@@ -37,7 +37,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         {
             if app.searching {
                 app.handle_search_key(key.code);
-            } else if app.connection_dialog.is_some() {
+            } else if app.connection_dialog.is_some() || app.host_dialog.is_some() {
                 app.handle_key(key.code);
             } else if app.section == NavSection::Hosts && key.code == KeyCode::Enter {
                 connect_selected(terminal, &mut app)?;

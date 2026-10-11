@@ -73,6 +73,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(dialog) = &app.connection_dialog {
         render_connection_dialog(frame, dialog);
     }
+    if let Some(dialog) = &app.host_dialog {
+        render_host_dialog(frame, dialog);
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -338,14 +341,72 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "Type to filter   Enter apply   Esc clear"
     } else if app.section == NavSection::Hosts {
         if area.width < 95 {
-            "↑↓ move  Enter SSH  / find  r reload  1-4 nav  q quit"
+            "↑↓ move  Enter SSH  a add  e edit  d delete  / find  r reload  q quit"
         } else {
-            "↑↓ select   Enter connect   / search   r refresh   f files   t tunnels   1-4 nav   q quit"
+            "↑↓ select   Enter connect   a add   e edit   d delete   / search   r refresh   1-4 nav   q quit"
         }
     } else {
         "1-4 nav   Hosts: ↑↓ select, Enter connect   q quit"
     };
     frame.render_widget(Paragraph::new(hint).style(Style::default().fg(MUTED)), area);
+}
+
+fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
+    let area = centered_rect(68, 15, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(if dialog.deleting {
+        " DELETE HOST "
+    } else if dialog.editing {
+        " EDIT HOST "
+    } else {
+        " NEW HOST "
+    });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if dialog.deleting {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(
+                    "Delete LazyTerm-managed host \"{}\"?",
+                    dialog.fields[0]
+                )),
+                Line::from(""),
+                Line::from("y confirm    n / Esc cancel"),
+            ])
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let labels = ["Alias", "HostName", "User", "Port", "IdentityFile"];
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1); 5])
+        .split(inner);
+    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+        let cursor = if index == dialog.selected_field {
+            "_"
+        } else {
+            ""
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("{label:<13}"), Style::default().fg(MUTED)),
+            Span::styled(format!("{value}{cursor}"), Style::default().fg(TEXT)),
+        ]);
+        frame.render_widget(Paragraph::new(line), rows[index]);
+    }
+    let help_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(6),
+        width: inner.width,
+        height: inner.height.saturating_sub(6),
+    };
+    frame.render_widget(
+        Paragraph::new("Tab / ↑↓ next field    Enter next / save    Esc cancel")
+            .style(Style::default().fg(MUTED)),
+        help_area,
+    );
 }
 
 fn render_search(frame: &mut Frame, app: &App) {
