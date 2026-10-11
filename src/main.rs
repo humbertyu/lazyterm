@@ -3,7 +3,7 @@ mod hosts;
 mod ui;
 
 use std::{
-    io::{self, Write},
+    io,
     process::{Command, ExitStatus, Stdio},
     time::Duration,
 };
@@ -52,9 +52,35 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
         return Ok(());
     };
 
+    app.notice = Some(format!("Checking connection to {}...", host.alias));
+    terminal.draw(|frame| ui::render(frame, app))?;
+
+    let preflight = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "RequestTTY=no",
+            "-o",
+            "ConnectTimeout=5",
+        ])
+        .arg(&host.alias)
+        .arg("true")
+        .stdin(Stdio::null())
+        .output()?;
+
+    let preflight_detail = String::from_utf8_lossy(&preflight.stderr);
+    if !preflight.status.success() && !needs_interactive_auth(&preflight_detail) {
+        app.notice = Some(format!(
+            "SSH to {} failed: {}",
+            host.alias,
+            ssh_error_detail(&preflight_detail, preflight.status)
+        ));
+        return Ok(());
+    }
+
     // Leave Ratatui's alternate screen completely before handing the terminal
-    // to OpenSSH. This keeps failed sessions visible on terminals that do not
-    // repaint the alternate screen reliably.
+    // to OpenSSH. The preflight above guarantees that failures stay in the TUI.
     terminal.show_cursor()?;
     ratatui::restore();
     execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show)?;
@@ -66,22 +92,11 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
         .stderr(Stdio::inherit())
         .status();
 
-    let connected = matches!(&result, Ok(status) if status.success());
     let notice = match result {
         Ok(status) if status.success() => format!("SSH session to {} ended.", host.alias),
         Ok(status) => format!("SSH to {} failed ({})", host.alias, exit_status(status)),
         Err(error) => format!("Could not start OpenSSH: {error}"),
     };
-
-    if !connected {
-        writeln!(
-            io::stdout(),
-            "\r\n{notice}\r\nPress Enter to return to LazyTerm..."
-        )?;
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-    }
 
     execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Hide)?;
     enable_raw_mode()?;
@@ -96,4 +111,24 @@ fn exit_status(status: ExitStatus) -> String {
         || "terminated by signal".to_string(),
         |code| format!("exit {code}"),
     )
+}
+
+fn ssh_error_detail(stderr: &str, status: ExitStatus) -> String {
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        exit_status(status)
+    } else {
+        detail
+            .strip_prefix("ssh: ")
+            .unwrap_or(detail)
+            .replace('\n', " ")
+    }
+}
+
+fn needs_interactive_auth(stderr: &str) -> bool {
+    let detail = stderr.to_ascii_lowercase();
+    detail.contains("permission denied")
+        || detail.contains("publickey")
+        || detail.contains("keyboard-interactive")
+        || detail.contains("password")
 }
