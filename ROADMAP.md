@@ -4,14 +4,14 @@ LazyTerm is early-stage software. This roadmap describes intended release bounda
 
 ## Current
 
-The repository currently contains the Ratatui application shell only. No network, host storage, credential, SFTP, or tunnel feature is considered shipped until it is included in a tagged release.
+The current feature branch has the initial navigation shell, OpenSSH alias discovery, host search, and native SSH handoff in progress. SFTP, tunnel management, credential storage, and snippets remain unimplemented until delivered and included in a tagged release.
 
 ## v0.1.0 - Hosts and Native SSH
 
 Goal: select an existing OpenSSH host and enter a reliable native SSH session.
 
 - [ ] Split the TUI shell into app, UI, domain, and adapter modules.
-- [ ] Discover aliases from `~/.ssh/config` and display effective settings.
+- [ ] Discover concrete aliases from `~/.ssh/config` and included config files.
 - [ ] Search and select hosts.
 - [ ] Support favorites, groups, and tags as LazyTerm metadata.
 - [ ] Launch `ssh <alias>` with inherited terminal and return cleanly to the TUI.
