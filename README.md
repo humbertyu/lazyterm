@@ -19,6 +19,8 @@ Use `1`-`4` or `Tab` to switch sections. In Hosts, use `↑`/`↓` to select, `E
 
 The v0.1.0 host-management scope is limited to common connection fields: alias, hostname, username, port, and identity file. LazyTerm will not store passwords. Advanced OpenSSH directives and complex configuration rules remain editable directly in `~/.ssh/config`.
 
+In the Hosts view, use `a` to add a managed host, `e` to edit a LazyTerm-managed host, and `d` to delete one after confirmation. Existing unmanaged OpenSSH hosts remain read-only in LazyTerm. Press `Enter` to hand an SSH session to the system OpenSSH client.
+
 ## Direction
 
 - Reuse OpenSSH for interactive sessions, host key verification, and ProxyJump.
