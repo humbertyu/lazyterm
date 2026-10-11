@@ -30,7 +30,7 @@ SSHub combines read-only `~/.ssh/config` hosts with a managed host database, and
 
 | SSHub approach | LazyTerm decision |
 |---|---|
-| Hybrid SSH config and managed-host catalog | Adopt: preserve OpenSSH aliases and keep LazyTerm metadata separately. |
+| Hybrid SSH config and managed-host catalog | Adapt: discover existing OpenSSH aliases, support basic CRUD for LazyTerm-managed host blocks, and keep UI-only metadata separately. |
 | Embedded PTY sessions and tabs | Defer: keep native terminal handoff until multiple live sessions are a proven need. |
 | Integrated SFTP browser | Adopt the workflow; validate the transport separately because LazyTerm's terminal path is OpenSSH. |
 | Tunnel definitions, status, and reconnect | Adopt, with explicit `session`, `app`, and `persistent` lifecycles. |
@@ -66,7 +66,23 @@ RuntimeSession   one current SSH/SFTP/Tunnel process
 
 Never store process IDs or transient connection errors inside a host profile.
 
-### 2.3 One persistence boundary
+### 2.3 Basic host management in v0.1.0
+
+The first release should let users create, edit, and delete common connection profiles from the TUI. The managed fields are intentionally limited to:
+
+```text
+Host alias
+HostName
+User
+Port
+IdentityFile
+```
+
+OpenSSH remains the connection and authentication authority. LazyTerm must never persist passwords in SSH config, application data, process arguments, or logs. Advanced directives such as `Match`, complex `Include` layouts, `ProxyCommand`, and per-host policy remain user-managed in `~/.ssh/config`; LazyTerm should not flatten or silently rewrite these rules.
+
+For reliable CRUD, identify which host entries LazyTerm owns and update only those entries. Before overwriting an alias or deleting a managed entry, require explicit confirmation. Writes should be atomic and preserve unrelated content; implementation and release criteria must include backup or recovery behavior. Existing arbitrary `~/.ssh/config` entries may be listed and connected to, but should not be offered for destructive edits unless LazyTerm can preserve their full structure.
+
+### 2.4 One persistence boundary
 
 SSHub centralizes persistent settings and credentials instead of letting each screen write its own files. LazyTerm should have one storage boundary:
 
@@ -80,7 +96,7 @@ Host catalog / metadata / snippets / tunnel definitions
 
 Secrets go through a separate `CredentialStore`; they must not be serialized into ordinary application records.
 
-### 2.4 Runtime process supervision
+### 2.5 Runtime process supervision
 
 Tunnel processes, snippet commands, and native SSH sessions need a shared process policy:
 
@@ -91,7 +107,7 @@ Tunnel processes, snippet commands, and native SSH sessions need a shared proces
 - preserve persistent tunnels when the TUI exits;
 - rediscover running persistent tunnels on the next launch.
 
-### 2.5 Capability-focused tests
+### 2.6 Capability-focused tests
 
 Connection features should be tested through narrow interfaces and fake implementations:
 
