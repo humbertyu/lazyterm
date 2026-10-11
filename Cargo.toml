@@ -1,0 +1,11 @@
+[package]
+name = "lazyterm"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, keyboard-driven workspace for remote hosts"
+license = "MIT"
+
+[dependencies]
+color-eyre = "0.6"
+crossterm = "0.29"
+ratatui = "0.30"
