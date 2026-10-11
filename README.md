@@ -26,6 +26,7 @@ Use `1`-`3` or `Tab` to switch between Hosts, Tunnels, and Snippets. Press `q` o
 - Defer embedded terminal rendering, sync, and team features.
 
 See [docs/architecture.md](docs/architecture.md) for the initial architecture and milestones.
+See [ROADMAP.md](ROADMAP.md) for planned releases and [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
 
 ## Development
 
