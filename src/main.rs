@@ -17,7 +17,7 @@ use crossterm::{
 };
 use ratatui::DefaultTerminal;
 
-use crate::app::{App, NavSection};
+use crate::app::{App, ConnectionDialog, NavSection};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -37,6 +37,8 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         {
             if app.searching {
                 app.handle_search_key(key.code);
+            } else if app.connection_dialog.is_some() {
+                app.handle_key(key.code);
             } else if app.section == NavSection::Hosts && key.code == KeyCode::Enter {
                 connect_selected(terminal, &mut app)?;
             } else {
@@ -52,7 +54,11 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
         return Ok(());
     };
 
-    app.notice = Some(format!("Checking connection to {}...", host.alias));
+    app.connection_dialog = Some(ConnectionDialog {
+        title: format!("Connecting to {}", host.alias),
+        message: "Checking SSH connection...".to_string(),
+        pending: true,
+    });
     terminal.draw(|frame| ui::render(frame, app))?;
 
     let preflight = Command::new("ssh")
@@ -71,13 +77,14 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
 
     let preflight_detail = String::from_utf8_lossy(&preflight.stderr);
     if !preflight.status.success() && !needs_interactive_auth(&preflight_detail) {
-        app.notice = Some(format!(
-            "SSH to {} failed: {}",
-            host.alias,
-            ssh_error_detail(&preflight_detail, preflight.status)
-        ));
+        app.connection_dialog = Some(ConnectionDialog {
+            title: format!("Connection to {} failed", host.alias),
+            message: ssh_error_detail(&preflight_detail, preflight.status),
+            pending: false,
+        });
         return Ok(());
     }
+    app.connection_dialog = None;
 
     // Leave Ratatui's alternate screen completely before handing the terminal
     // to OpenSSH. The preflight above guarantees that failures stay in the TUI.

@@ -4,22 +4,27 @@ LazyTerm is early-stage software. This roadmap describes intended release bounda
 
 ## Current
 
-The current feature branch has the initial navigation shell, OpenSSH alias discovery, host search, and native SSH handoff in progress. SFTP, tunnel management, credential storage, and snippets remain unimplemented until delivered and included in a tagged release.
+The current feature branch has the initial navigation shell, OpenSSH alias discovery, host search, native SSH handoff, and connection error dialogs in progress. Basic host editing is now part of v0.1.0. SFTP, tunnel management, credential storage, and snippets remain unimplemented until delivered and included in a tagged release.
 
-## v0.1.0 - Hosts and Native SSH
+## v0.1.0 - Host Management and Native SSH
 
-Goal: select an existing OpenSSH host and enter a reliable native SSH session.
+Goal: manage common SSH host profiles and enter reliable native OpenSSH sessions.
 
 - [ ] Split the TUI shell into app, UI, domain, and adapter modules.
 - [ ] Discover concrete aliases from `~/.ssh/config` and included config files.
 - [ ] Search and select hosts.
+- [ ] Add a host from the TUI with alias, hostname, username, port, and identity file.
+- [ ] Edit and delete hosts created or managed by LazyTerm.
+- [ ] Write basic host fields safely without exposing or storing passwords.
+- [ ] Preserve unrelated comments, `Include` directives, advanced OpenSSH options, and unmanaged host blocks where possible.
+- [ ] Show confirmation before deleting a host or overwriting an existing alias.
 - [ ] Support favorites, groups, and tags as LazyTerm metadata.
 - [ ] Launch `ssh <alias>` with inherited terminal and return cleanly to the TUI.
 - [ ] Preserve OpenSSH host-key verification, identity files, `ssh-agent`, `ProxyJump`, and `ProxyCommand`.
 - [ ] Show connection exit status and useful errors.
 - [ ] Support macOS first and document the tested OpenSSH/Rust versions.
 
-Release gate: a clean install can discover a normal OpenSSH config, connect to a host, and return to the TUI without corrupting the terminal.
+Release gate: a clean install can discover or create a normal OpenSSH host, edit or remove a LazyTerm-managed host safely, connect to a host, and return to the TUI without corrupting the terminal.
 
 ## v0.2.0 - Credentials and SFTP
 

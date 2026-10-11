@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, NavSection};
+use crate::app::{App, ConnectionDialog, NavSection};
 
 const BG: Color = Color::Rgb(13, 16, 17);
 const PANEL: Color = Color::Rgb(18, 23, 23);
@@ -69,6 +69,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_footer(frame, page[2], app);
     if app.searching {
         render_search(frame, app);
+    }
+    if let Some(dialog) = &app.connection_dialog {
+        render_connection_dialog(frame, dialog);
     }
 }
 
@@ -356,6 +359,40 @@ fn render_search(frame: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(GREEN))
                 .style(Style::default().bg(PANEL)),
         ),
+        area,
+    );
+}
+
+fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
+    let area = centered_rect(72, 9, frame.area());
+    let border = if dialog.pending {
+        GREEN
+    } else {
+        Color::Rgb(221, 132, 112)
+    };
+    let footer = if dialog.pending {
+        "Please wait..."
+    } else {
+        "Press any key to close"
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                dialog.message.as_str(),
+                Style::default().fg(TEXT),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(footer, Style::default().fg(MUTED))),
+        ])
+        .block(
+            Block::default()
+                .title(format!(" {} ", dialog.title))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .style(Style::default().bg(PANEL)),
+        )
+        .wrap(Wrap { trim: true }),
         area,
     );
 }

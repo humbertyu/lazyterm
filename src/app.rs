@@ -31,6 +31,13 @@ pub struct App {
     pub searching: bool,
     pub should_quit: bool,
     pub notice: Option<String>,
+    pub connection_dialog: Option<ConnectionDialog>,
+}
+
+pub struct ConnectionDialog {
+    pub title: String,
+    pub message: String,
+    pub pending: bool,
 }
 
 impl App {
@@ -43,6 +50,7 @@ impl App {
             searching: false,
             should_quit: false,
             notice: None,
+            connection_dialog: None,
         }
     }
 
@@ -64,6 +72,11 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.connection_dialog.is_some() {
+            self.connection_dialog = None;
+            return;
+        }
+
         match key {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Down => self.move_selection(1),
