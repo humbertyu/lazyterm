@@ -4,7 +4,33 @@ LazyTerm is early-stage software. This roadmap describes intended release bounda
 
 ## Current
 
-The current feature branch implements top-level tabs, compact group cards, tag metadata, orphaned-metadata cleanup, host search, basic managed-host CRUD, native SSH handoff, and connection error dialogs. These are development features, not a completed or tagged v0.1.0 release. SFTP, tunnel management, credential storage, and snippets remain unimplemented.
+Host management and native SSH are implemented in development, with the v0.1 acceptance gaps below still open. v0.2 has started with shared host context and an initial library-backed SFTP directory browser; the native `sftp` client remains a compatibility path. This is not a completed or tagged release; tunnel management, credential storage, and snippets remain open.
+
+## Delivery Strategy
+
+Build the integrated core workflows first: Hosts -> SSH / Files -> Tunnels -> Snippets, then consolidate hardening and acceptance. A development milestone may start before the preceding release gate is met. Starting a milestone does not mark unfinished work accepted or change the package version.
+
+- Keep incomplete implementation and unverified behavior visible in the carry-over backlog.
+- Use `~/.ssh/config` (including Includes) as the host source of truth; LazyTerm stores only supplemental metadata and module definitions.
+- Share host references by alias, never by list index or copied connection fields. Files, tunnels, and snippets resolve references against the current catalog.
+- Preserve a selected host across tab switches. Selecting a group must not silently choose its first host for an operation.
+- In-app host renames migrate references. External removal/rename invalidates the old reference; discovery failures retain data but block new operations that cannot be resolved safely.
+- Runtime state belongs to each module, not to host configuration. Switching tabs must not implicitly launch a connection.
+- Never defer minimum safety: no plaintext secrets, no bypass of host-key checking, no silent wrong-host fallback, and no unconfirmed destructive operations initiated by LazyTerm.
+
+### Carry-Over Backlog
+
+| Owner | Incomplete / Unverified | Required Before |
+|---|---|---|
+| Hosts | Input quoting, advanced managed-block preservation, Include alias conflicts | Declaring managed CRUD safe for release |
+| SSH | Real host-key/auth/proxy/terminal acceptance; cancellable preflight and restricted-account behavior | Declaring native SSH accepted |
+| Hosts / UI | Favorites, legacy view cleanup, keyboard usability acceptance | Beta scope review |
+| Files | Directory transfers, cancellation, confirmed mutations, and integration acceptance | v0.2 release acceptance |
+| Credentials | Keychain and native saved-password security spike | Enabling saved credentials |
+| Cross-module | Host rename/removal handling for future persisted tunnel/snippet references | Shipping those definitions |
+| Release | Disposable SSH/SFTP integration fixtures, supported OS matrix, packaging and release notes | Tagging the corresponding release |
+
+The detailed unchecked items and audit below remain authoritative; none are waived by progressing to the next development milestone.
 
 ## v0.1.0 - Host Management and Native SSH
 
@@ -41,18 +67,31 @@ The release gate is **not yet met**. Checked boxes above record implemented beha
 - Environment: local checks ran with Rust 1.92.0 and system OpenSSH 9.9p2 (LibreSSL 3.3.6) on macOS. This does not constitute a tested support matrix.
 - Release preparation: finish the remaining safety and SSH checks, publish release notes, and only then tag a release. Package version `0.1.0` alone does not mean a release has shipped.
 
-## v0.2.0 - Credentials and SFTP
+## v0.2.0 - Integrated Files / SFTP
 
-Goal: add safe saved credentials and basic file transfer.
+Goal: use the Hosts catalog for file workflows, without a second host database. Grow the initial in-TUI directory browser into a complete Files workflow. Saved-password automation is not a prerequisite for starting Files.
+
+- [x] Carry a stable selected-host alias from Hosts into other modules.
+- [x] Add a native `sftp` handoff using that alias and restore the TUI on exit; this remains a compatibility bridge.
+- [x] Retain host context across tabs, migrate it on in-app rename, and clear it when refresh confirms the alias is gone.
+- [ ] Verify context behavior end to end with SSH config edits, refresh failures, and renamed managed aliases.
+- [x] Select and document `openssh` plus `openssh-sftp-client` for the embedded browser; retain OpenSSH configuration and strict host-key checking.
+- [ ] Share host resolution and credential lookup across SSH and SFTP.
+- [x] List a remote directory, inspect basic entry metadata, enter directories, and return to the parent.
+- [x] Build the first integrated Files browser slice with a persistent local pane, remote pane, and Groups/Hosts picker.
+- [x] Extend the dual-pane browser with single-file transfers and progress reporting.
+- [x] Upload and download ordinary files with progress and clear errors.
+- [x] Remember the local directory and the last remote directory for each host.
+- [x] Hide dot files and directories by default, with a shared Files toggle.
+- [ ] Add cancellation and queued-task controls.
+- [ ] Add rename, mkdir, and delete with confirmation.
+- [ ] Verify the integrated Hosts -> Files -> Hosts workflow against disposable fixtures.
+
+Deferred credential track:
 
 - [ ] Add a macOS Keychain-backed credential store.
 - [ ] Support password authentication without writing secrets to config, arguments, environment, or logs.
 - [ ] Complete a security and behavior spike for supplying a saved password to native OpenSSH; do not ship an `sshpass` dependency.
-- [ ] Select and document a maintained SFTP transport.
-- [ ] Share host resolution and credential lookup across SSH and SFTP.
-- [ ] Browse directories and inspect file metadata.
-- [ ] Upload and download with progress, cancellation, and clear errors.
-- [ ] Add rename, mkdir, and delete with confirmation.
 
 Release gate: SSH and SFTP use the same host identity and authentication policy; transfers handle interruption without freezing the TUI.
 

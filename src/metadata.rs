@@ -17,6 +17,9 @@ pub struct Metadata {
     pub version: u32,
     pub view: HostView,
     pub tags: BTreeMap<String, Vec<String>>,
+    pub local_path: Option<PathBuf>,
+    pub remote_paths: BTreeMap<String, String>,
+    pub show_hidden_files: bool,
 }
 
 impl Default for Metadata {
@@ -25,6 +28,9 @@ impl Default for Metadata {
             version: 1,
             view: HostView::Groups,
             tags: BTreeMap::new(),
+            local_path: None,
+            remote_paths: BTreeMap::new(),
+            show_hidden_files: false,
         }
     }
 }
@@ -66,10 +72,12 @@ impl Metadata {
             .iter()
             .map(|host| host.alias.as_str())
             .collect::<std::collections::HashSet<_>>();
-        let previous_len = self.tags.len();
+        let previous_len = self.tags.len() + self.remote_paths.len();
         self.tags
             .retain(|alias, _| aliases.contains(alias.as_str()));
-        self.tags.len() != previous_len
+        self.remote_paths
+            .retain(|alias, _| aliases.contains(alias.as_str()));
+        self.tags.len() + self.remote_paths.len() != previous_len
     }
 
     fn path() -> io::Result<PathBuf> {
@@ -121,10 +129,18 @@ mod tests {
             ..Metadata::default()
         };
         metadata.tags.insert("web".into(), parse_tags("prod,work"));
+        metadata.local_path = Some(PathBuf::from("/tmp/lazyterm"));
+        metadata
+            .remote_paths
+            .insert("web".into(), "projects".into());
+        metadata.show_hidden_files = true;
         let bytes = serde_json::to_vec(&metadata).unwrap();
         let restored: Metadata = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored.view, HostView::Hosts);
         assert_eq!(restored.tags["web"], ["prod", "work"]);
+        assert_eq!(restored.local_path, Some(PathBuf::from("/tmp/lazyterm")));
+        assert_eq!(restored.remote_paths["web"], "projects");
+        assert!(restored.show_hidden_files);
     }
 
     #[test]

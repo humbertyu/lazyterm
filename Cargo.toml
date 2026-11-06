@@ -11,5 +11,10 @@ crossterm = "0.29"
 ratatui = "0.30"
 glob = "0.3"
 shell-words = "1.1"
+bytes = "1"
+futures-util = "0.3"
+openssh = "0.11.6"
+openssh-sftp-client = { version = "0.15.12", features = ["openssh"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }

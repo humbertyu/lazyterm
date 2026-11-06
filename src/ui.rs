@@ -1,12 +1,18 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 
-use crate::app::{App, ConnectionDialog, NavSection, group_columns, host_browser_width};
+use crate::{
+    app::{
+        App, ConnectionDialog, FilePane, FilesState, HostPickerItem, LOCAL_BREADCRUMB_SEPARATOR,
+        LocalEntryKind, NavSection, TransferStatus, group_columns, host_browser_width,
+    },
+    sftp::SftpEntryKind,
+};
 
 const BG: Color = Color::Rgb(13, 16, 17);
 const PANEL: Color = Color::Rgb(18, 23, 23);
@@ -35,19 +41,20 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_navigation(frame, page[1], app);
     match app.section {
         NavSection::Hosts => render_hosts(frame, page[2], app),
-        NavSection::Files => {
-            let description = app.selected_host().map_or_else(
-                || "Select a host in Hosts to choose the remote file context.".to_string(),
-                |host| format!("SFTP browser for {} will appear here.", host.alias),
-            );
-            render_placeholder(frame, page[2], "Files", "SFTP workspace", &description);
-        }
+        NavSection::Files => render_files(frame, page[2], app),
         NavSection::Tunnels => {
             let description = app.selected_host().map_or_else(
                 || "Create local, remote, or SOCKS port forwards.".to_string(),
                 |host| format!("Tunnel manager for {} will appear here.", host.alias),
             );
-            render_placeholder(frame, page[2], "Tunnels", "Port forwarding", &description);
+            render_placeholder(
+                frame,
+                page[2],
+                "Tunnels",
+                "Port forwarding",
+                &description,
+                "Planned",
+            );
         }
         NavSection::Snippets => render_placeholder(
             frame,
@@ -55,6 +62,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             "Snippets",
             "Command library",
             "Save commands and run them against one or more hosts.",
+            "Planned",
         ),
     }
     render_footer(frame, page[3], app);
@@ -85,6 +93,568 @@ pub fn render(frame: &mut Frame, app: &App) {
             area,
         );
     }
+}
+
+fn render_files(frame: &mut Frame, area: Rect, app: &App) {
+    let task_height = app.transfer_panel_height(area.height);
+    let sections = if task_height == 0 {
+        Layout::vertical([Constraint::Min(1)]).split(area)
+    } else {
+        Layout::vertical([Constraint::Min(6), Constraint::Length(task_height)]).split(area)
+    };
+    let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[0]);
+    render_local_files(frame, panes[0], app);
+    if app.host_picker_open {
+        render_host_picker(frame, panes[1], app);
+    } else {
+        render_remote_files(frame, panes[1], app);
+    }
+    if task_height > 0 {
+        render_transfer_tasks(frame, sections[1], app);
+    }
+}
+
+fn render_transfer_tasks(frame: &mut Frame, area: Rect, app: &App) {
+    let tasks = app.transfer_tasks.iter().rev().take(4).collect::<Vec<_>>();
+    let task_area = Block::default()
+        .title(" TRANSFERS ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(PANEL));
+    let inner = task_area.inner(area);
+    frame.render_widget(task_area, area);
+    for (index, task) in tasks.into_iter().enumerate() {
+        let direction = match task.direction {
+            crate::sftp::TransferDirection::Upload => "↑",
+            crate::sftp::TransferDirection::Download => "↓",
+        };
+        let ratio = if task.total > 0 {
+            (task.transferred as f64 / task.total as f64).clamp(0.0, 1.0)
+        } else if task.status == TransferStatus::Completed {
+            1.0
+        } else {
+            0.0
+        };
+        let label = match &task.status {
+            TransferStatus::Running if task.total > 0 => {
+                format!("{direction} {}  {:.0}%", task.name, ratio * 100.0)
+            }
+            TransferStatus::Running => {
+                format!(
+                    "{direction} {}  {}",
+                    task.name,
+                    format_bytes(task.transferred)
+                )
+            }
+            TransferStatus::Completed => format!("{direction} {}  100% done", task.name),
+            TransferStatus::Failed(message) => {
+                format!("{direction} {}  failed: {message}", task.name)
+            }
+        };
+        let gauge = Gauge::default()
+            .gauge_style(
+                Style::default().fg(if task.status == TransferStatus::Completed {
+                    GREEN
+                } else {
+                    Color::Rgb(93, 159, 122)
+                }),
+            )
+            .label(label)
+            .ratio(ratio);
+        if let Some(row) = inner.rows().nth(index) {
+            frame.render_widget(gauge, row);
+        }
+    }
+}
+
+fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
+    let active = app.active_file_pane == FilePane::Local;
+    let title = if active {
+        format!(
+            " LOCAL  [FOCUS]  hidden:{} ",
+            if app.show_hidden_files { "on" } else { "off" }
+        )
+    } else {
+        format!(
+            " LOCAL  hidden:{} ",
+            if app.show_hidden_files { "on" } else { "off" }
+        )
+    };
+    let block = file_panel(&title, active);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let filter_visible = app.file_filtering || !app.file_filter.is_empty();
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(filter_visible)),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+    let breadcrumbs = app.local_breadcrumb_parts(rows[0].width);
+    let mut path_line = Vec::new();
+    for (index, breadcrumb) in breadcrumbs.iter().enumerate() {
+        if index > 0 {
+            path_line.push(Span::styled(
+                LOCAL_BREADCRUMB_SEPARATOR,
+                Style::default().fg(MUTED),
+            ));
+        }
+        path_line.push(Span::styled(
+            breadcrumb.label.as_str(),
+            Style::default()
+                .fg(if active {
+                    if index + 1 == breadcrumbs.len() {
+                        TEXT
+                    } else {
+                        GREEN
+                    }
+                } else {
+                    MUTED
+                })
+                .add_modifier(if index + 1 == breadcrumbs.len() {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(path_line))
+            .style(Style::default().fg(TEXT))
+            .scroll((0, 0)),
+        rows[0],
+    );
+
+    if filter_visible {
+        let filter_text = if app.file_filtering {
+            format!("Filter: {}_", app.file_filter)
+        } else {
+            format!("Filter: {}", app.file_filter)
+        };
+        frame.render_widget(
+            Paragraph::new(filter_text).style(Style::default().fg(if active {
+                if app.file_filter.is_empty() {
+                    MUTED
+                } else {
+                    GREEN
+                }
+            } else {
+                DISABLED
+            })),
+            rows[1],
+        );
+    }
+
+    if let Some(error) = &app.local_files.error {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Could not read this directory.",
+                    Style::default().fg(if active { TEXT } else { MUTED }),
+                )),
+                Line::from(Span::styled(error.as_str(), Style::default().fg(MUTED))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press r to retry.",
+                    Style::default().fg(GREEN),
+                )),
+            ])
+            .wrap(Wrap { trim: true }),
+            rows[2],
+        );
+        return;
+    }
+
+    let visible_entries = app.visible_local_entries();
+    let items = visible_entries.iter().map(|entry| {
+        let (name, kind) = match entry.kind {
+            LocalEntryKind::Parent => ("..".to_string(), "parent"),
+            LocalEntryKind::Directory => (format!("{}/", entry.name), "folder"),
+            LocalEntryKind::File => (entry.name.clone(), "file"),
+            LocalEntryKind::Other => (entry.name.clone(), "other"),
+        };
+        let size = entry
+            .size
+            .map_or_else(String::new, |size| format!("  {}", format_bytes(size)));
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("  {name}"),
+                Style::default().fg(if active && entry.kind == LocalEntryKind::Directory {
+                    GREEN
+                } else if active {
+                    TEXT
+                } else {
+                    MUTED
+                }),
+            ),
+            Span::styled(
+                format!("  {kind}{size}"),
+                Style::default().fg(if active { MUTED } else { DISABLED }),
+            ),
+        ]))
+    });
+    let mut state = ListState::default();
+    if !visible_entries.is_empty() {
+        state.select(Some(
+            app.local_files.selected.min(visible_entries.len() - 1),
+        ));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("> ")
+            .highlight_style(file_selection_style(active)),
+        rows[2],
+        &mut state,
+    );
+    if visible_entries.is_empty() && !app.file_filter.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching local files or directories.")
+                .style(Style::default().fg(MUTED)),
+            rows[2],
+        );
+    }
+}
+
+fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
+    let active = app.active_file_pane == FilePane::Remote;
+    let Some(host) = app.context_host() else {
+        let block = file_panel(" REMOTE  SELECT HOST ", active);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let content = Layout::vertical([
+            Constraint::Percentage(30),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+        frame.render_widget(
+            Paragraph::new("[ SFTP ]")
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(if active { GREEN } else { MUTED })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            content[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Connect to host")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            content[1],
+        );
+        frame.render_widget(
+            Paragraph::new("Choose a saved SSH host to manage its files.")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: true }),
+            content[2],
+        );
+        let select_label = if area.width < 36 {
+            "[Enter] Select host"
+        } else {
+            "[Enter / s]  Select host"
+        };
+        frame.render_widget(
+            Paragraph::new(select_label)
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(if active { GREEN } else { MUTED })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            content[3],
+        );
+        return;
+    };
+
+    match &app.files {
+        FilesState::Idle => {
+            let title = format!(" REMOTE  {}  ~ ", host.alias);
+            let block = file_panel(&title, active);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Remote host selected.",
+                        Style::default()
+                            .fg(if active { TEXT } else { MUTED })
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "Press Enter to load its home directory.",
+                        Style::default().fg(if active { MUTED } else { DISABLED }),
+                    )),
+                ])
+                .alignment(Alignment::Center),
+                inner,
+            );
+        }
+        FilesState::Loading { host_alias, path } => {
+            render_remote_status(
+                frame,
+                area,
+                active,
+                &format!(
+                    " REMOTE  {}  {} ",
+                    host_alias,
+                    if path.is_empty() { "~" } else { path }
+                ),
+                "Connecting to remote directory...",
+                "Please wait",
+            );
+        }
+        FilesState::Failed {
+            host_alias,
+            path,
+            message,
+        } => {
+            render_remote_status(
+                frame,
+                area,
+                active,
+                &format!(
+                    " REMOTE  {}  {} ",
+                    host_alias,
+                    if path.is_empty() { "~" } else { path }
+                ),
+                message,
+                "Enter retry  s choose another host",
+            );
+        }
+        FilesState::Loaded(listing) => {
+            let title = format!(
+                " REMOTE  {}  {}  hidden:{} ",
+                listing.host_alias,
+                if listing.path.is_empty() {
+                    "~"
+                } else {
+                    listing.path.as_str()
+                },
+                if app.show_hidden_files { "on" } else { "off" }
+            );
+            let block = file_panel(&title, active);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let entries = app.visible_remote_entries();
+            if entries.is_empty() {
+                frame.render_widget(
+                    Paragraph::new("This directory is empty.").style(Style::default().fg(MUTED)),
+                    inner,
+                );
+                return;
+            }
+            let items = entries.iter().map(|entry| {
+                let marker = if entry.kind == SftpEntryKind::Directory {
+                    "/"
+                } else {
+                    ""
+                };
+                let size = entry
+                    .size
+                    .map_or_else(String::new, |size| format!("  {}", format_bytes(size)));
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("  {}{}", entry.name, marker),
+                        Style::default().fg(if active && entry.kind == SftpEntryKind::Directory {
+                            GREEN
+                        } else if active {
+                            TEXT
+                        } else {
+                            MUTED
+                        }),
+                    ),
+                    Span::styled(
+                        size,
+                        Style::default().fg(if active { MUTED } else { DISABLED }),
+                    ),
+                ]))
+            });
+            let mut state = ListState::default();
+            state.select(Some(app.selected_file.min(entries.len() - 1)));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_symbol("> ")
+                    .highlight_style(file_selection_style(active)),
+                inner,
+                &mut state,
+            );
+        }
+    }
+}
+
+fn render_remote_status(
+    frame: &mut Frame,
+    area: Rect,
+    active: bool,
+    title: &str,
+    message: &str,
+    hint: &str,
+) {
+    let block = file_panel(title, active);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                message,
+                Style::default().fg(if active { TEXT } else { MUTED }),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                hint,
+                Style::default().fg(if active { GREEN } else { MUTED }),
+            )),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_host_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let title = app
+        .host_picker_group
+        .as_ref()
+        .map_or(" SELECT HOST  /  GROUPS + HOSTS ".to_string(), |group| {
+            format!(" SELECT HOST  /  {} ", group.title())
+        });
+    let block = file_panel(&title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let items = app.host_picker_items();
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No SSH hosts found in ~/.ssh/config.")
+                .style(Style::default().fg(MUTED)),
+            inner,
+        );
+        return;
+    }
+    let group_count = items
+        .iter()
+        .take_while(|item| matches!(item, HostPickerItem::Group(_)))
+        .count();
+    let mut list_items = Vec::with_capacity(items.len() + 2);
+    if group_count > 0 {
+        list_items.push(ListItem::new(Line::from(Span::styled(
+            " Groups",
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ))));
+        list_items.extend(items[..group_count].iter().map(|item| {
+            let HostPickerItem::Group(group) = item else {
+                unreachable!("group section contains only groups")
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled("  [G] ", Style::default().fg(GREEN)),
+                Span::styled(
+                    group.title(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} hosts", app.host_group_count(group)),
+                    Style::default().fg(MUTED),
+                ),
+            ]))
+        }));
+    }
+    list_items.push(ListItem::new(Line::from(Span::styled(
+        if let Some(group) = &app.host_picker_group {
+            format!(" Hosts / {}", group.title())
+        } else {
+            " Hosts".to_string()
+        },
+        Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+    ))));
+    let host_items = &items[group_count..];
+    list_items.extend(host_items.iter().map(|item| {
+        let HostPickerItem::Host(alias) = item else {
+            unreachable!("host section contains only hosts")
+        };
+        let target = app
+            .hosts
+            .hosts
+            .iter()
+            .find(|host| host.alias == *alias)
+            .map_or(alias.as_str(), |host| host.destination());
+        ListItem::new(Line::from(vec![
+            Span::styled("  [H] ", Style::default().fg(MUTED)),
+            Span::styled(alias, Style::default().fg(TEXT)),
+            Span::styled(format!("  {target}"), Style::default().fg(MUTED)),
+        ]))
+    }));
+    let selected_row = if group_count > 0 && app.host_picker_group.is_none() {
+        if app.host_picker_selection < group_count {
+            app.host_picker_selection + 1
+        } else {
+            app.host_picker_selection + 2
+        }
+    } else {
+        app.host_picker_selection + 1
+    };
+    let mut state = ListState::default();
+    state.select(Some(selected_row.min(list_items.len().saturating_sub(1))));
+    frame.render_stateful_widget(
+        List::new(list_items)
+            .highlight_symbol("> ")
+            .highlight_style(file_selection_style(true)),
+        inner,
+        &mut state,
+    );
+}
+
+fn file_panel(title: &str, active: bool) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .title_style(Style::default().fg(if active { GREEN } else { MUTED }))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active { GREEN } else { BORDER }))
+        .style(Style::default().bg(PANEL))
+}
+
+fn file_selection_style(active: bool) -> Style {
+    Style::default()
+        .fg(if active { TEXT } else { MUTED })
+        .bg(if active {
+            Color::Rgb(34, 54, 47)
+        } else {
+            PANEL
+        })
+        .add_modifier(if active {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        })
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next_unit in UNITS {
+        value /= 1024.0;
+        unit = next_unit;
+        if value < 1024.0 || next_unit == "TB" {
+            break;
+        }
+    }
+    let formatted = if value >= 100.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    };
+    let formatted = formatted.strip_suffix(".0").unwrap_or(&formatted);
+    format!("{formatted} {unit}")
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -459,6 +1029,7 @@ fn render_placeholder(
     section: &str,
     title: &str,
     description: &str,
+    status: &str,
 ) {
     let block = panel(section);
     let inner = block.inner(area);
@@ -484,7 +1055,8 @@ fn render_placeholder(
         content[2],
     );
     frame.render_widget(
-        Paragraph::new("Planned").style(Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+        Paragraph::new(status.to_string())
+            .style(Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
         content[3],
     );
 }
@@ -501,6 +1073,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "Enter save tags  Esc cancel"
     } else if app.searching {
         "Type to filter   Enter apply   Esc clear"
+    } else if app.file_filtering {
+        "Type to filter local files   ↑↓ move   ← parent   → open   Enter apply   Esc clear"
     } else if app.section == NavSection::Hosts {
         if area.width < 75 && app.showing_groups() {
             "Arrows select  Enter open/SSH  / find  q quit"
@@ -512,6 +1086,34 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             "↑↓ move  Enter SSH  v view  g tags  / find  Esc back  q quit"
         } else {
             "↑↓ select  Enter SSH  v view  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
+        }
+    } else if app.section == NavSection::Files {
+        if app.host_picker_open {
+            if area.width < 75 {
+                "↑↓ select  Enter open  Backspace/Esc back"
+            } else {
+                "↑↓ select  Enter group/host  Backspace back  Esc close"
+            }
+        } else if area.width < 75 {
+            match (app.active_file_pane, app.context_host().is_none()) {
+                (FilePane::Local, _) => {
+                    "Click path  / filter  h hidden files  ↑↓ select  ← parent  →/Enter open"
+                }
+                (FilePane::Remote, true) => "Tab local  Enter/s select host",
+                (FilePane::Remote, false) => {
+                    "Tab local  h hidden files  ↑↓ select  ← parent  →/Enter open"
+                }
+            }
+        } else {
+            match (app.active_file_pane, app.context_host().is_none()) {
+                (FilePane::Local, _) => {
+                    "Click path  / filter  h hidden  Tab remote  ↑↓ select  ← parent  →/Enter open  u upload  r reload"
+                }
+                (FilePane::Remote, true) => "Tab local  Enter/s select host",
+                (FilePane::Remote, false) => {
+                    "Tab local  h hidden  ↑↓ select  ← parent  →/Enter open  d download  s host  o native sftp"
+                }
+            }
         }
     } else {
         "q quit"
@@ -661,7 +1263,19 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::{app::App, hosts::HostCatalog};
+    use crate::{
+        app::{App, TransferStatus, TransferTask},
+        hosts::HostCatalog,
+    };
+
+    #[test]
+    fn file_sizes_use_readable_units() {
+        assert_eq!(format_bytes(12), "12 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(12 * 1024), "12 KB");
+        assert_eq!(format_bytes(1536 * 1024), "1.5 MB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2 GB");
+    }
 
     #[test]
     fn all_sections_render_at_desktop_and_compact_sizes() {
@@ -680,6 +1294,76 @@ mod tests {
                     .expect("render section");
             }
         }
+    }
+
+    #[test]
+    fn files_render_persistent_local_pane_remote_empty_state_and_host_picker() {
+        use crate::{
+            hosts::Host,
+            metadata::{Metadata, parse_tags},
+        };
+
+        for (width, height) in [(120, 40), (80, 24), (54, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut app = App::with_catalog(
+                HostCatalog {
+                    hosts: vec![Host {
+                        alias: "web-prod".into(),
+                        hostname: Some("web.example.com".into()),
+                        user: None,
+                        port: None,
+                        identity_file: None,
+                        managed: false,
+                    }],
+                    error: None,
+                },
+                Ok(Metadata::default()),
+            );
+            app.section = NavSection::Files;
+            app.metadata
+                .tags
+                .insert("web-prod".into(), parse_tags("production"));
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("LOCAL"));
+            assert!(text.contains("REMOTE"));
+            assert!(text.contains("Connect to host"));
+            assert!(text.contains("Select host"));
+
+            app.host_picker_open = true;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Groups"));
+            assert!(text.contains("Hosts"));
+            assert!(text.contains("production"));
+            assert!(text.contains("web-prod"));
+        }
+    }
+
+    #[test]
+    fn files_render_transfer_task_list() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Files;
+        app.transfer_tasks.push(TransferTask {
+            id: 1,
+            direction: crate::sftp::TransferDirection::Upload,
+            name: "notes.txt".into(),
+            local_path: std::path::PathBuf::from("/tmp/notes.txt"),
+            remote_path: "notes.txt".into(),
+            transferred: 10,
+            total: 10,
+            status: TransferStatus::Completed,
+        });
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("TRANSFERS"));
+        assert!(text.contains("notes.txt"));
+        assert!(text.contains("done"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod app;
 mod hosts;
 mod metadata;
+mod sftp;
 mod ui;
 
 use std::{
@@ -12,7 +13,10 @@ use std::{
 use color_eyre::eyre::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{Clear, ClearType, enable_raw_mode},
 };
@@ -23,24 +27,71 @@ use crate::app::{App, ConnectionDialog, InputAction};
 fn main() -> Result<()> {
     color_eyre::install()?;
     let mut terminal = ratatui::init();
+    execute!(io::stdout(), EnableMouseCapture)?;
     let result = run(&mut terminal, App::new());
     ratatui::restore();
+    execute!(io::stdout(), DisableMouseCapture)?;
     result
 }
 
 fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
     while !app.should_quit {
+        app.poll_sftp();
+        app.poll_transfers();
         app.viewport_width = terminal.size()?.width;
         terminal.draw(|frame| ui::render(frame, &app))?;
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && app.handle_event(key) == InputAction::Connect
-        {
-            connect_selected(terminal, &mut app)?;
+        if event::poll(Duration::from_millis(100))? {
+            let action = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_event(key),
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    let size = terminal.size()?;
+                    app.handle_mouse(mouse.column, mouse.row, size.width, size.height)
+                }
+                _ => InputAction::None,
+            };
+            match action {
+                InputAction::Connect => connect_selected(terminal, &mut app)?,
+                InputAction::LoadFiles { host_alias, path } => {
+                    app.start_sftp_listing(host_alias, path)
+                }
+                InputAction::OpenNativeSftp => open_files(terminal, &mut app)?,
+                InputAction::None => {}
+            }
         }
     }
+    Ok(())
+}
+
+fn open_files(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
+    let Some(host) = app.context_host().cloned() else {
+        app.notice = Some("Select a host from the Files remote pane first.".to_string());
+        return Ok(());
+    };
+
+    terminal.show_cursor()?;
+    execute!(io::stdout(), DisableMouseCapture)?;
+    ratatui::restore();
+    execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show)?;
+    let result = Command::new("sftp")
+        .arg(&host.alias)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    let notice = match result {
+        Ok(status) if status.success() => format!("SFTP session to {} ended.", host.alias),
+        Ok(status) => format!("SFTP to {} failed ({})", host.alias, exit_status(status)),
+        Err(error) => format!("Could not start OpenSSH sftp: {error}"),
+    };
+
+    execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Hide)?;
+    enable_raw_mode()?;
+    *terminal = ratatui::init();
+    execute!(io::stdout(), EnableMouseCapture)?;
+    terminal.clear()?;
+    app.notice = Some(notice);
     Ok(())
 }
 
@@ -95,6 +146,7 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     // Leave Ratatui's alternate screen completely before handing the terminal
     // to OpenSSH. The preflight above guarantees that failures stay in the TUI.
     terminal.show_cursor()?;
+    execute!(io::stdout(), DisableMouseCapture)?;
     ratatui::restore();
     execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show)?;
 
@@ -114,6 +166,7 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Hide)?;
     enable_raw_mode()?;
     *terminal = ratatui::init();
+    execute!(io::stdout(), EnableMouseCapture)?;
     terminal.clear()?;
     app.notice = Some(notice);
     Ok(())

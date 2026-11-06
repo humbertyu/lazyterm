@@ -258,7 +258,11 @@ This preserves the user's complete OpenSSH configuration. Only add explicit `-o`
 
 ### 5.3 SftpService
 
-SFTP is the first area that may need a library-backed adapter rather than the system `sftp` command. The service should provide:
+The first v0.2 slice uses `openssh` plus `openssh-sftp-client`. `openssh` launches the system OpenSSH connection with the selected alias, while `openssh-sftp-client` speaks SFTP v3 over the subsystem and provides directory and file operations. This reuses `~/.ssh/config`, Includes, ProxyJump, agent/key routing, and known-host checking without implementing the protocol ourselves. The current UI implements directory listing, basic metadata, entering directories, and returning to the parent.
+
+The system `sftp` client remains available as a native handoff for interactive password prompts, first-time host-key confirmation, and other cases where the library's non-interactive session cannot proceed. It is a compatibility path, not the embedded browser. See the [OpenSSH sftp manual](https://man.openbsd.org/sftp).
+
+The service should provide:
 
 - list directory;
 - stat;
@@ -269,7 +273,15 @@ SFTP is the first area that may need a library-backed adapter rather than the sy
 - remove;
 - cancellation and progress.
 
-It must consume the same effective host profile and credential provider as SSH. This avoids a host working in Terminal but failing in Files because the two screens use different authentication rules.
+The intended contract is one shared host reference and credential policy. The current listing slice resolves the same alias and OpenSSH config but requires key/agent authentication and a previously trusted host key (`StrictHostKeyChecking=yes`); it does not yet share interactive password prompts with the native SSH/SFTP handoff.
+
+### 5.3.1 Shared host context
+
+The workspace retains an optional host alias independently of the Hosts cursor, group, or search. An explicit connection from Hosts or a selection in the Files picker updates that context; merely switching tabs never infers a host from the current cursor or connects.
+
+Each operation resolves the alias against the current catalog. A successful refresh that removes the alias clears the context, while discovery failure retains it and blocks new operations. In-app rename migrates the context. An external rename is deletion plus addition and requires explicit selection of the new alias. Future persisted tunnel/snippet references use this same policy; missing references are disabled, not retargeted.
+
+No module copies hostname, user, port, identity, or proxy fields into a separate host store. OpenSSH receives the alias to resolve inherited settings at execution time.
 
 ### 5.4 TunnelService
 
@@ -405,7 +417,7 @@ Input / timer
 
 Use bounded channels for service events. Long-running work belongs in worker tasks or threads. The UI should display `Starting`, `Transferring`, `Reconnecting`, and `Failed` rather than block on a synchronous network call.
 
-For the current Rust stack, start with standard threads and channels where ownership is simple. Introduce Tokio only when SFTP concurrency, tunnel supervision, or cancellation actually requires an async runtime.
+The current SFTP adapter uses a short-lived Tokio runtime inside a worker thread and returns listing and transfer events through channels. The Ratatui event loop remains non-blocking, and the Files view keeps a bounded transfer history with a progress bar, percentage, and terminal status. The metadata store also remembers the local path, the last remote path by host alias, and the shared hidden-file setting. A supervised worker model and cancellation protocol remain future work.
 
 ## 9. Persistence layout
 
@@ -443,12 +455,14 @@ The storage layer needs schema versioning from its first migration. It should su
 - surface exit status and common errors;
 - add host search and favorite/group metadata.
 
-### Phase 3: SFTP and credentials
+### Phase 3: integrated Files
 
-- choose a maintained SFTP library;
-- implement Keychain adapter;
-- share effective connection profiles;
-- implement directory listing and one transfer path before building the full browser.
+- retain shared host context across modules and validate references;
+- add native SFTP terminal handoff as a small usable bridge;
+- implement the initial dual-pane directory browser: local files stay visible, while the remote pane reuses the Hosts catalog and offers a Groups/Hosts picker;
+- add transfers, progress, cancellation, and mutations around the same service.
+
+Keychain and automatic saved-password entry are a separate deferred track, not a dependency for starting Files with native prompts or agent/key authentication.
 
 ### Phase 4: tunnels
 
@@ -471,8 +485,10 @@ Only add embedded PTY sessions after measuring a real need for multiple live ter
 
 ## 11. Architectural decisions
 
+Development follows integrated vertical slices, not strict release acceptance order. The carry-over backlog in `ROADMAP.md` retains incomplete and unverified work. Safety invariants remain mandatory; starting the next milestone does not claim the previous release is accepted.
+
 1. OpenSSH is the default interactive SSH and Tunnel backend.
-2. SFTP is a separate library-backed capability with shared host and credential models.
+2. SFTP reuses the OpenSSH alias; the embedded adapter currently requires a trusted host key and key/agent auth, with credential-policy unification still open.
 3. The TUI is a state projection, not a process manager or credential store.
 4. Persistent tunnels are supervised independently of the interactive SSH handoff.
 5. Password support starts with safe prompts and Keychain storage; automatic native SSH password injection is a separately validated feature.
