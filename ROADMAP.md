@@ -4,27 +4,42 @@ LazyTerm is early-stage software. This roadmap describes intended release bounda
 
 ## Current
 
-The current feature branch has the initial navigation shell, OpenSSH alias discovery, host search, native SSH handoff, and connection error dialogs in progress. Basic host editing is now part of v0.1.0. SFTP, tunnel management, credential storage, and snippets remain unimplemented until delivered and included in a tagged release.
+The current feature branch implements top-level tabs, compact group cards, tag metadata, orphaned-metadata cleanup, host search, basic managed-host CRUD, native SSH handoff, and connection error dialogs. These are development features, not a completed or tagged v0.1.0 release. SFTP, tunnel management, credential storage, and snippets remain unimplemented.
 
 ## v0.1.0 - Host Management and Native SSH
 
 Goal: manage common SSH host profiles and enter reliable native OpenSSH sessions.
 
-- [ ] Split the TUI shell into app, UI, domain, and adapter modules.
-- [ ] Discover concrete aliases from `~/.ssh/config` and included config files.
-- [ ] Search and select hosts.
-- [ ] Add a host from the TUI with alias, hostname, username, port, and identity file.
-- [ ] Edit and delete hosts created or managed by LazyTerm.
+- [x] Separate app state, UI rendering, SSH config discovery, and metadata into modules. Further domain/adapter extraction remains open.
+- [x] Discover concrete aliases from `~/.ssh/config` and basic included config files. Full OpenSSH grammar and expansion support remain open.
+- [x] Search and select hosts.
+- [x] Add a host from the TUI with alias, hostname, username, port, and identity file.
+- [x] Edit and delete basic hosts created or managed by LazyTerm.
 - [ ] Write basic host fields safely without exposing or storing passwords.
 - [ ] Preserve unrelated comments, `Include` directives, advanced OpenSSH options, and unmanaged host blocks where possible.
-- [ ] Show confirmation before deleting a host or overwriting an existing alias.
-- [ ] Support favorites, groups, and tags as LazyTerm metadata.
+- [x] Show confirmation before deleting a managed host.
+- [ ] Fully validate alias conflicts across included files; keep overwrites refused unless explicitly confirmed.
+- [x] Support tag-based groups as separate, versioned LazyTerm metadata.
+- [x] Clean up metadata for removed SSH aliases on startup/refresh; retain it when discovery fails.
+- [ ] Support favorites.
 - [ ] Launch `ssh <alias>` with inherited terminal and return cleanly to the TUI.
 - [ ] Preserve OpenSSH host-key verification, identity files, `ssh-agent`, `ProxyJump`, and `ProxyCommand`.
 - [ ] Show connection exit status and useful errors.
 - [ ] Support macOS first and document the tested OpenSSH/Rust versions.
 
 Release gate: a clean install can discover or create a normal OpenSSH host, edit or remove a LazyTerm-managed host safely, connect to a host, and return to the TUI without corrupting the terminal.
+
+### v0.1.0 Audit - 2026-11-06
+
+The release gate is **not yet met**. Checked boxes above record implemented behavior, not full release acceptance.
+
+- Safe writing: backups, atomic replacement, private permissions on newly created files, and protection of neighboring managed markers are implemented and tested. Input quoting/validation, included-file alias conflicts, and preservation of manually added advanced options/comments inside a managed block still need dedicated coverage and hardening.
+- SSH acceptance: verify first-time host-key confirmation, changed-key rejection, password/key authentication, ProxyJump/ProxyCommand, and terminal restoration on success, failure, and interruption against disposable SSH fixtures.
+- SSH responsiveness: preflight currently blocks the event loop and cannot be cancelled. It runs a remote `true` command, so restricted-command accounts may fail preflight despite supporting the intended session.
+- Error handling: a missing/unlaunchable SSH executable now stays in a TUI error dialog. Process supervision and simulated process/terminal integration tests remain open.
+- Persistence: groups and tags are implemented; favorites are not. The legacy `view` metadata property remains readable but no longer selects separate Groups/Hosts pages.
+- Environment: local checks ran with Rust 1.92.0 and system OpenSSH 9.9p2 (LibreSSL 3.3.6) on macOS. This does not constitute a tested support matrix.
+- Release preparation: finish the remaining safety and SSH checks, publish release notes, and only then tag a release. Package version `0.1.0` alone does not mean a release has shipped.
 
 ## v0.2.0 - Credentials and SFTP
 

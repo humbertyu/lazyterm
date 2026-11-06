@@ -1,5 +1,6 @@
 mod app;
 mod hosts;
+mod metadata;
 mod ui;
 
 use std::{
@@ -11,13 +12,13 @@ use std::{
 use color_eyre::eyre::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyEventKind},
     execute,
     terminal::{Clear, ClearType, enable_raw_mode},
 };
 use ratatui::DefaultTerminal;
 
-use crate::app::{App, ConnectionDialog, NavSection};
+use crate::app::{App, ConnectionDialog, InputAction};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -29,21 +30,15 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
     while !app.should_quit {
+        app.viewport_width = terminal.size()?.width;
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
+            && app.handle_event(key) == InputAction::Connect
         {
-            if app.searching {
-                app.handle_search_key(key.code);
-            } else if app.connection_dialog.is_some() || app.host_dialog.is_some() {
-                app.handle_key(key.code);
-            } else if app.section == NavSection::Hosts && key.code == KeyCode::Enter {
-                connect_selected(terminal, &mut app)?;
-            } else {
-                app.handle_key(key.code);
-            }
+            connect_selected(terminal, &mut app)?;
         }
     }
     Ok(())
@@ -61,7 +56,7 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     });
     terminal.draw(|frame| ui::render(frame, app))?;
 
-    let preflight = Command::new("ssh")
+    let preflight = match Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
@@ -73,7 +68,18 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
         .arg(&host.alias)
         .arg("true")
         .stdin(Stdio::null())
-        .output()?;
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            app.connection_dialog = Some(ConnectionDialog {
+                title: format!("Connection to {} failed", host.alias),
+                message: format!("Could not start OpenSSH: {error}"),
+                pending: false,
+            });
+            return Ok(());
+        }
+    };
 
     let preflight_detail = String::from_utf8_lossy(&preflight.stderr);
     if !preflight.status.success() && !needs_interactive_auth(&preflight_detail) {

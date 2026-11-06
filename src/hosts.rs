@@ -37,20 +37,20 @@ impl HostCatalog {
         };
         let ssh_dir = home.join(".ssh");
         let config_path = ssh_dir.join("config");
+        Self::load_from(&config_path, &ssh_dir)
+    }
+
+    pub(crate) fn load_from(config_path: &Path, ssh_dir: &Path) -> Self {
         let mut catalog = Self {
             ..Default::default()
         };
-
-        if !config_path.exists() {
-            return catalog;
-        }
 
         let mut visited = HashSet::new();
         let mut seen_aliases = HashSet::new();
         let mut aliases = Vec::new();
         match scan_file(
-            &config_path,
-            &ssh_dir,
+            config_path,
+            ssh_dir,
             &mut visited,
             &mut seen_aliases,
             &mut aliases,
@@ -78,6 +78,14 @@ impl HostCatalog {
             Err(error) => return Err(error),
         };
         if let Some(original_alias) = original_alias
+            && managed_block_range(&contents, original_alias).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Original host is no longer managed by LazyTerm",
+            ));
+        }
+        if let Some(original_alias) = original_alias
             && original_alias != host.alias
         {
             let Some(range) = managed_block_range(&contents, original_alias) else {
@@ -88,7 +96,7 @@ impl HostCatalog {
             };
             contents.replace_range(range, "");
         }
-        if host_exists(&contents, &host.alias) && original_alias != Some(host.alias.as_str()) {
+        if host_exists(&contents, &host.alias)? && original_alias != Some(host.alias.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "That SSH alias already exists and is not managed by LazyTerm",
@@ -138,21 +146,26 @@ fn scan_file(
 ) -> std::io::Result<()> {
     let canonical = match fs::canonicalize(path) {
         Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && fs::symlink_metadata(path).is_err() =>
+        {
+            return Ok(());
+        }
         Err(error) => return Err(error),
     };
     if !visited.insert(canonical.clone()) {
         return Ok(());
     }
     let contents = fs::read_to_string(&canonical)?;
-    for (host, includes) in hosts_and_includes(&contents) {
+    for (host, includes) in hosts_and_includes(&contents)? {
         if let Some(host) = host
             && seen_aliases.insert(host.alias.clone())
         {
             aliases.push(host);
         }
         for include in includes {
-            for included_path in expand_include(&include, ssh_dir) {
+            for included_path in expand_include(&include, ssh_dir)? {
                 scan_file(&included_path, ssh_dir, visited, seen_aliases, aliases)?;
             }
         }
@@ -160,7 +173,9 @@ fn scan_file(
     Ok(())
 }
 
-fn hosts_and_includes(contents: &str) -> Vec<(Option<Host>, Vec<String>)> {
+type ConfigEntries = Vec<(Option<Host>, Vec<String>)>;
+
+fn hosts_and_includes(contents: &str) -> io::Result<ConfigEntries> {
     let mut entries = Vec::new();
     let mut current: Vec<Host> = Vec::new();
     let mut managed_marker = false;
@@ -173,28 +188,35 @@ fn hosts_and_includes(contents: &str) -> Vec<(Option<Host>, Vec<String>)> {
         if line.is_empty() {
             continue;
         }
-        let Ok(parts) = shell_words::split(line) else {
-            continue;
-        };
-        let Some((directive, values)) = parts.split_first() else {
-            continue;
-        };
+        let directive_end = line
+            .find(|character: char| character.is_whitespace() || character == '=')
+            .unwrap_or(line.len());
+        let directive = &line[..directive_end];
+        let values = line[directive_end..].trim_start();
+        let values = values.strip_prefix('=').unwrap_or(values).trim_start();
+        let values = shell_words::split(values)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if values.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Missing value for {directive}"),
+            ));
+        }
         match directive.to_ascii_lowercase().as_str() {
             "host" => {
                 flush_hosts(&mut current, &mut entries);
-                if values.iter().all(|value| is_concrete_alias(value)) {
-                    current = values
-                        .iter()
-                        .map(|alias| Host {
-                            alias: alias.clone(),
-                            hostname: None,
-                            user: None,
-                            port: None,
-                            identity_file: None,
-                            managed: managed_marker,
-                        })
-                        .collect();
-                }
+                current = values
+                    .iter()
+                    .filter(|alias| is_concrete_alias(alias))
+                    .map(|alias| Host {
+                        alias: alias.clone(),
+                        hostname: None,
+                        user: None,
+                        port: None,
+                        identity_file: None,
+                        managed: managed_marker,
+                    })
+                    .collect();
                 managed_marker = false;
             }
             "hostname" if !current.is_empty() => {
@@ -228,7 +250,7 @@ fn hosts_and_includes(contents: &str) -> Vec<(Option<Host>, Vec<String>)> {
         }
     }
     flush_hosts(&mut current, &mut entries);
-    entries
+    Ok(entries)
 }
 
 fn flush_hosts(current: &mut Vec<Host>, entries: &mut Vec<(Option<Host>, Vec<String>)>) {
@@ -240,16 +262,17 @@ fn flush_hosts(current: &mut Vec<Host>, entries: &mut Vec<(Option<Host>, Vec<Str
 #[cfg(test)]
 fn aliases_and_includes(contents: &str) -> Vec<(Option<String>, Vec<String>)> {
     hosts_and_includes(contents)
+        .expect("valid test config")
         .into_iter()
         .map(|(host, includes)| (host.map(|host| host.alias), includes))
         .collect()
 }
 
-fn host_exists(contents: &str, alias: &str) -> bool {
-    hosts_and_includes(contents)
+fn host_exists(contents: &str, alias: &str) -> io::Result<bool> {
+    Ok(hosts_and_includes(contents)?
         .into_iter()
         .filter_map(|(host, _)| host)
-        .any(|host| host.alias == alias)
+        .any(|host| host.alias == alias))
 }
 
 fn format_host_block(host: &Host) -> String {
@@ -285,11 +308,14 @@ fn managed_block_range(contents: &str, alias: &str) -> Option<std::ops::Range<us
         let Some(host_line) = lines.get(index + 1).map(|line| line.trim()) else {
             break;
         };
-        let parsed_aliases = host_line
-            .strip_prefix("Host ")
-            .map(shell_words::split)
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        let parts = shell_words::split(strip_comment(host_line)).ok()?;
+        let parsed_aliases = match parts.split_first() {
+            Some((directive, aliases)) if directive.eq_ignore_ascii_case("host") => aliases,
+            _ => {
+                offset += lines[index].len();
+                continue;
+            }
+        };
         if parsed_aliases.len() != 1 || parsed_aliases[0] != alias {
             offset += lines[index].len();
             continue;
@@ -297,7 +323,15 @@ fn managed_block_range(contents: &str, alias: &str) -> Option<std::ops::Range<us
         let mut end = offset + lines[index].len() + lines[index + 1].len();
         let mut cursor = index + 2;
         while let Some(line) = lines.get(cursor) {
-            if line.trim_start().starts_with("Host ") || line.trim_start().starts_with("Match ") {
+            let directive = line
+                .trim_start()
+                .split([' ', '\t', '='])
+                .next()
+                .unwrap_or("");
+            if line.trim() == "# managed-by: lazyterm"
+                || directive.eq_ignore_ascii_case("host")
+                || directive.eq_ignore_ascii_case("match")
+            {
                 break;
             }
             end += line.len();
@@ -310,7 +344,7 @@ fn managed_block_range(contents: &str, alias: &str) -> Option<std::ops::Range<us
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -342,6 +376,11 @@ fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     ));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
     let mut file = options.open(&temp)?;
     #[cfg(unix)]
     if let Some(metadata) = &existing {
@@ -361,9 +400,12 @@ fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn expand_include(include: &str, ssh_dir: &Path) -> Vec<PathBuf> {
+fn expand_include(include: &str, ssh_dir: &Path) -> io::Result<Vec<PathBuf>> {
     if include.contains('%') || include.contains("${") {
-        return Vec::new();
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Cannot fully resolve SSH Include expansion",
+        ));
     }
     let expanded = if include == "~" {
         env::var_os("HOME").map(PathBuf::from)
@@ -373,7 +415,7 @@ fn expand_include(include: &str, ssh_dir: &Path) -> Vec<PathBuf> {
         Some(PathBuf::from(include))
     };
     let Some(mut pattern) = expanded else {
-        return Vec::new();
+        return Err(io::Error::new(io::ErrorKind::NotFound, "HOME is not set"));
     };
     if !pattern.is_absolute() {
         pattern = ssh_dir.join(pattern);
@@ -381,16 +423,14 @@ fn expand_include(include: &str, ssh_dir: &Path) -> Vec<PathBuf> {
     let pattern = pattern.to_string_lossy().into_owned();
     let mut paths = if pattern.contains(['*', '?', '[']) {
         glob::glob(&pattern)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .map(|entry| entry.map_err(io::Error::other))
+            .collect::<io::Result<Vec<_>>>()?
     } else {
         vec![PathBuf::from(pattern)]
     };
     paths.sort();
-    paths
+    Ok(paths)
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -418,6 +458,44 @@ fn is_concrete_alias(alias: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_block_changes_preserve_the_next_marker_and_case_insensitive_boundary() {
+        let contents = "# keep\n# managed-by: lazyterm\nHost first\n    User deploy\n\n# managed-by: lazyterm\nHost second\n    User root\nhost\tthird\n    User ops\nmatch all\n";
+        let first = managed_block_range(contents, "first").unwrap();
+        let mut deleted = contents.to_string();
+        deleted.replace_range(first, "");
+        assert!(deleted.starts_with("# keep\n# managed-by: lazyterm\nHost second\n"));
+        assert!(managed_block_range(&deleted, "second").is_some());
+        let second = managed_block_range(&deleted, "second").unwrap();
+        assert!(!deleted[second.clone()].contains("third"));
+        deleted.replace_range(second, "");
+        assert_eq!(deleted, "# keep\nhost\tthird\n    User ops\nmatch all\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_config_is_private_and_updates_keep_permissions_and_backup() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = env::temp_dir().join(format!("lazyterm-permissions-{}", std::process::id()));
+        let path = root.join("config");
+        safe_write(&path, b"Host original\n").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        safe_write(&path, b"Host changed\n").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read(path.with_extension("config.lazyterm.bak")).unwrap(),
+            b"Host original\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn discovers_concrete_aliases_and_ignores_patterns_and_match_blocks() {
@@ -450,10 +528,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_equals_syntax_and_concrete_aliases_alongside_patterns() {
+        let hosts = hosts_and_includes(
+            "Host=web *.internal !excluded\n  HostName = web.example.com\nHost db\n  User=deploy\n",
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|(host, _)| host)
+        .collect::<Vec<_>>();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].alias, "web");
+        assert_eq!(hosts[0].hostname.as_deref(), Some("web.example.com"));
+        assert_eq!(hosts[1].user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
     fn recognizes_lazyterm_managed_host_fields() {
         let entries = hosts_and_includes(
             "# managed-by: lazyterm\nHost app\n  HostName app.example.com\n  User deploy\n  Port 2222\n  IdentityFile ~/.ssh/app\nHost api db\n  HostName shared.example.com\n",
-        );
+        ).unwrap();
         let hosts = entries
             .into_iter()
             .filter_map(|(host, _)| host)
