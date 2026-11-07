@@ -74,6 +74,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(pending) = &app.snippet_confirmation {
         render_snippet_confirmation(frame, pending);
     }
+    if let Some(target) = &app.snippet_delete_confirmation {
+        render_snippet_delete_confirmation(frame, target);
+    }
     if let Some((alias, tags)) = &app.tags_dialog {
         let area = centered_rect(68, 7, frame.area());
         frame.render_widget(Clear, area);
@@ -1310,6 +1313,10 @@ fn panel(title: &str) -> Block<'_> {
 }
 
 fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
+    if app.snippet_execution_view {
+        render_snippet_execution(frame, area, app);
+        return;
+    }
     let block = panel(" SNIPPETS ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1416,6 +1423,88 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
         columns[1],
     );
     render_snippet_runs(frame, sections[1], app);
+}
+
+fn render_snippet_execution(frame: &mut Frame, area: Rect, app: &App) {
+    let block = panel(" SNIPPET EXECUTION ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(run) = app.snippet_runs.get(app.selected_snippet_run) else {
+        frame.render_widget(
+            Paragraph::new("No execution selected.").style(Style::default().fg(MUTED)),
+            inner,
+        );
+        return;
+    };
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Snippet: ", Style::default().fg(MUTED)),
+            Span::styled(
+                run.snippet_name.clone(),
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Command: ", Style::default().fg(MUTED)),
+            Span::styled(run.command.clone(), Style::default().fg(TEXT)),
+        ]),
+    ]);
+    frame.render_widget(header, Rect { height: 2, ..inner });
+    let body = Rect {
+        y: inner.y + 3,
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    let columns =
+        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(body);
+    let target_rows = app.snippet_runs.iter().enumerate().map(|(index, item)| {
+        let selected = index == app.selected_snippet_run;
+        let status = match &item.status {
+            crate::app::SnippetRunStatus::Queued => "queued".to_string(),
+            crate::app::SnippetRunStatus::Running => "running".to_string(),
+            crate::app::SnippetRunStatus::Completed(code) => format!("exit {code}"),
+            crate::app::SnippetRunStatus::ConnectionFailed(error) => {
+                format!("connection: {error}")
+            }
+            crate::app::SnippetRunStatus::Cancelled => "cancelled".to_string(),
+        };
+        ListItem::new(vec![
+            Line::from(Span::styled(
+                format!("{} {}", if selected { ">" } else { " " }, item.host_alias),
+                Style::default()
+                    .fg(if selected { GREEN } else { TEXT })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            )),
+            Line::from(Span::styled(
+                format!("  {status}"),
+                Style::default().fg(MUTED),
+            )),
+        ])
+    });
+    frame.render_widget(
+        List::new(target_rows).block(panel(" TARGET HOSTS ")),
+        columns[0],
+    );
+    let output = if run.output.is_empty() {
+        match &run.status {
+            crate::app::SnippetRunStatus::Running => "Waiting for output...".to_string(),
+            crate::app::SnippetRunStatus::Queued => "Queued...".to_string(),
+            _ => "No output.".to_string(),
+        }
+    } else {
+        run.output.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(output)
+            .scroll((app.snippet_output_scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(panel(" OUTPUT ")),
+        columns[1],
+    );
 }
 
 fn render_snippet_runs(frame: &mut Frame, area: Rect, app: &App) {
@@ -1557,6 +1646,34 @@ fn render_snippet_confirmation(frame: &mut Frame, pending: &crate::app::PendingS
     );
 }
 
+fn render_snippet_delete_confirmation(frame: &mut Frame, target: &crate::app::SnippetDeleteTarget) {
+    let area = centered_rect(76, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let (title, message) = match target {
+        crate::app::SnippetDeleteTarget::Package { name, .. } => (
+            " DELETE PACKAGE ",
+            format!("Delete package \"{name}\" and all snippets inside it?"),
+        ),
+        crate::app::SnippetDeleteTarget::Snippet { name, .. } => {
+            (" DELETE SNIPPET ", format!("Delete snippet \"{name}\"?"))
+        }
+    };
+    let block = panel(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(message),
+            Line::from(Span::styled(
+                "y / Enter confirm    n / Esc cancel",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .style(Style::default().fg(TEXT)),
+        inner,
+    );
+}
+
 fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
     let area = centered_rect(82, 22, frame.area());
     frame.render_widget(Clear, area);
@@ -1652,9 +1769,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "1-4 / F1-F4 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
     };
-    let hint = if app.snippet_host_picker_open {
+    let hint = if app.snippet_execution_view {
+        "↑↓ scroll output  [ ] select Host  c cancel  C clear  Esc back  q quit"
+    } else if app.snippet_host_picker_open {
         "↑↓ select group/Host  Enter run one  b run group  Backspace back  Esc cancel"
-    } else if app.snippet_confirmation.is_some() {
+    } else if app.snippet_confirmation.is_some() || app.snippet_delete_confirmation.is_some() {
         "y / Enter confirm    n / Esc cancel"
     } else if app.snippet_dialog.is_some() || app.package_dialog.is_some() {
         "Tab / ↑↓ field  Enter next/save  Esc cancel"
@@ -1729,9 +1848,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "↑↓ select  l local  R remote  D dynamic  s/Space start/stop  r restart  e edit  d delete"
     } else if app.section == NavSection::Snippets {
         if app.snippet_package_open {
-            "↑↓ select  Enter execute  e edit  a add  b group  Y copy  [ ] runs  c cancel  C clear"
+            "↑↓ select  Enter execute  e edit  a add  d delete  b group  Y copy  [ ] runs  c cancel  C clear"
         } else {
-            "↑↓ select package  Enter open  e edit  a add  p new package"
+            "↑↓ select package  Enter open  e edit  a add  d delete"
         }
     } else {
         "q quit"
@@ -1746,6 +1865,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     || app.snippet_dialog.is_some()
                     || app.package_dialog.is_some()
                     || app.snippet_confirmation.is_some()
+                    || app.snippet_delete_confirmation.is_some()
                 {
                     ""
                 } else if app.searching {

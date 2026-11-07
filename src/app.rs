@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::{
     collections::VecDeque,
     fs,
@@ -207,6 +207,9 @@ pub struct App {
     pub selected_snippet_run: usize,
     pub snippet_runs: Vec<SnippetRun>,
     pub snippet_confirmation: Option<PendingSnippetRun>,
+    pub snippet_delete_confirmation: Option<SnippetDeleteTarget>,
+    pub snippet_execution_view: bool,
+    pub snippet_output_scroll: u16,
     pub selected_tunnel: usize,
     pub tunnel_statuses: std::collections::HashMap<u64, TunnelStatus>,
     pub metadata: Metadata,
@@ -242,7 +245,7 @@ pub struct App {
     tunnel_sender: Sender<tunnel::TunnelEvent>,
     tunnel_receiver: Receiver<tunnel::TunnelEvent>,
     tunnel_processes: std::collections::HashMap<u64, Child>,
-    snippet_processes: std::collections::HashMap<u64, Child>,
+    snippet_processes: std::collections::HashMap<u64, SnippetProcess>,
     next_snippet_run_id: u64,
     tunnel_errors: std::collections::HashMap<u64, String>,
     tunnel_retries: std::collections::HashMap<u64, TunnelRetry>,
@@ -323,6 +326,58 @@ pub struct PendingSnippetRun {
     pub snippet_name: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnippetDeleteTarget {
+    Package {
+        id: u64,
+        name: String,
+    },
+    Snippet {
+        package_id: u64,
+        id: u64,
+        name: String,
+    },
+}
+
+enum SnippetProcessEvent {
+    Output(String, bool),
+    Closed,
+}
+
+struct SnippetProcess {
+    child: Child,
+    receiver: Receiver<SnippetProcessEvent>,
+    finished: Option<ExitStatus>,
+    closed_readers: u8,
+}
+
+fn spawn_snippet_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    sender: Sender<SnippetProcessEvent>,
+    stderr: bool,
+) {
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => {
+                    let _ = sender.send(SnippetProcessEvent::Closed);
+                    break;
+                }
+                Ok(size) => {
+                    let text = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                    if sender
+                        .send(SnippetProcessEvent::Output(text, stderr))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 pub struct ConnectionDialog {
     pub title: String,
     pub message: String,
@@ -400,6 +455,9 @@ impl App {
             selected_snippet_run: 0,
             snippet_runs: Vec::new(),
             snippet_confirmation: None,
+            snippet_delete_confirmation: None,
+            snippet_execution_view: false,
+            snippet_output_scroll: 0,
             selected_tunnel: 0,
             tunnel_statuses: metadata
                 .tunnels
@@ -2145,6 +2203,7 @@ impl App {
         command: String,
         snippet_name: String,
     ) {
+        let target_count = host_aliases.len();
         for host_alias in host_aliases {
             let id = self.next_snippet_run_id;
             self.next_snippet_run_id = self.next_snippet_run_id.saturating_add(1);
@@ -2160,24 +2219,13 @@ impl App {
         if !self.snippet_runs.is_empty() {
             self.selected_snippet_run = self.snippet_runs.len().saturating_sub(1);
         }
+        self.snippet_execution_view = true;
+        self.snippet_output_scroll = 0;
         self.notice = Some(format!(
             "Queued {} for {} host{}.",
             snippet_name,
-            self.snippet_runs
-                .iter()
-                .filter(|run| run.snippet_name == snippet_name)
-                .count(),
-            if self
-                .snippet_runs
-                .iter()
-                .filter(|run| run.snippet_name == snippet_name)
-                .count()
-                == 1
-            {
-                ""
-            } else {
-                "s"
-            }
+            target_count,
+            if target_count == 1 { "" } else { "s" }
         ));
     }
 
@@ -2196,48 +2244,96 @@ impl App {
                 continue;
             };
             match std::process::Command::new("ssh")
+                .args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "RequestTTY=no",
+                    "-o",
+                    "ConnectTimeout=10",
+                ])
                 .arg(&run.host_alias)
                 .arg(&run.command)
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
             {
-                Ok(child) => {
+                Ok(mut child) => {
+                    let Some(stdout) = child.stdout.take() else {
+                        let _ = child.kill();
+                        run.status = SnippetRunStatus::ConnectionFailed(
+                            "ssh stdout pipe was unavailable".to_string(),
+                        );
+                        continue;
+                    };
+                    let Some(stderr) = child.stderr.take() else {
+                        let _ = child.kill();
+                        run.status = SnippetRunStatus::ConnectionFailed(
+                            "ssh stderr pipe was unavailable".to_string(),
+                        );
+                        continue;
+                    };
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    spawn_snippet_reader(stdout, sender.clone(), false);
+                    spawn_snippet_reader(stderr, sender, true);
                     run.status = SnippetRunStatus::Running;
-                    self.snippet_processes.insert(id, child);
+                    self.snippet_processes.insert(
+                        id,
+                        SnippetProcess {
+                            child,
+                            receiver,
+                            finished: None,
+                            closed_readers: 0,
+                        },
+                    );
                 }
                 Err(error) => run.status = SnippetRunStatus::ConnectionFailed(error.to_string()),
             }
         }
         let ids = self.snippet_processes.keys().copied().collect::<Vec<_>>();
         for id in ids {
-            let Some(child) = self.snippet_processes.get_mut(&id) else {
+            let Some(process) = self.snippet_processes.get_mut(&id) else {
                 continue;
             };
-            let Ok(Some(status)) = child.try_wait() else {
-                continue;
-            };
-            let mut bytes = Vec::new();
-            if let Some(stdout) = child.stdout.as_mut() {
-                let _ = stdout.read_to_end(&mut bytes);
+            let mut events = Vec::new();
+            while let Ok(event) = process.receiver.try_recv() {
+                events.push(event);
             }
-            if let Some(stderr) = child.stderr.as_mut() {
-                let _ = stderr.read_to_end(&mut bytes);
-            }
-            let output = String::from_utf8_lossy(&bytes).trim().to_string();
             let run = self.snippet_runs.iter_mut().find(|run| run.id == id);
             if let Some(run) = run {
-                run.output = output;
-                let code = status.code().unwrap_or(-1);
-                run.status = if code == 255 {
-                    SnippetRunStatus::ConnectionFailed(
-                        "ssh returned 255; connection or authentication failed".to_string(),
-                    )
-                } else {
-                    SnippetRunStatus::Completed(code)
-                };
+                for event in events {
+                    match event {
+                        SnippetProcessEvent::Output(text, stderr) => {
+                            if stderr {
+                                run.output.push_str("[stderr] ");
+                            }
+                            run.output.push_str(&text);
+                        }
+                        SnippetProcessEvent::Closed => {
+                            process.closed_readers = process.closed_readers.saturating_add(1);
+                        }
+                    }
+                }
             }
-            self.snippet_processes.remove(&id);
+            let closed_readers = process.closed_readers;
+            if process.finished.is_none() {
+                process.finished = process.child.try_wait().ok().flatten();
+            }
+            if process.finished.is_some() && closed_readers >= 2 {
+                let status = process.finished.expect("checked above");
+                let code = status.code().unwrap_or(-1);
+                if let Some(run) = self.snippet_runs.iter_mut().find(|run| run.id == id) {
+                    run.status = if code == 255 {
+                        SnippetRunStatus::ConnectionFailed(
+                            "ssh returned 255; connection or authentication failed".to_string(),
+                        )
+                    } else {
+                        SnippetRunStatus::Completed(code)
+                    };
+                }
+                self.snippet_processes.remove(&id);
+            }
         }
     }
 
@@ -2245,9 +2341,9 @@ impl App {
         let Some(run) = self.snippet_runs.get_mut(self.selected_snippet_run) else {
             return;
         };
-        if let Some(mut child) = self.snippet_processes.remove(&run.id) {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(mut process) = self.snippet_processes.remove(&run.id) {
+            let _ = process.child.kill();
+            let _ = process.child.wait();
             run.status = SnippetRunStatus::Cancelled;
             self.notice = Some(format!(
                 "Cancelled {} on {}.",
@@ -2281,6 +2377,7 @@ impl App {
             || self.snippet_dialog.is_some()
             || self.package_dialog.is_some()
             || self.snippet_confirmation.is_some()
+            || self.snippet_delete_confirmation.is_some()
             || self.tags_dialog.is_some()
             || self.connection_dialog.is_some()
             || self.file_dialog.is_some();
@@ -2316,6 +2413,8 @@ impl App {
             self.handle_file_dialog_key(key.code);
         } else if self.snippet_confirmation.is_some() {
             return self.handle_snippet_confirmation_key(key.code);
+        } else if self.snippet_delete_confirmation.is_some() {
+            self.handle_snippet_delete_key(key.code);
         } else if modal {
             self.handle_key(key.code);
         } else if self.section == NavSection::Hosts && key.code == KeyCode::Enter {
@@ -2549,6 +2648,44 @@ impl App {
             }
             _ => {}
         }
+        if self.snippet_execution_view {
+            match key {
+                KeyCode::Esc | KeyCode::Backspace => {
+                    self.snippet_execution_view = false;
+                    self.snippet_output_scroll = 0;
+                }
+                KeyCode::Up => {
+                    self.snippet_output_scroll = self.snippet_output_scroll.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    self.snippet_output_scroll = self.snippet_output_scroll.saturating_add(1)
+                }
+                KeyCode::Char('[') => {
+                    self.selected_snippet_run = self.selected_snippet_run.saturating_sub(1);
+                    self.snippet_output_scroll = 0;
+                }
+                KeyCode::Char(']') => {
+                    self.selected_snippet_run = (self.selected_snippet_run + 1)
+                        .min(self.snippet_runs.len().saturating_sub(1));
+                    self.snippet_output_scroll = 0;
+                }
+                KeyCode::Char('c') => self.cancel_selected_snippet_run(),
+                KeyCode::Char('C') => {
+                    self.snippet_runs.retain(|run| {
+                        matches!(
+                            run.status,
+                            SnippetRunStatus::Queued | SnippetRunStatus::Running
+                        )
+                    });
+                    self.selected_snippet_run = self
+                        .selected_snippet_run
+                        .min(self.snippet_runs.len().saturating_sub(1));
+                    self.snippet_output_scroll = 0;
+                }
+                _ => {}
+            }
+            return InputAction::None;
+        }
         if self.snippet_host_picker_open {
             let _ = self.handle_snippet_host_picker_key(key);
             return InputAction::None;
@@ -2580,6 +2717,15 @@ impl App {
                         .cloned()
                     {
                         self.open_package_form(Some(package));
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(package) = self.metadata.snippet_packages.get(self.selected_package)
+                    {
+                        self.snippet_delete_confirmation = Some(SnippetDeleteTarget::Package {
+                            id: package.id,
+                            name: package.name.clone(),
+                        });
                     }
                 }
                 _ => {}
@@ -2646,6 +2792,18 @@ impl App {
                     self.open_snippet_form(package_id, Some(snippet));
                 }
             }
+            KeyCode::Char('d') => {
+                if let Some(snippet) = self.metadata.snippet_packages[self.selected_package]
+                    .snippets
+                    .get(self.selected_snippet)
+                {
+                    self.snippet_delete_confirmation = Some(SnippetDeleteTarget::Snippet {
+                        package_id: self.metadata.snippet_packages[self.selected_package].id,
+                        id: snippet.id,
+                        name: snippet.name.clone(),
+                    });
+                }
+            }
             KeyCode::Char('a') => {
                 let package_id = self.metadata.snippet_packages[self.selected_package].id;
                 self.open_snippet_form(package_id, None);
@@ -2693,6 +2851,50 @@ impl App {
             editing_id: package.map(|item| item.id),
             selected_field: 0,
         });
+    }
+
+    fn handle_snippet_delete_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let Some(target) = self.snippet_delete_confirmation.take() else {
+                    return;
+                };
+                match target {
+                    SnippetDeleteTarget::Package { id, name } => {
+                        self.metadata
+                            .snippet_packages
+                            .retain(|package| package.id != id);
+                        self.selected_package = self
+                            .selected_package
+                            .min(self.metadata.snippet_packages.len().saturating_sub(1));
+                        self.snippet_package_open = false;
+                        self.selected_snippet = 0;
+                        self.notice = Some(format!("Deleted package {name}."));
+                    }
+                    SnippetDeleteTarget::Snippet {
+                        package_id,
+                        id,
+                        name,
+                    } => {
+                        if let Some(package) = self
+                            .metadata
+                            .snippet_packages
+                            .iter_mut()
+                            .find(|package| package.id == package_id)
+                        {
+                            package.snippets.retain(|snippet| snippet.id != id);
+                            self.selected_snippet = self
+                                .selected_snippet
+                                .min(package.snippets.len().saturating_sub(1));
+                        }
+                        self.notice = Some(format!("Deleted snippet {name}."));
+                    }
+                }
+                self.save_metadata();
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.snippet_delete_confirmation = None,
+            _ => {}
+        }
     }
 
     fn handle_package_dialog_key(&mut self, key: KeyCode) {
@@ -4976,6 +5178,40 @@ mod tests {
                 snippet_name: "restart".into(),
             }
         );
+    }
+
+    #[test]
+    fn snippets_can_delete_a_snippet_and_a_package_after_confirmation() {
+        let mut app = app_fixture();
+        app.metadata.snippet_packages.push(SnippetPackage {
+            id: 1,
+            name: "Ops".into(),
+            description: String::new(),
+            snippets: vec![SnippetDefinition {
+                id: 1,
+                name: "status".into(),
+                command: "uptime".into(),
+                description: String::new(),
+                dangerous: false,
+            }],
+        });
+        app.snippet_package_open = true;
+        app.handle_snippets_key(KeyCode::Char('d'));
+        assert!(matches!(
+            app.snippet_delete_confirmation,
+            Some(SnippetDeleteTarget::Snippet { .. })
+        ));
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.metadata.snippet_packages[0].snippets.is_empty());
+
+        app.snippet_package_open = false;
+        app.handle_snippets_key(KeyCode::Char('d'));
+        assert!(matches!(
+            app.snippet_delete_confirmation,
+            Some(SnippetDeleteTarget::Package { .. })
+        ));
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.metadata.snippet_packages.is_empty());
     }
 
     #[test]
