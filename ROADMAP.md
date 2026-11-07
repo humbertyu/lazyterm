@@ -124,13 +124,13 @@ Release gate: users can start, inspect, stop, and restart tunnels without orphan
 
 Goal: make repeatable remote tasks easy without requiring an embedded terminal.
 
-- [ ] Save and edit snippets.
-- [ ] Preview the rendered command and target hosts before execution.
-- [ ] Run a snippet on one host.
-- [ ] Run on selected hosts with bounded concurrency.
-- [ ] Show per-host output, exit status, and cancellation.
-- [ ] Copy a rendered command to the system clipboard.
-- [ ] Require confirmation for commands marked destructive.
+- [x] Save and edit snippets inside Packages.
+- [x] Preview the command and choose a target Host or tagged Host group before execution.
+- [x] Run a snippet on one host.
+- [x] Run a snippet on a Host group with bounded concurrency.
+- [x] Show per-host output, exit status, connection errors, and cancellation.
+- [x] Copy a snippet command to the system clipboard.
+- [x] Require confirmation for commands marked destructive.
 
 Release gate: batch results clearly distinguish success, command failure, connection failure, and cancellation.
 

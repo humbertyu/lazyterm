@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::process::Child;
 use std::{
     collections::VecDeque,
@@ -15,7 +16,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::hosts::{Host, HostCatalog};
 use crate::metadata::{
-    HostView, Metadata, TunnelDefinition, TunnelKind, TunnelLifecycle, parse_tags,
+    HostView, Metadata, SnippetDefinition, SnippetPackage, TunnelDefinition, TunnelKind,
+    TunnelLifecycle, parse_tags,
 };
 use crate::sftp::{
     self, Mutation, MutationEvent, MutationRequest, SftpListing, SftpResult, TransferDirection,
@@ -192,7 +194,19 @@ pub struct App {
     pub connection_dialog: Option<ConnectionDialog>,
     pub host_dialog: Option<HostDialog>,
     pub tunnel_dialog: Option<TunnelDialog>,
+    pub snippet_dialog: Option<SnippetDialog>,
+    pub package_dialog: Option<PackageDialog>,
     pub tunnel_host_picker_open: bool,
+    pub snippet_host_picker_open: bool,
+    pub snippet_host_picker_group: Option<HostGroup>,
+    pub snippet_host_picker_selection: usize,
+    pub snippet_package_open: bool,
+    pub selected_package: usize,
+    pub selected_snippet: usize,
+    pub snippet_concurrency: usize,
+    pub selected_snippet_run: usize,
+    pub snippet_runs: Vec<SnippetRun>,
+    pub snippet_confirmation: Option<PendingSnippetRun>,
     pub selected_tunnel: usize,
     pub tunnel_statuses: std::collections::HashMap<u64, TunnelStatus>,
     pub metadata: Metadata,
@@ -228,6 +242,8 @@ pub struct App {
     tunnel_sender: Sender<tunnel::TunnelEvent>,
     tunnel_receiver: Receiver<tunnel::TunnelEvent>,
     tunnel_processes: std::collections::HashMap<u64, Child>,
+    snippet_processes: std::collections::HashMap<u64, Child>,
+    next_snippet_run_id: u64,
     tunnel_errors: std::collections::HashMap<u64, String>,
     tunnel_retries: std::collections::HashMap<u64, TunnelRetry>,
 }
@@ -268,6 +284,45 @@ pub struct TunnelDialog {
     pub deleting: bool,
 }
 
+pub struct SnippetDialog {
+    pub fields: [String; 4],
+    pub package_id: u64,
+    pub editing_id: Option<u64>,
+    pub selected_field: usize,
+}
+
+pub struct PackageDialog {
+    pub fields: [String; 2],
+    pub editing_id: Option<u64>,
+    pub selected_field: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnippetRunStatus {
+    Queued,
+    Running,
+    Completed(i32),
+    ConnectionFailed(String),
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnippetRun {
+    pub id: u64,
+    pub host_alias: String,
+    pub snippet_name: String,
+    pub command: String,
+    pub output: String,
+    pub status: SnippetRunStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSnippetRun {
+    pub targets: Vec<String>,
+    pub command: String,
+    pub snippet_name: String,
+}
+
 pub struct ConnectionDialog {
     pub title: String,
     pub message: String,
@@ -278,8 +333,19 @@ pub struct ConnectionDialog {
 pub enum InputAction {
     None,
     Connect,
-    LoadFiles { host_alias: String, path: String },
+    LoadFiles {
+        host_alias: String,
+        path: String,
+    },
     OpenNativeSftp,
+    RunSnippets {
+        host_aliases: Vec<String>,
+        command: String,
+        snippet_name: String,
+    },
+    CopySnippet {
+        command: String,
+    },
 }
 
 impl App {
@@ -321,7 +387,19 @@ impl App {
             connection_dialog: None,
             host_dialog: None,
             tunnel_dialog: None,
+            snippet_dialog: None,
+            package_dialog: None,
             tunnel_host_picker_open: false,
+            snippet_host_picker_open: false,
+            snippet_host_picker_group: None,
+            snippet_host_picker_selection: 0,
+            snippet_package_open: false,
+            selected_package: 0,
+            selected_snippet: 0,
+            snippet_concurrency: 4,
+            selected_snippet_run: 0,
+            snippet_runs: Vec::new(),
+            snippet_confirmation: None,
             selected_tunnel: 0,
             tunnel_statuses: metadata
                 .tunnels
@@ -366,6 +444,8 @@ impl App {
             tunnel_sender,
             tunnel_receiver,
             tunnel_processes: std::collections::HashMap::new(),
+            snippet_processes: std::collections::HashMap::new(),
+            next_snippet_run_id: 1,
             tunnel_errors: std::collections::HashMap::new(),
             tunnel_retries: std::collections::HashMap::new(),
         }
@@ -1753,6 +1833,27 @@ impl App {
         viewport_width: u16,
         viewport_height: u16,
     ) -> InputAction {
+        if self.section == NavSection::Snippets {
+            if row < 6 || row >= viewport_height.saturating_sub(3) {
+                return InputAction::None;
+            }
+            let content_width = viewport_width.saturating_sub(2);
+            let left_width = content_width * 35 / 100;
+            let list_row = usize::from(row.saturating_sub(7)) / 2;
+            if column < left_width {
+                if list_row < self.metadata.snippet_packages.len() {
+                    self.selected_package = list_row;
+                    self.selected_snippet = 0;
+                    self.snippet_package_open = true;
+                }
+            } else if let Some(package) = self.metadata.snippet_packages.get(self.selected_package)
+                && list_row < package.snippets.len()
+            {
+                self.snippet_package_open = true;
+                self.selected_snippet = list_row;
+            }
+            return InputAction::None;
+        }
         if self.section != NavSection::Files || row < 3 || row >= viewport_height.saturating_sub(3)
         {
             return InputAction::None;
@@ -2011,9 +2112,175 @@ impl App {
         }
     }
 
+    fn selected_snippet(&self) -> Option<&SnippetDefinition> {
+        self.metadata
+            .snippet_packages
+            .get(self.selected_package)?
+            .snippets
+            .get(self.selected_snippet)
+    }
+
+    fn snippet_run_action(&mut self, targets: Vec<String>) -> InputAction {
+        let Some(snippet) = self.selected_snippet().cloned() else {
+            return InputAction::None;
+        };
+        if snippet.dangerous {
+            self.snippet_confirmation = Some(PendingSnippetRun {
+                targets,
+                command: snippet.command,
+                snippet_name: snippet.name,
+            });
+            return InputAction::None;
+        }
+        InputAction::RunSnippets {
+            host_aliases: targets,
+            command: snippet.command,
+            snippet_name: snippet.name,
+        }
+    }
+
+    pub fn start_snippet_runs(
+        &mut self,
+        host_aliases: Vec<String>,
+        command: String,
+        snippet_name: String,
+    ) {
+        for host_alias in host_aliases {
+            let id = self.next_snippet_run_id;
+            self.next_snippet_run_id = self.next_snippet_run_id.saturating_add(1);
+            self.snippet_runs.push(SnippetRun {
+                id,
+                host_alias,
+                snippet_name: snippet_name.clone(),
+                command: command.clone(),
+                output: String::new(),
+                status: SnippetRunStatus::Queued,
+            });
+        }
+        if !self.snippet_runs.is_empty() {
+            self.selected_snippet_run = self.snippet_runs.len().saturating_sub(1);
+        }
+        self.notice = Some(format!(
+            "Queued {} for {} host{}.",
+            snippet_name,
+            self.snippet_runs
+                .iter()
+                .filter(|run| run.snippet_name == snippet_name)
+                .count(),
+            if self
+                .snippet_runs
+                .iter()
+                .filter(|run| run.snippet_name == snippet_name)
+                .count()
+                == 1
+            {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+
+    pub fn poll_snippet_runs(&mut self) {
+        let running = self.snippet_processes.len();
+        let available = self.snippet_concurrency.saturating_sub(running);
+        let queued = self
+            .snippet_runs
+            .iter()
+            .filter(|run| matches!(run.status, SnippetRunStatus::Queued))
+            .take(available)
+            .map(|run| run.id)
+            .collect::<Vec<_>>();
+        for id in queued {
+            let Some(run) = self.snippet_runs.iter_mut().find(|run| run.id == id) else {
+                continue;
+            };
+            match std::process::Command::new("ssh")
+                .arg(&run.host_alias)
+                .arg(&run.command)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => {
+                    run.status = SnippetRunStatus::Running;
+                    self.snippet_processes.insert(id, child);
+                }
+                Err(error) => run.status = SnippetRunStatus::ConnectionFailed(error.to_string()),
+            }
+        }
+        let ids = self.snippet_processes.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let Some(child) = self.snippet_processes.get_mut(&id) else {
+                continue;
+            };
+            let Ok(Some(status)) = child.try_wait() else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if let Some(stdout) = child.stdout.as_mut() {
+                let _ = stdout.read_to_end(&mut bytes);
+            }
+            if let Some(stderr) = child.stderr.as_mut() {
+                let _ = stderr.read_to_end(&mut bytes);
+            }
+            let output = String::from_utf8_lossy(&bytes).trim().to_string();
+            let run = self.snippet_runs.iter_mut().find(|run| run.id == id);
+            if let Some(run) = run {
+                run.output = output;
+                let code = status.code().unwrap_or(-1);
+                run.status = if code == 255 {
+                    SnippetRunStatus::ConnectionFailed(
+                        "ssh returned 255; connection or authentication failed".to_string(),
+                    )
+                } else {
+                    SnippetRunStatus::Completed(code)
+                };
+            }
+            self.snippet_processes.remove(&id);
+        }
+    }
+
+    pub fn cancel_selected_snippet_run(&mut self) {
+        let Some(run) = self.snippet_runs.get_mut(self.selected_snippet_run) else {
+            return;
+        };
+        if let Some(mut child) = self.snippet_processes.remove(&run.id) {
+            let _ = child.kill();
+            let _ = child.wait();
+            run.status = SnippetRunStatus::Cancelled;
+            self.notice = Some(format!(
+                "Cancelled {} on {}.",
+                run.snippet_name, run.host_alias
+            ));
+        } else if matches!(run.status, SnippetRunStatus::Queued) {
+            run.status = SnippetRunStatus::Cancelled;
+        }
+    }
+
+    fn handle_snippet_confirmation_key(&mut self, key: KeyCode) -> InputAction {
+        match key {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Some(pending) = self.snippet_confirmation.take() {
+                    return InputAction::RunSnippets {
+                        host_aliases: pending.targets,
+                        command: pending.command,
+                        snippet_name: pending.snippet_name,
+                    };
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.snippet_confirmation = None,
+            _ => {}
+        }
+        InputAction::None
+    }
+
     pub fn handle_event(&mut self, key: KeyEvent) -> InputAction {
         let modal = self.host_dialog.is_some()
             || self.tunnel_dialog.is_some()
+            || self.snippet_dialog.is_some()
+            || self.package_dialog.is_some()
+            || self.snippet_confirmation.is_some()
             || self.tags_dialog.is_some()
             || self.connection_dialog.is_some()
             || self.file_dialog.is_some();
@@ -2047,6 +2314,8 @@ impl App {
             self.handle_file_filter_key(key.code);
         } else if self.file_dialog.is_some() {
             self.handle_file_dialog_key(key.code);
+        } else if self.snippet_confirmation.is_some() {
+            return self.handle_snippet_confirmation_key(key.code);
         } else if modal {
             self.handle_key(key.code);
         } else if self.section == NavSection::Hosts && key.code == KeyCode::Enter {
@@ -2056,8 +2325,12 @@ impl App {
                 self.set_host_context(Some(host.alias));
                 return InputAction::Connect;
             }
+        } else if self.snippet_host_picker_open {
+            return self.handle_snippet_host_picker_key(key.code);
         } else if self.section == NavSection::Files {
             return self.handle_files_key(key.code);
+        } else if self.section == NavSection::Snippets {
+            return self.handle_snippets_key(key.code);
         } else {
             self.handle_key(key.code);
         }
@@ -2098,6 +2371,14 @@ impl App {
         }
         if self.tunnel_dialog.is_some() {
             self.handle_tunnel_dialog_key(key);
+            return;
+        }
+        if self.snippet_dialog.is_some() {
+            self.handle_snippet_dialog_key(key);
+            return;
+        }
+        if self.package_dialog.is_some() {
+            self.handle_package_dialog_key(key);
             return;
         }
         if self.host_dialog.is_some() {
@@ -2246,6 +2527,411 @@ impl App {
             KeyCode::Char('4') | KeyCode::Char('s') => self.switch_section(NavSection::Snippets),
             _ => {}
         }
+    }
+
+    fn handle_snippets_key(&mut self, key: KeyCode) -> InputAction {
+        match key {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return InputAction::None;
+            }
+            KeyCode::Tab => {
+                self.next_section();
+                return InputAction::None;
+            }
+            KeyCode::BackTab => {
+                self.previous_section();
+                return InputAction::None;
+            }
+            KeyCode::Char('`') => {
+                self.switch_section(self.previous_section);
+                return InputAction::None;
+            }
+            _ => {}
+        }
+        if self.snippet_host_picker_open {
+            let _ = self.handle_snippet_host_picker_key(key);
+            return InputAction::None;
+        }
+        let package_count = self.metadata.snippet_packages.len();
+        if package_count == 0 {
+            if key == KeyCode::Char('a') {
+                self.open_package_form(None);
+            }
+            return InputAction::None;
+        }
+        if !self.snippet_package_open {
+            match key {
+                KeyCode::Up => self.selected_package = self.selected_package.saturating_sub(1),
+                KeyCode::Down => {
+                    self.selected_package =
+                        (self.selected_package + 1).min(package_count.saturating_sub(1))
+                }
+                KeyCode::Enter | KeyCode::Right => {
+                    self.snippet_package_open = true;
+                    self.selected_snippet = 0;
+                }
+                KeyCode::Char('a') => self.open_package_form(None),
+                KeyCode::Char('e') => {
+                    if let Some(package) = self
+                        .metadata
+                        .snippet_packages
+                        .get(self.selected_package)
+                        .cloned()
+                    {
+                        self.open_package_form(Some(package));
+                    }
+                }
+                _ => {}
+            }
+            return InputAction::None;
+        }
+        let snippets = self.metadata.snippet_packages[self.selected_package]
+            .snippets
+            .len();
+        match key {
+            KeyCode::Char('[') => {
+                self.selected_snippet_run = self.selected_snippet_run.saturating_sub(1)
+            }
+            KeyCode::Char(']') => {
+                self.selected_snippet_run =
+                    (self.selected_snippet_run + 1).min(self.snippet_runs.len().saturating_sub(1))
+            }
+            KeyCode::Char('c') => self.cancel_selected_snippet_run(),
+            KeyCode::Char('C') => {
+                self.snippet_runs.retain(|run| {
+                    matches!(
+                        run.status,
+                        SnippetRunStatus::Queued | SnippetRunStatus::Running
+                    )
+                });
+                self.selected_snippet_run = self
+                    .selected_snippet_run
+                    .min(self.snippet_runs.len().saturating_sub(1));
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.snippet_concurrency = (self.snippet_concurrency + 1).min(16)
+            }
+            KeyCode::Char('-') => {
+                self.snippet_concurrency = self.snippet_concurrency.saturating_sub(1).max(1)
+            }
+            KeyCode::Char('Y') => {
+                if let Some(snippet) = self.selected_snippet().cloned() {
+                    return InputAction::CopySnippet {
+                        command: snippet.command,
+                    };
+                }
+            }
+            KeyCode::Up => self.selected_snippet = self.selected_snippet.saturating_sub(1),
+            KeyCode::Down => {
+                self.selected_snippet = (self.selected_snippet + 1).min(snippets.saturating_sub(1))
+            }
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Esc => self.snippet_package_open = false,
+            KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('x') => {
+                if self.metadata.snippet_packages[self.selected_package]
+                    .snippets
+                    .get(self.selected_snippet)
+                    .is_some()
+                {
+                    self.open_snippet_host_picker();
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(snippet) = self.metadata.snippet_packages[self.selected_package]
+                    .snippets
+                    .get(self.selected_snippet)
+                    .cloned()
+                {
+                    let package_id = self.metadata.snippet_packages[self.selected_package].id;
+                    self.open_snippet_form(package_id, Some(snippet));
+                }
+            }
+            KeyCode::Char('a') => {
+                let package_id = self.metadata.snippet_packages[self.selected_package].id;
+                self.open_snippet_form(package_id, None);
+            }
+            KeyCode::Char('b') => {
+                if self.metadata.snippet_packages[self.selected_package]
+                    .snippets
+                    .get(self.selected_snippet)
+                    .is_some()
+                {
+                    self.open_snippet_host_picker();
+                }
+            }
+            _ => {}
+        }
+        InputAction::None
+    }
+
+    fn open_snippet_form(&mut self, package_id: u64, snippet: Option<SnippetDefinition>) {
+        let editing_id = snippet.as_ref().map(|item| item.id);
+        self.snippet_dialog = Some(SnippetDialog {
+            fields: snippet.map_or_else(
+                || std::array::from_fn(|_| String::new()),
+                |item| {
+                    [
+                        item.name,
+                        item.command,
+                        item.description,
+                        item.dangerous.to_string(),
+                    ]
+                },
+            ),
+            package_id,
+            editing_id,
+            selected_field: 0,
+        });
+    }
+
+    fn open_package_form(&mut self, package: Option<SnippetPackage>) {
+        self.package_dialog = Some(PackageDialog {
+            fields: package.as_ref().map_or_else(
+                || [String::new(), String::new()],
+                |item| [item.name.clone(), item.description.clone()],
+            ),
+            editing_id: package.map(|item| item.id),
+            selected_field: 0,
+        });
+    }
+
+    fn handle_package_dialog_key(&mut self, key: KeyCode) {
+        let Some(dialog) = self.package_dialog.as_mut() else {
+            return;
+        };
+        match key {
+            KeyCode::Esc => self.package_dialog = None,
+            KeyCode::Tab | KeyCode::Down => dialog.selected_field = (dialog.selected_field + 1) % 2,
+            KeyCode::BackTab | KeyCode::Up => {
+                dialog.selected_field = (dialog.selected_field + 1) % 2
+            }
+            KeyCode::Backspace => {
+                dialog.fields[dialog.selected_field].pop();
+            }
+            KeyCode::Enter => {
+                if dialog.selected_field == 0 {
+                    dialog.selected_field = 1;
+                    return;
+                }
+                let Some(dialog) = self.package_dialog.take() else {
+                    return;
+                };
+                let name = dialog.fields[0].trim();
+                if name.is_empty() {
+                    self.notice = Some("Package name is required.".to_string());
+                    self.package_dialog = Some(dialog);
+                    return;
+                }
+                let id = dialog.editing_id.unwrap_or_else(|| {
+                    self.metadata
+                        .snippet_packages
+                        .iter()
+                        .map(|package| package.id)
+                        .max()
+                        .unwrap_or_default()
+                        .saturating_add(1)
+                });
+                let package = SnippetPackage {
+                    id,
+                    name: name.to_string(),
+                    description: dialog.fields[1].trim().to_string(),
+                    snippets: self
+                        .metadata
+                        .snippet_packages
+                        .iter()
+                        .find(|item| item.id == id)
+                        .map_or_else(Vec::new, |item| item.snippets.clone()),
+                };
+                if let Some(existing) = self
+                    .metadata
+                    .snippet_packages
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                {
+                    *existing = package;
+                } else {
+                    self.metadata.snippet_packages.push(package);
+                    self.selected_package = self.metadata.snippet_packages.len() - 1;
+                }
+                self.notice = Some(format!("Saved package {name}."));
+                self.save_metadata();
+            }
+            KeyCode::Char(value) if !value.is_control() => {
+                dialog.fields[dialog.selected_field].push(value)
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_snippet_dialog_key(&mut self, key: KeyCode) {
+        let Some(dialog) = self.snippet_dialog.as_mut() else {
+            return;
+        };
+        match key {
+            KeyCode::Esc => self.snippet_dialog = None,
+            KeyCode::Tab | KeyCode::Down => {
+                dialog.selected_field = (dialog.selected_field + 1) % dialog.fields.len()
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                dialog.selected_field =
+                    (dialog.selected_field + dialog.fields.len() - 1) % dialog.fields.len()
+            }
+            KeyCode::Backspace => {
+                dialog.fields[dialog.selected_field].pop();
+            }
+            KeyCode::Enter => {
+                if dialog.selected_field + 1 < dialog.fields.len() {
+                    dialog.selected_field += 1;
+                    return;
+                }
+                let Some(dialog) = self.snippet_dialog.take() else {
+                    return;
+                };
+                let name = dialog.fields[0].trim();
+                let command = dialog.fields[1].trim();
+                if name.is_empty() || command.is_empty() {
+                    self.notice = Some("Snippet name and command are required.".to_string());
+                    self.snippet_dialog = Some(dialog);
+                    return;
+                }
+                let dangerous = matches!(
+                    dialog.fields[3].trim().to_ascii_lowercase().as_str(),
+                    "y" | "yes" | "true" | "1"
+                );
+                let id = dialog.editing_id.unwrap_or_else(|| {
+                    self.metadata
+                        .snippet_packages
+                        .iter()
+                        .flat_map(|package| package.snippets.iter())
+                        .map(|snippet| snippet.id)
+                        .max()
+                        .unwrap_or_default()
+                        .saturating_add(1)
+                });
+                let snippet = SnippetDefinition {
+                    id,
+                    name: name.to_string(),
+                    command: command.to_string(),
+                    description: dialog.fields[2].trim().to_string(),
+                    dangerous,
+                };
+                if let Some(package) = self
+                    .metadata
+                    .snippet_packages
+                    .iter_mut()
+                    .find(|package| package.id == dialog.package_id)
+                {
+                    if let Some(existing) = package.snippets.iter_mut().find(|item| item.id == id) {
+                        *existing = snippet;
+                    } else {
+                        package.snippets.push(snippet);
+                    }
+                    package.snippets.sort_by_key(|item| item.id);
+                    self.notice = Some(format!("Saved snippet {name}."));
+                    self.save_metadata();
+                }
+            }
+            KeyCode::Char(value) if !value.is_control() => {
+                dialog.fields[dialog.selected_field].push(value)
+            }
+            _ => {}
+        }
+    }
+
+    fn snippet_host_picker_items(&self) -> Vec<HostPickerItem> {
+        if let Some(group) = &self.snippet_host_picker_group {
+            return self
+                .hosts
+                .hosts
+                .iter()
+                .filter(|host| self.matches_group(host, group))
+                .map(|host| HostPickerItem::Host(host.alias.clone()))
+                .collect();
+        }
+        self.visible_groups()
+            .into_iter()
+            .map(HostPickerItem::Group)
+            .chain(
+                self.hosts
+                    .hosts
+                    .iter()
+                    .map(|host| HostPickerItem::Host(host.alias.clone())),
+            )
+            .collect()
+    }
+
+    fn open_snippet_host_picker(&mut self) {
+        self.snippet_host_picker_open = true;
+        self.snippet_host_picker_group = None;
+        self.snippet_host_picker_selection = 0;
+    }
+
+    fn handle_snippet_host_picker_key(&mut self, key: KeyCode) -> InputAction {
+        let items = self.snippet_host_picker_items();
+        match key {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                self.snippet_host_picker_open = false;
+            }
+            KeyCode::Esc => self.snippet_host_picker_open = false,
+            KeyCode::Backspace => {
+                if self.snippet_host_picker_group.is_some() {
+                    self.snippet_host_picker_group = None;
+                    self.snippet_host_picker_selection = 0;
+                } else {
+                    self.snippet_host_picker_open = false;
+                }
+            }
+            KeyCode::Up => {
+                self.snippet_host_picker_selection =
+                    self.snippet_host_picker_selection.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                self.snippet_host_picker_selection =
+                    (self.snippet_host_picker_selection + 1).min(items.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                let Some(item) = items.get(self.snippet_host_picker_selection).cloned() else {
+                    return InputAction::None;
+                };
+                match item {
+                    HostPickerItem::Group(group) => {
+                        self.snippet_host_picker_group = Some(group);
+                        self.snippet_host_picker_selection = 0;
+                    }
+                    HostPickerItem::Host(alias) => {
+                        self.snippet_host_picker_open = false;
+                        let Some(package) =
+                            self.metadata.snippet_packages.get(self.selected_package)
+                        else {
+                            return InputAction::None;
+                        };
+                        let Some(snippet) = package.snippets.get(self.selected_snippet) else {
+                            return InputAction::None;
+                        };
+                        self.notice = Some(format!("Running {} on {alias}...", snippet.name));
+                        return self.snippet_run_action(vec![alias]);
+                    }
+                }
+            }
+            KeyCode::Char('b') => {
+                if let Some(HostPickerItem::Group(group)) =
+                    items.get(self.snippet_host_picker_selection).cloned()
+                {
+                    let aliases = self
+                        .hosts
+                        .hosts
+                        .iter()
+                        .filter(|host| self.matches_group(host, &group))
+                        .map(|host| host.alias.clone())
+                        .collect::<Vec<_>>();
+                    self.snippet_host_picker_open = false;
+                    return self.snippet_run_action(aliases);
+                }
+            }
+            _ => {}
+        }
+        InputAction::None
     }
 
     fn open_host_form(&mut self, host: Option<Host>) {
@@ -4235,5 +4921,68 @@ mod tests {
         press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(app.local_files.path, root);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snippets_queue_targets_and_confirm_dangerous_commands() {
+        let mut app = app_fixture();
+        app.metadata.snippet_packages.push(SnippetPackage {
+            id: 1,
+            name: "Ops".into(),
+            description: String::new(),
+            snippets: vec![
+                SnippetDefinition {
+                    id: 1,
+                    name: "status".into(),
+                    command: "uptime".into(),
+                    description: String::new(),
+                    dangerous: false,
+                },
+                SnippetDefinition {
+                    id: 2,
+                    name: "restart".into(),
+                    command: "sudo reboot".into(),
+                    description: String::new(),
+                    dangerous: true,
+                },
+            ],
+        });
+        app.selected_package = 0;
+        app.selected_snippet = 0;
+        app.start_snippet_runs(
+            vec!["one".into(), "two".into()],
+            "uptime".into(),
+            "status".into(),
+        );
+        assert_eq!(app.snippet_runs.len(), 2);
+        assert!(
+            app.snippet_runs
+                .iter()
+                .all(|run| matches!(run.status, SnippetRunStatus::Queued))
+        );
+        assert_eq!(app.snippet_runs[0].command, "uptime");
+
+        app.selected_snippet = 1;
+        assert_eq!(
+            app.snippet_run_action(vec!["one".into()]),
+            InputAction::None
+        );
+        assert!(app.snippet_confirmation.is_some());
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE),
+            InputAction::RunSnippets {
+                host_aliases: vec!["one".into()],
+                command: "sudo reboot".into(),
+                snippet_name: "restart".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn snippets_q_quits_from_the_section() {
+        let mut app = app_fixture();
+        app.section = NavSection::Snippets;
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.should_quit);
     }
 }

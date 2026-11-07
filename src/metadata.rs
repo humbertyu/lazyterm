@@ -40,6 +40,27 @@ pub struct TunnelDefinition {
     pub keepalive_interval_secs: u64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnippetDefinition {
+    pub id: u64,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub dangerous: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnippetPackage {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub snippets: Vec<SnippetDefinition>,
+}
+
 fn default_tunnel_timeout() -> u64 {
     10
 }
@@ -65,6 +86,8 @@ pub struct Metadata {
     pub remote_paths: BTreeMap<String, String>,
     pub show_hidden_files: bool,
     pub tunnels: Vec<TunnelDefinition>,
+    #[serde(default)]
+    pub snippet_packages: Vec<SnippetPackage>,
 }
 
 impl Default for Metadata {
@@ -77,6 +100,7 @@ impl Default for Metadata {
             remote_paths: BTreeMap::new(),
             show_hidden_files: false,
             tunnels: Vec::new(),
+            snippet_packages: Vec::new(),
         }
     }
 }

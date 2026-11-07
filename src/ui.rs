@@ -44,14 +44,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         NavSection::Hosts => render_hosts(frame, page[2], app),
         NavSection::Files => render_files(frame, page[2], app),
         NavSection::Tunnels => render_tunnels(frame, page[2], app),
-        NavSection::Snippets => render_placeholder(
-            frame,
-            page[2],
-            "Snippets",
-            "Command library",
-            "Save commands and run them against one or more hosts.",
-            "Planned",
-        ),
+        NavSection::Snippets => render_snippets(frame, page[2], app),
     }
     render_footer(frame, page[3], app);
     if app.searching {
@@ -68,6 +61,18 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if app.tunnel_host_picker_open {
         render_tunnel_host_picker(frame, app);
+    }
+    if app.snippet_host_picker_open {
+        render_snippet_host_picker(frame, app);
+    }
+    if let Some(dialog) = &app.snippet_dialog {
+        render_snippet_dialog(frame, dialog, app);
+    }
+    if let Some(dialog) = &app.package_dialog {
+        render_package_dialog(frame, dialog);
+    }
+    if let Some(pending) = &app.snippet_confirmation {
+        render_snippet_confirmation(frame, pending);
     }
     if let Some((alias, tags)) = &app.tags_dialog {
         let area = centered_rect(68, 7, frame.area());
@@ -1304,41 +1309,340 @@ fn panel(title: &str) -> Block<'_> {
         .style(Style::default().bg(PANEL))
 }
 
-fn render_placeholder(
-    frame: &mut Frame,
-    area: Rect,
-    section: &str,
-    title: &str,
-    description: &str,
-    status: &str,
-) {
-    let block = panel(section);
+fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
+    let block = panel(" SNIPPETS ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "Packages",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   →   ", Style::default().fg(MUTED)),
+        Span::styled(
+            if app.snippet_package_open {
+                app.metadata
+                    .snippet_packages
+                    .get(app.selected_package)
+                    .map_or("Package", |package| package.name.as_str())
+            } else {
+                "Select a package"
+            },
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(title, Rect { height: 1, ..inner });
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    let sections = Layout::vertical([Constraint::Min(6), Constraint::Length(7)]).split(body);
+    let columns = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(sections[0]);
 
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(38),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
+    let package_rows = app
+        .metadata
+        .snippet_packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| {
+            let selected = !app.snippet_package_open && index == app.selected_package;
+            ListItem::new(vec![
+                Line::from(Span::styled(
+                    format!("▣  {}", package.name),
+                    Style::default()
+                        .fg(if selected { GREEN } else { TEXT })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "   {} snippet{}",
+                        package.snippets.len(),
+                        if package.snippets.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(MUTED),
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(package_rows).block(panel(" PACKAGES ")),
+        columns[0],
+    );
+
+    let snippet_rows = app
+        .metadata
+        .snippet_packages
+        .get(app.selected_package)
+        .map(|package| {
+            package
+                .snippets
+                .iter()
+                .enumerate()
+                .map(|(index, snippet)| {
+                    let selected = app.snippet_package_open && index == app.selected_snippet;
+                    let marker = if selected { ">" } else { " " };
+                    ListItem::new(vec![
+                        Line::from(Span::styled(
+                            format!("{marker}  {{}}  {} {}", snippet.name, snippet.command),
+                            Style::default()
+                                .fg(if selected { GREEN } else { TEXT })
+                                .add_modifier(if selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        )),
+                        Line::from(Span::styled(
+                            if snippet.description.is_empty() {
+                                "     No description".to_string()
+                            } else {
+                                format!("     {}", snippet.description)
+                            },
+                            Style::default().fg(MUTED),
+                        )),
+                    ])
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    frame.render_widget(
+        List::new(snippet_rows).block(panel(" SNIPPETS IN PACKAGE ")),
+        columns[1],
+    );
+    render_snippet_runs(frame, sections[1], app);
+}
+
+fn render_snippet_runs(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = app.snippet_runs.iter().enumerate().map(|(index, run)| {
+        let marker = if index == app.selected_snippet_run {
+            ">"
+        } else {
+            " "
+        };
+        let status = match &run.status {
+            crate::app::SnippetRunStatus::Queued => "queued".to_string(),
+            crate::app::SnippetRunStatus::Running => "running".to_string(),
+            crate::app::SnippetRunStatus::Completed(code) => format!("exit {code}"),
+            crate::app::SnippetRunStatus::ConnectionFailed(error) => {
+                format!("connection: {error}")
+            }
+            crate::app::SnippetRunStatus::Cancelled => "cancelled".to_string(),
+        };
+        let output = run.output.lines().next().unwrap_or("");
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("{marker} {:<18} {:<10} ", run.host_alias, status),
+                Style::default().fg(if index == app.selected_snippet_run {
+                    GREEN
+                } else {
+                    TEXT
+                }),
+            ),
+            Span::styled(output, Style::default().fg(MUTED)),
+        ]))
+    });
+    frame.render_widget(List::new(rows).block(panel(" RUNS ")), area);
+}
+
+fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, app: &App) {
+    let area = centered_rect(82, 16, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(if dialog.editing_id.is_some() {
+        " EDIT SNIPPET "
+    } else {
+        " NEW SNIPPET "
+    });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let labels = ["Name", "Command", "Description", "Dangerous (y/n)"];
+    let rows = Layout::vertical([Constraint::Length(1); 4]).split(inner);
+    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+        let cursor = if index == dialog.selected_field {
+            "_"
+        } else {
+            ""
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{label:<18}"), Style::default().fg(MUTED)),
+                Span::styled(format!("{value}{cursor}"), Style::default().fg(TEXT)),
+            ])),
+            rows[index],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Package: {}   Tab / ↑↓ next field   Enter next / save   Esc cancel",
+            app.metadata
+                .snippet_packages
+                .iter()
+                .find(|package| package.id == dialog.package_id)
+                .map_or("Unknown", |package| package.name.as_str())
+        ))
+        .style(Style::default().fg(MUTED))
+        .wrap(Wrap { trim: true }),
+        Rect {
+            y: inner.y + 6,
+            height: inner.height.saturating_sub(6),
+            ..inner
+        },
+    );
+}
+
+fn render_package_dialog(frame: &mut Frame, dialog: &crate::app::PackageDialog) {
+    let area = centered_rect(72, 11, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(if dialog.editing_id.is_some() {
+        " EDIT PACKAGE "
+    } else {
+        " NEW PACKAGE "
+    });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let labels = ["Name", "Description"];
+    let rows = Layout::vertical([Constraint::Length(1); 2]).split(inner);
+    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+        let cursor = if index == dialog.selected_field {
+            "_"
+        } else {
+            ""
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{label:<14}"), Style::default().fg(MUTED)),
+                Span::styled(format!("{value}{cursor}"), Style::default().fg(TEXT)),
+            ])),
+            rows[index],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("Tab / ↑↓ next field    Enter next / save    Esc cancel")
+            .style(Style::default().fg(MUTED)),
+        Rect {
+            y: inner.y + 4,
+            height: inner.height.saturating_sub(4),
+            ..inner
+        },
+    );
+}
+
+fn render_snippet_confirmation(frame: &mut Frame, pending: &crate::app::PendingSnippetRun) {
+    let area = centered_rect(76, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(" CONFIRM DANGEROUS COMMAND ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "Run {} on {} host(s)?",
+                pending.snippet_name,
+                pending.targets.len()
+            )),
+            Line::from(pending.command.clone()),
+            Line::from(Span::styled(
+                "y / Enter confirm    n / Esc cancel",
+                Style::default().fg(MUTED),
+            )),
         ])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
-        content[1],
+        .style(Style::default().fg(TEXT))
+        .wrap(Wrap { trim: true }),
+        inner,
     );
-    frame.render_widget(
-        Paragraph::new(description)
-            .style(Style::default().fg(MUTED))
-            .wrap(Wrap { trim: true }),
-        content[2],
+}
+
+fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(82, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let title = app.snippet_host_picker_group.as_ref().map_or_else(
+        || " EXECUTE SNIPPET ".to_string(),
+        |group| match group {
+            crate::app::HostGroup::Tag(tag) => format!(" EXECUTE ON GROUP / {tag} "),
+            crate::app::HostGroup::Untagged => " EXECUTE ON GROUP / UNTAGGED ".to_string(),
+        },
     );
+    let block = panel(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if let Some(snippet) = app
+        .metadata
+        .snippet_packages
+        .get(app.selected_package)
+        .and_then(|package| package.snippets.get(app.selected_snippet))
+    {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    snippet.name.clone(),
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("$ {}", snippet.command),
+                    Style::default().fg(MUTED),
+                )),
+            ]),
+            Rect { height: 2, ..inner },
+        );
+    }
+    let list_area = Rect {
+        y: inner.y + 3,
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    let items = if let Some(group) = &app.snippet_host_picker_group {
+        app.hosts
+            .hosts
+            .iter()
+            .filter(|host| match group {
+                crate::app::HostGroup::Tag(tag) => app.tags(host).iter().any(|item| item == tag),
+                crate::app::HostGroup::Untagged => app.tags(host).is_empty(),
+            })
+            .map(|host| crate::app::HostPickerItem::Host(host.alias.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        app.visible_groups()
+            .into_iter()
+            .map(crate::app::HostPickerItem::Group)
+            .chain(
+                app.hosts
+                    .hosts
+                    .iter()
+                    .map(|host| crate::app::HostPickerItem::Host(host.alias.clone())),
+            )
+            .collect::<Vec<_>>()
+    };
+    let rows = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let selected = index == app.snippet_host_picker_selection;
+            let label = match item {
+                crate::app::HostPickerItem::Group(group) => format!("▣  {}", group.title()),
+                crate::app::HostPickerItem::Host(alias) => format!("   {alias}"),
+            };
+            ListItem::new(Span::styled(
+                label,
+                Style::default()
+                    .fg(if selected { GREEN } else { TEXT })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ))
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(status.to_string())
-            .style(Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
-        content[3],
+        List::new(rows)
+            .block(panel(" TARGETS "))
+            .highlight_style(Style::default().fg(GREEN)),
+        list_area,
     );
 }
 
@@ -1348,7 +1652,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "1-4 / F1-F4 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
     };
-    let hint = if app.tunnel_host_picker_open {
+    let hint = if app.snippet_host_picker_open {
+        "↑↓ select group/Host  Enter run one  b run group  Backspace back  Esc cancel"
+    } else if app.snippet_confirmation.is_some() {
+        "y / Enter confirm    n / Esc cancel"
+    } else if app.snippet_dialog.is_some() || app.package_dialog.is_some() {
+        "Tab / ↑↓ field  Enter next/save  Esc cancel"
+    } else if app.tunnel_host_picker_open {
         "↑↓ select group/Host  Enter open/choose  Backspace back  Esc cancel"
     } else if app.tunnel_dialog.is_some() {
         if app
@@ -1417,6 +1727,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
     } else if app.section == NavSection::Tunnels {
         "↑↓ select  l local  R remote  D dynamic  s/Space start/stop  r restart  e edit  d delete"
+    } else if app.section == NavSection::Snippets {
+        if app.snippet_package_open {
+            "↑↓ select  Enter execute  e edit  a add  b group  Y copy  [ ] runs  c cancel  C clear"
+        } else {
+            "↑↓ select package  Enter open  e edit  a add  p new package"
+        }
     } else {
         "q quit"
     };
@@ -1427,6 +1743,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     || app.host_dialog.is_some()
                     || app.tags_dialog.is_some()
                     || app.file_dialog.is_some()
+                    || app.snippet_dialog.is_some()
+                    || app.package_dialog.is_some()
+                    || app.snippet_confirmation.is_some()
                 {
                     ""
                 } else if app.searching {

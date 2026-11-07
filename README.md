@@ -2,7 +2,7 @@
 
 A lightweight, keyboard-driven workspace for remote hosts. LazyTerm aims to bring the useful parts of a Termius-style workflow to a local-first TUI: SSH host management, terminal access, SFTP, tunnels, and command snippets.
 
-The project is at an early stage. The Hosts view reads aliases from `~/.ssh/config`, organizes them by local tags, and opens them with the system OpenSSH client. Basic creation, editing, and deletion are available for LazyTerm-managed hosts. Files now has a local-first dual-pane browser with an embedded SFTP directory view, per-host connection reuse, recursive transfers, transfer history, and confirmed file mutations. Tunnels support Local, Remote, and Dynamic/SOCKS forwards with process supervision; Snippets remain in development.
+The project is at an early stage. The Hosts view reads aliases from `~/.ssh/config`, organizes them by local tags, and opens them with the system OpenSSH client. Basic creation, editing, and deletion are available for LazyTerm-managed hosts. Files now has a local-first dual-pane browser with an embedded SFTP directory view, per-host connection reuse, recursive transfers, transfer history, and confirmed file mutations. Tunnels support Local, Remote, and Dynamic/SOCKS forwards with process supervision. Snippets are organized into Packages, can run against a Host or tagged Host group with bounded concurrency, and show per-host output and status.
 
 ## Requirements
 

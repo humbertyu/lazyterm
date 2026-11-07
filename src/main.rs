@@ -41,6 +41,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         app.poll_transfers();
         app.poll_mutations();
         app.poll_tunnels();
+        app.poll_snippet_runs();
         app.viewport_width = terminal.size()?.width;
         terminal.draw(|frame| ui::render(frame, &app))?;
 
@@ -59,11 +60,54 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                     app.start_sftp_listing(host_alias, path)
                 }
                 InputAction::OpenNativeSftp => open_files(terminal, &mut app)?,
+                InputAction::RunSnippets {
+                    host_aliases,
+                    command,
+                    snippet_name,
+                } => app.start_snippet_runs(host_aliases, command, snippet_name),
+                InputAction::CopySnippet { command } => copy_to_clipboard(&mut app, &command),
                 InputAction::None => {}
             }
         }
     }
     Ok(())
+}
+
+fn copy_to_clipboard(app: &mut App, command: &str) {
+    let candidates = if cfg!(target_os = "macos") {
+        vec![("pbcopy", Vec::<&str>::new())]
+    } else if cfg!(target_os = "windows") {
+        vec![("clip", Vec::<&str>::new())]
+    } else {
+        vec![
+            ("wl-copy", Vec::<&str>::new()),
+            ("xclip", vec!["-selection", "clipboard"]),
+        ]
+    };
+    for (program, args) in candidates {
+        let mut child = match Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            let _ = stdin.write_all(command.as_bytes());
+        }
+        match child.wait() {
+            Ok(status) if status.success() => {
+                app.notice = Some("Copied snippet command to clipboard.".to_string());
+                return;
+            }
+            _ => {}
+        }
+    }
+    app.notice = Some("Clipboard tool is unavailable.".to_string());
 }
 
 fn open_files(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
