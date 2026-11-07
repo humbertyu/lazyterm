@@ -1,3 +1,4 @@
+use std::process::Child;
 use std::{
     collections::VecDeque,
     fs,
@@ -7,16 +8,20 @@ use std::{
         atomic::AtomicBool,
         mpsc::{Receiver, Sender, TryRecvError},
     },
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::hosts::{Host, HostCatalog};
-use crate::metadata::{HostView, Metadata, parse_tags};
+use crate::metadata::{
+    HostView, Metadata, TunnelDefinition, TunnelKind, TunnelLifecycle, parse_tags,
+};
 use crate::sftp::{
     self, Mutation, MutationEvent, MutationRequest, SftpListing, SftpResult, TransferDirection,
     TransferEvent, TransferRequest,
 };
+use crate::tunnel;
 
 pub const LOCAL_BREADCRUMB_SEPARATOR: &str = "  >  ";
 
@@ -118,6 +123,14 @@ pub struct TransferTask {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TunnelStatus {
+    Stopped,
+    Starting,
+    Running,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostPickerItem {
     Group(HostGroup),
     Host(String),
@@ -178,6 +191,10 @@ pub struct App {
     pub notice: Option<String>,
     pub connection_dialog: Option<ConnectionDialog>,
     pub host_dialog: Option<HostDialog>,
+    pub tunnel_dialog: Option<TunnelDialog>,
+    pub tunnel_host_picker_open: bool,
+    pub selected_tunnel: usize,
+    pub tunnel_statuses: std::collections::HashMap<u64, TunnelStatus>,
     pub metadata: Metadata,
     pub metadata_error: bool,
     pub active_group: Option<HostGroup>,
@@ -208,6 +225,16 @@ pub struct App {
     mutation_sender: Sender<MutationEvent>,
     mutation_receiver: Receiver<MutationEvent>,
     mutation_hosts: std::collections::HashMap<u64, String>,
+    tunnel_sender: Sender<tunnel::TunnelEvent>,
+    tunnel_receiver: Receiver<tunnel::TunnelEvent>,
+    tunnel_processes: std::collections::HashMap<u64, Child>,
+    tunnel_errors: std::collections::HashMap<u64, String>,
+    tunnel_retries: std::collections::HashMap<u64, TunnelRetry>,
+}
+
+struct TunnelRetry {
+    attempts: u8,
+    next_attempt: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +257,14 @@ pub struct HostDialog {
     pub original_alias: Option<String>,
     pub selected_field: usize,
     pub editing: bool,
+    pub deleting: bool,
+}
+
+pub struct TunnelDialog {
+    pub fields: [String; 8],
+    pub kind: TunnelKind,
+    pub editing_id: Option<u64>,
+    pub selected_field: usize,
     pub deleting: bool,
 }
 
@@ -271,6 +306,7 @@ impl App {
         });
         let (transfer_sender, transfer_receiver) = std::sync::mpsc::channel();
         let (mutation_sender, mutation_receiver) = std::sync::mpsc::channel();
+        let (tunnel_sender, tunnel_receiver) = std::sync::mpsc::channel();
         Self {
             section: NavSection::Hosts,
             previous_section: NavSection::Hosts,
@@ -284,6 +320,14 @@ impl App {
             notice,
             connection_dialog: None,
             host_dialog: None,
+            tunnel_dialog: None,
+            tunnel_host_picker_open: false,
+            selected_tunnel: 0,
+            tunnel_statuses: metadata
+                .tunnels
+                .iter()
+                .map(|tunnel| (tunnel.id, TunnelStatus::Stopped))
+                .collect(),
             metadata,
             metadata_error,
             active_group: None,
@@ -319,6 +363,11 @@ impl App {
             mutation_sender,
             mutation_receiver,
             mutation_hosts: std::collections::HashMap::new(),
+            tunnel_sender,
+            tunnel_receiver,
+            tunnel_processes: std::collections::HashMap::new(),
+            tunnel_errors: std::collections::HashMap::new(),
+            tunnel_retries: std::collections::HashMap::new(),
         }
     }
 
@@ -1330,6 +1379,169 @@ impl App {
         }
     }
 
+    pub fn poll_tunnels(&mut self) {
+        while let Ok(event) = self.tunnel_receiver.try_recv() {
+            match event {
+                tunnel::TunnelEvent::Stderr { id, message } => {
+                    let failed =
+                        matches!(self.tunnel_statuses.get(&id), Some(TunnelStatus::Failed(_)));
+                    self.tunnel_errors.insert(id, message.clone());
+                    if failed {
+                        self.tunnel_statuses
+                            .insert(id, TunnelStatus::Failed(message.clone()));
+                        self.notice = Some(format!("Tunnel failed: {message}"));
+                    }
+                }
+            }
+        }
+
+        let due = self
+            .tunnel_retries
+            .iter()
+            .filter(|(_, retry)| retry.next_attempt <= Instant::now())
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in due {
+            self.tunnel_retries.remove(&id);
+            if let Some(index) = self
+                .metadata
+                .tunnels
+                .iter()
+                .position(|tunnel| tunnel.id == id)
+            {
+                self.selected_tunnel = index;
+                self.start_selected_tunnel();
+            }
+        }
+
+        let ids = self.tunnel_processes.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let result = self.tunnel_processes.get_mut(&id).map(Child::try_wait);
+            let Some(result) = result else {
+                continue;
+            };
+            match result {
+                Ok(None) => {
+                    self.tunnel_statuses.insert(id, TunnelStatus::Running);
+                }
+                Ok(Some(status)) => {
+                    self.tunnel_processes.remove(&id);
+                    if status.success() {
+                        self.tunnel_errors.remove(&id);
+                        self.tunnel_retries.remove(&id);
+                        self.tunnel_statuses.insert(id, TunnelStatus::Stopped);
+                    } else {
+                        let message = self
+                            .tunnel_errors
+                            .remove(&id)
+                            .unwrap_or_else(|| format!("ssh exited with {status}"));
+                        self.notice = Some(format!("Tunnel failed: {message}"));
+                        self.tunnel_statuses
+                            .insert(id, TunnelStatus::Failed(message.clone()));
+                        if let Some(tunnel) =
+                            self.metadata.tunnels.iter().find(|tunnel| tunnel.id == id)
+                            && tunnel.auto_reconnect
+                        {
+                            let retry = self.tunnel_retries.entry(id).or_insert(TunnelRetry {
+                                attempts: 0,
+                                next_attempt: Instant::now(),
+                            });
+                            if retry.attempts < 5 {
+                                retry.attempts += 1;
+                                let delay = 1_u64 << (retry.attempts - 1);
+                                retry.next_attempt = Instant::now() + Duration::from_secs(delay);
+                                self.notice = Some(format!(
+                                    "Tunnel failed; reconnecting in {delay}s (attempt {}/5).",
+                                    retry.attempts
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.tunnel_processes.remove(&id);
+                    let message = format!("Could not check tunnel process: {error}");
+                    self.tunnel_errors.insert(id, message.clone());
+                    self.tunnel_statuses
+                        .insert(id, TunnelStatus::Failed(message.clone()));
+                    self.notice = Some(message);
+                }
+            }
+        }
+    }
+
+    pub fn start_selected_tunnel(&mut self) {
+        let Some(tunnel) = self.selected_tunnel_definition().cloned() else {
+            self.notice = Some("Select a tunnel first.".to_string());
+            return;
+        };
+        if self.tunnel_processes.contains_key(&tunnel.id) {
+            self.notice = Some(format!("Tunnel {} is already running.", tunnel.label));
+            return;
+        }
+        self.tunnel_errors.remove(&tunnel.id);
+        self.tunnel_retries.remove(&tunnel.id);
+        match tunnel::spawn_forward(&tunnel, self.tunnel_sender.clone()) {
+            Ok(child) => {
+                self.tunnel_processes.insert(tunnel.id, child);
+                self.tunnel_statuses
+                    .insert(tunnel.id, TunnelStatus::Starting);
+                self.notice = Some(format!("Starting tunnel {}.", tunnel.label));
+            }
+            Err(error) => {
+                let message = format!("Could not start tunnel: {error}");
+                self.tunnel_statuses
+                    .insert(tunnel.id, TunnelStatus::Failed(message.clone()));
+                self.tunnel_errors.insert(tunnel.id, message.clone());
+                self.notice = Some(message);
+            }
+        }
+    }
+
+    pub fn stop_selected_tunnel(&mut self) {
+        let Some(tunnel) = self.selected_tunnel_definition().cloned() else {
+            self.notice = Some("Select a tunnel first.".to_string());
+            return;
+        };
+        self.stop_tunnel(tunnel.id);
+        self.notice = Some(format!("Stopped tunnel {}.", tunnel.label));
+    }
+
+    pub fn toggle_selected_tunnel(&mut self) {
+        let Some(tunnel) = self.selected_tunnel_definition() else {
+            self.notice = Some("Select a tunnel first.".to_string());
+            return;
+        };
+        if self.tunnel_processes.contains_key(&tunnel.id) {
+            self.stop_selected_tunnel();
+        } else {
+            self.start_selected_tunnel();
+        }
+    }
+
+    fn stop_tunnel(&mut self, id: u64) {
+        if let Some(mut child) = self.tunnel_processes.remove(&id) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.tunnel_errors.remove(&id);
+        self.tunnel_retries.remove(&id);
+        self.tunnel_statuses.insert(id, TunnelStatus::Stopped);
+    }
+
+    fn stop_orphaned_tunnels(&mut self) {
+        let ids = self
+            .tunnel_processes
+            .keys()
+            .copied()
+            .filter(|id| !self.metadata.tunnels.iter().any(|tunnel| tunnel.id == *id))
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.stop_tunnel(id);
+            self.tunnel_statuses.remove(&id);
+        }
+    }
+
     pub fn host_picker_items(&self) -> Vec<HostPickerItem> {
         if let Some(group) = &self.host_picker_group {
             return self
@@ -1801,6 +2013,7 @@ impl App {
 
     pub fn handle_event(&mut self, key: KeyEvent) -> InputAction {
         let modal = self.host_dialog.is_some()
+            || self.tunnel_dialog.is_some()
             || self.tags_dialog.is_some()
             || self.connection_dialog.is_some()
             || self.file_dialog.is_some();
@@ -1883,9 +2096,63 @@ impl App {
             self.handle_tags_key(key);
             return;
         }
+        if self.tunnel_dialog.is_some() {
+            self.handle_tunnel_dialog_key(key);
+            return;
+        }
         if self.host_dialog.is_some() {
             self.handle_host_dialog_key(key);
             return;
+        }
+        if self.section == NavSection::Tunnels {
+            match key {
+                KeyCode::Up => {
+                    self.selected_tunnel = self.selected_tunnel.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.selected_tunnel = (self.selected_tunnel + 1)
+                        .min(self.metadata.tunnels.len().saturating_sub(1));
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.open_tunnel_form(self.selected_tunnel_definition().cloned());
+                    return;
+                }
+                KeyCode::Char('s') | KeyCode::Char(' ') => {
+                    self.toggle_selected_tunnel();
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    if let Some(tunnel) = self.selected_tunnel_definition().cloned() {
+                        if self.tunnel_processes.contains_key(&tunnel.id) {
+                            self.stop_tunnel(tunnel.id);
+                        }
+                        self.start_selected_tunnel();
+                    }
+                    return;
+                }
+                KeyCode::Char('A') => {
+                    if let Some(tunnel) = self.selected_tunnel_definition().cloned()
+                        && let Some(stored) = self
+                            .metadata
+                            .tunnels
+                            .iter_mut()
+                            .find(|item| item.id == tunnel.id)
+                    {
+                        stored.auto_reconnect = !stored.auto_reconnect;
+                        let state = if stored.auto_reconnect {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
+                        self.notice = Some(format!("Auto-reconnect {state}."));
+                        self.save_metadata();
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.connection_dialog.is_some() {
             self.connection_dialog = None;
@@ -1955,6 +2222,24 @@ impl App {
                     self.notice = Some("Only LazyTerm-managed hosts can be deleted.".to_string());
                 }
             }
+            KeyCode::Char('a') if self.section == NavSection::Tunnels => {
+                self.open_tunnel_form(None)
+            }
+            KeyCode::Char('l') if self.section == NavSection::Tunnels => {
+                self.open_tunnel_form_with_kind(None, TunnelKind::Local)
+            }
+            KeyCode::Char('R') if self.section == NavSection::Tunnels => {
+                self.open_tunnel_form_with_kind(None, TunnelKind::Remote)
+            }
+            KeyCode::Char('D') if self.section == NavSection::Tunnels => {
+                self.open_tunnel_form_with_kind(None, TunnelKind::Dynamic)
+            }
+            KeyCode::Char('e') if self.section == NavSection::Tunnels => {
+                self.open_tunnel_form(self.selected_tunnel_definition().cloned());
+            }
+            KeyCode::Char('d') if self.section == NavSection::Tunnels => {
+                self.open_tunnel_delete();
+            }
             KeyCode::Char('1') => self.switch_section(NavSection::Hosts),
             KeyCode::Char('2') | KeyCode::Char('f') => self.switch_section(NavSection::Files),
             KeyCode::Char('3') | KeyCode::Char('t') => self.switch_section(NavSection::Tunnels),
@@ -1986,6 +2271,338 @@ impl App {
         });
     }
 
+    pub fn selected_tunnel_definition(&self) -> Option<&TunnelDefinition> {
+        self.metadata.tunnels.get(self.selected_tunnel)
+    }
+
+    fn open_tunnel_form(&mut self, tunnel: Option<TunnelDefinition>) {
+        self.open_tunnel_form_with_kind(tunnel, TunnelKind::Local);
+    }
+
+    fn open_tunnel_form_with_kind(
+        &mut self,
+        tunnel: Option<TunnelDefinition>,
+        default_kind: TunnelKind,
+    ) {
+        let kind = tunnel.as_ref().map_or(default_kind, |tunnel| tunnel.kind);
+        let mut fields = tunnel.as_ref().map_or_else(
+            || {
+                [
+                    String::new(),
+                    self.host_context.clone().unwrap_or_default(),
+                    "127.0.0.1".to_string(),
+                    String::new(),
+                    if kind == TunnelKind::Dynamic {
+                        String::new()
+                    } else {
+                        "127.0.0.1".to_string()
+                    },
+                    String::new(),
+                    "10".to_string(),
+                    "30".to_string(),
+                ]
+            },
+            |tunnel| {
+                [
+                    tunnel.label.clone(),
+                    tunnel.host_alias.clone(),
+                    tunnel.bind_address.clone(),
+                    tunnel.local_port.to_string(),
+                    tunnel.remote_host.clone().unwrap_or_default(),
+                    tunnel
+                        .remote_port
+                        .map_or_else(String::new, |port| port.to_string()),
+                    tunnel.connect_timeout_secs.to_string(),
+                    tunnel.keepalive_interval_secs.to_string(),
+                ]
+            },
+        );
+        if kind == TunnelKind::Dynamic {
+            fields[4].clear();
+            fields[5].clear();
+        }
+        self.tunnel_dialog = Some(TunnelDialog {
+            fields,
+            kind,
+            editing_id: tunnel.map(|tunnel| tunnel.id),
+            selected_field: 0,
+            deleting: false,
+        });
+    }
+
+    fn open_tunnel_delete(&mut self) {
+        let Some(tunnel) = self.selected_tunnel_definition().cloned() else {
+            self.notice = Some("Select a tunnel first.".to_string());
+            return;
+        };
+        self.tunnel_dialog = Some(TunnelDialog {
+            fields: [
+                tunnel.label,
+                tunnel.host_alias,
+                tunnel.bind_address,
+                tunnel.local_port.to_string(),
+                tunnel.remote_host.unwrap_or_default(),
+                tunnel
+                    .remote_port
+                    .map_or_else(String::new, |port| port.to_string()),
+                tunnel.connect_timeout_secs.to_string(),
+                tunnel.keepalive_interval_secs.to_string(),
+            ],
+            kind: tunnel.kind,
+            editing_id: Some(tunnel.id),
+            selected_field: 0,
+            deleting: true,
+        });
+    }
+
+    fn open_tunnel_host_picker(&mut self) {
+        if self.hosts.hosts.is_empty() {
+            self.notice = Some("No SSH Hosts are available to select.".to_string());
+            return;
+        }
+        self.host_picker_group = None;
+        self.host_picker_selection = 0;
+        self.tunnel_host_picker_open = true;
+    }
+
+    fn handle_tunnel_host_picker_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc | KeyCode::Backspace => {
+                if self.host_picker_group.is_some() {
+                    self.host_picker_group = None;
+                    self.host_picker_selection = 0;
+                } else {
+                    self.tunnel_host_picker_open = false;
+                }
+            }
+            KeyCode::Up | KeyCode::Down => self.move_host_picker_selection(key),
+            KeyCode::Enter => {
+                match self
+                    .host_picker_items()
+                    .get(self.host_picker_selection)
+                    .cloned()
+                {
+                    Some(HostPickerItem::Group(group)) => {
+                        self.host_picker_group = Some(group);
+                        self.host_picker_selection = 0;
+                    }
+                    Some(HostPickerItem::Host(alias)) => {
+                        if let Some(dialog) = self.tunnel_dialog.as_mut() {
+                            dialog.fields[1] = alias;
+                        }
+                        self.host_picker_group = None;
+                        self.host_picker_selection = 0;
+                        self.tunnel_host_picker_open = false;
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_tunnel_dialog_key(&mut self, key: KeyCode) {
+        if self.tunnel_host_picker_open {
+            self.handle_tunnel_host_picker_key(key);
+            return;
+        }
+        match key {
+            KeyCode::F(1) => {
+                self.set_tunnel_dialog_kind(TunnelKind::Local);
+                return;
+            }
+            KeyCode::F(2) => {
+                self.set_tunnel_dialog_kind(TunnelKind::Remote);
+                return;
+            }
+            KeyCode::F(3) => {
+                self.set_tunnel_dialog_kind(TunnelKind::Dynamic);
+                return;
+            }
+            _ => {}
+        }
+        if key == KeyCode::Enter
+            && self
+                .tunnel_dialog
+                .as_ref()
+                .is_some_and(|dialog| !dialog.deleting && dialog.selected_field == 1)
+        {
+            self.open_tunnel_host_picker();
+            return;
+        }
+        let Some(dialog) = self.tunnel_dialog.as_mut() else {
+            return;
+        };
+        if dialog.deleting {
+            match key {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let Some(id) = dialog.editing_id else {
+                        self.tunnel_dialog = None;
+                        return;
+                    };
+                    let label = dialog.fields[0].clone();
+                    self.stop_tunnel(id);
+                    self.metadata.tunnels.retain(|tunnel| tunnel.id != id);
+                    self.tunnel_statuses.remove(&id);
+                    self.tunnel_dialog = None;
+                    self.selected_tunnel = self
+                        .selected_tunnel
+                        .min(self.metadata.tunnels.len().saturating_sub(1));
+                    self.notice = Some(format!("Deleted tunnel {label}."));
+                    self.save_metadata();
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.tunnel_dialog = None,
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            KeyCode::Esc => self.tunnel_dialog = None,
+            KeyCode::Tab | KeyCode::Down => {
+                dialog.selected_field = (dialog.selected_field + 1) % dialog.fields.len()
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                dialog.selected_field =
+                    (dialog.selected_field + dialog.fields.len() - 1) % dialog.fields.len()
+            }
+            KeyCode::Backspace => {
+                dialog.fields[dialog.selected_field].pop();
+            }
+            KeyCode::Enter => {
+                if dialog.selected_field + 1 < dialog.fields.len() {
+                    dialog.selected_field += 1;
+                    return;
+                }
+                let Some(dialog) = self.tunnel_dialog.take() else {
+                    return;
+                };
+                let label = dialog.fields[0].trim();
+                let host_alias = dialog.fields[1].trim();
+                let bind_address = dialog.fields[2].trim();
+                let remote_host = dialog.fields[4].trim();
+                let local_port = match dialog.fields[3].trim().parse::<u16>() {
+                    Ok(port) if port > 0 => port,
+                    _ => {
+                        self.notice =
+                            Some("Local port must be an integer from 1 to 65535.".to_string());
+                        self.tunnel_dialog = Some(dialog);
+                        return;
+                    }
+                };
+                let remote_port = if dialog.kind == TunnelKind::Dynamic {
+                    None
+                } else {
+                    match dialog.fields[5].trim().parse::<u16>() {
+                        Ok(port) if port > 0 => Some(port),
+                        _ => {
+                            self.notice = Some(
+                                "Destination port must be an integer from 1 to 65535.".to_string(),
+                            );
+                            self.tunnel_dialog = Some(dialog);
+                            return;
+                        }
+                    }
+                };
+                let connect_timeout_secs = match dialog.fields[6].trim().parse::<u64>() {
+                    Ok(value) if value > 0 => value.min(300),
+                    _ => {
+                        self.notice = Some("Connect timeout must be 1-300 seconds.".to_string());
+                        self.tunnel_dialog = Some(dialog);
+                        return;
+                    }
+                };
+                let keepalive_interval_secs = match dialog.fields[7].trim().parse::<u64>() {
+                    Ok(value) => value.min(3600),
+                    _ => {
+                        self.notice =
+                            Some("KeepAlive interval must be 0-3600 seconds.".to_string());
+                        self.tunnel_dialog = Some(dialog);
+                        return;
+                    }
+                };
+                if label.is_empty() || host_alias.is_empty() || bind_address.is_empty() {
+                    self.notice =
+                        Some("Label, SSH host, and Bind address are required.".to_string());
+                    self.tunnel_dialog = Some(dialog);
+                    return;
+                }
+                if dialog.kind != TunnelKind::Dynamic && remote_host.is_empty() {
+                    self.notice = Some("Destination address is required.".to_string());
+                    self.tunnel_dialog = Some(dialog);
+                    return;
+                }
+                let custom_host = !self.hosts.hosts.iter().any(|host| host.alias == host_alias);
+                let id = dialog.editing_id.unwrap_or_else(|| {
+                    self.metadata
+                        .tunnels
+                        .iter()
+                        .map(|tunnel| tunnel.id)
+                        .max()
+                        .unwrap_or_default()
+                        .saturating_add(1)
+                });
+                if dialog.editing_id.is_some() {
+                    self.stop_tunnel(id);
+                }
+                let tunnel = TunnelDefinition {
+                    id,
+                    label: label.to_string(),
+                    host_alias: host_alias.to_string(),
+                    custom_host,
+                    kind: dialog.kind,
+                    bind_address: bind_address.to_string(),
+                    local_port,
+                    remote_host: if dialog.kind == TunnelKind::Dynamic {
+                        None
+                    } else {
+                        Some(remote_host.to_string())
+                    },
+                    remote_port,
+                    lifecycle: TunnelLifecycle::App,
+                    auto_reconnect: false,
+                    connect_timeout_secs,
+                    keepalive_interval_secs,
+                };
+                if let Some(existing) = self.metadata.tunnels.iter_mut().find(|t| t.id == id) {
+                    *existing = tunnel;
+                } else {
+                    self.metadata.tunnels.push(tunnel);
+                }
+                self.metadata.tunnels.sort_by_key(|tunnel| tunnel.id);
+                self.selected_tunnel = self
+                    .metadata
+                    .tunnels
+                    .iter()
+                    .position(|tunnel| tunnel.id == id)
+                    .unwrap_or_default();
+                self.tunnel_statuses.insert(id, TunnelStatus::Stopped);
+                self.notice = Some(format!("Saved tunnel {label}."));
+                self.save_metadata();
+            }
+            KeyCode::Char(value) if !value.is_control() => {
+                dialog.fields[dialog.selected_field].push(value)
+            }
+            _ => {}
+        }
+    }
+
+    fn set_tunnel_dialog_kind(&mut self, kind: TunnelKind) {
+        let Some(dialog) = self.tunnel_dialog.as_mut() else {
+            return;
+        };
+        if dialog.deleting {
+            return;
+        }
+        dialog.kind = kind;
+        if kind == TunnelKind::Dynamic {
+            dialog.fields[4].clear();
+            dialog.fields[5].clear();
+        } else if dialog.fields[4].is_empty() {
+            dialog.fields[4] = "127.0.0.1".to_string();
+        }
+    }
+
     fn handle_host_dialog_key(&mut self, key: KeyCode) {
         let dialog = self.host_dialog.as_mut().expect("dialog exists");
         if dialog.deleting {
@@ -1997,6 +2614,10 @@ impl App {
                         Ok(()) => {
                             self.metadata.tags.remove(&alias);
                             self.metadata.remote_paths.remove(&alias);
+                            self.metadata
+                                .tunnels
+                                .retain(|tunnel| tunnel.custom_host || tunnel.host_alias != alias);
+                            self.stop_orphaned_tunnels();
                             self.notice = Some(format!("Deleted host {alias}."));
                             self.save_metadata();
                             self.clamp_selection();
@@ -2053,6 +2674,7 @@ impl App {
                     user: nonempty(&dialog.fields[2]),
                     port,
                     identity_file: nonempty(&dialog.fields[4]),
+                    proxy_jump: None,
                     managed: true,
                 };
                 match self
@@ -2073,6 +2695,11 @@ impl App {
                             }
                             if let Some(path) = self.metadata.remote_paths.remove(original) {
                                 self.metadata.remote_paths.insert(host.alias.clone(), path);
+                            }
+                            for tunnel in &mut self.metadata.tunnels {
+                                if !tunnel.custom_host && tunnel.host_alias == *original {
+                                    tunnel.host_alias = host.alias.clone();
+                                }
                             }
                         } else if !dialog.editing
                             && let Some(HostGroup::Tag(tag)) = &self.active_group
@@ -2328,6 +2955,7 @@ impl App {
         if !self.metadata_error && self.metadata.reconcile(&self.hosts) {
             self.save_metadata();
         }
+        self.stop_orphaned_tunnels();
         self.clamp_selection();
     }
 
@@ -2352,6 +2980,15 @@ impl App {
                 self.clamp_selection();
             }
             _ => {}
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        let ids = self.tunnel_processes.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            self.stop_tunnel(id);
         }
     }
 }
@@ -2384,6 +3021,7 @@ mod tests {
                 user: None,
                 port: None,
                 identity_file: None,
+                proxy_jump: None,
                 managed: false,
             },
             Host {
@@ -2392,6 +3030,7 @@ mod tests {
                 user: None,
                 port: None,
                 identity_file: None,
+                proxy_jump: None,
                 managed: false,
             },
         ];
@@ -2425,6 +3064,7 @@ mod tests {
                 user: None,
                 port: None,
                 identity_file: None,
+                proxy_jump: None,
                 managed: false,
             })
             .collect();
@@ -3374,6 +4014,125 @@ mod tests {
 
         assert_eq!(app.transfer_tasks.len(), 1);
         assert_eq!(app.transfer_tasks[0].id, 2);
+    }
+
+    #[test]
+    fn local_tunnel_form_creates_and_removes_a_definition() {
+        let mut app = grouped_fixture();
+        app.section = NavSection::Tunnels;
+        app.metadata_error = true;
+        app.open_tunnel_form(None);
+        let dialog = app.tunnel_dialog.as_mut().expect("tunnel form opens");
+        dialog.fields = [
+            "web-db".into(),
+            "web".into(),
+            "127.0.0.1".into(),
+            "15432".into(),
+            "db.internal".into(),
+            "5432".into(),
+            "10".into(),
+            "30".into(),
+        ];
+        dialog.selected_field = 7;
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.metadata.tunnels.len(), 1);
+        assert_eq!(app.metadata.tunnels[0].label, "web-db");
+        assert_eq!(app.metadata.tunnels[0].host_alias, "web");
+
+        app.open_tunnel_delete();
+        app.handle_key(KeyCode::Char('y'));
+        assert!(app.metadata.tunnels.is_empty());
+    }
+
+    #[test]
+    fn local_tunnel_form_accepts_a_custom_ip_target() {
+        let mut app = grouped_fixture();
+        app.section = NavSection::Tunnels;
+        app.metadata_error = true;
+        app.open_tunnel_form(None);
+        let dialog = app.tunnel_dialog.as_mut().expect("tunnel form opens");
+        dialog.fields = [
+            "custom-db".into(),
+            "192.0.2.10".into(),
+            "127.0.0.1".into(),
+            "15433".into(),
+            "db.internal".into(),
+            "5432".into(),
+            "10".into(),
+            "30".into(),
+        ];
+        dialog.selected_field = 7;
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.metadata.tunnels.len(), 1);
+        assert_eq!(app.metadata.tunnels[0].host_alias, "192.0.2.10");
+        assert!(app.metadata.tunnels[0].custom_host);
+        assert!(!app.metadata.reconcile(&app.hosts));
+        assert_eq!(app.metadata.tunnels.len(), 1);
+    }
+
+    #[test]
+    fn tunnel_forms_save_remote_and_dynamic_modes() {
+        let mut app = grouped_fixture();
+        app.section = NavSection::Tunnels;
+        app.metadata_error = true;
+
+        app.open_tunnel_form_with_kind(None, TunnelKind::Remote);
+        let dialog = app.tunnel_dialog.as_mut().expect("remote form opens");
+        dialog.fields = [
+            "remote-web".into(),
+            "web".into(),
+            "0.0.0.0".into(),
+            "18080".into(),
+            "127.0.0.1".into(),
+            "8080".into(),
+            "10".into(),
+            "30".into(),
+        ];
+        dialog.selected_field = 7;
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.metadata.tunnels[0].kind, TunnelKind::Remote);
+        assert_eq!(app.metadata.tunnels[0].remote_port, Some(8080));
+
+        app.open_tunnel_form_with_kind(None, TunnelKind::Dynamic);
+        let dialog = app.tunnel_dialog.as_mut().expect("dynamic form opens");
+        dialog.fields = [
+            "socks".into(),
+            "web".into(),
+            "127.0.0.1".into(),
+            "1080".into(),
+            String::new(),
+            String::new(),
+            "10".into(),
+            "30".into(),
+        ];
+        dialog.selected_field = 7;
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.metadata.tunnels[1].kind, TunnelKind::Dynamic);
+        assert_eq!(app.metadata.tunnels[1].remote_host, None);
+        assert_eq!(app.metadata.tunnels[1].remote_port, None);
+    }
+
+    #[test]
+    fn tunnel_create_form_switches_mode_with_function_keys() {
+        let mut app = grouped_fixture();
+        app.section = NavSection::Tunnels;
+        app.open_tunnel_form(None);
+
+        app.handle_key(KeyCode::F(2));
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().kind, TunnelKind::Remote);
+        app.handle_key(KeyCode::F(3));
+        assert_eq!(
+            app.tunnel_dialog.as_ref().unwrap().kind,
+            TunnelKind::Dynamic
+        );
+        assert!(app.tunnel_dialog.as_ref().unwrap().fields[4].is_empty());
+        assert!(app.tunnel_dialog.as_ref().unwrap().fields[5].is_empty());
+        app.handle_key(KeyCode::F(1));
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().kind, TunnelKind::Local);
     }
 
     #[test]

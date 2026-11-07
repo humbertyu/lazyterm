@@ -2,6 +2,7 @@ mod app;
 mod hosts;
 mod metadata;
 mod sftp;
+mod tunnel;
 mod ui;
 
 use std::{
@@ -39,6 +40,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         app.poll_sftp();
         app.poll_transfers();
         app.poll_mutations();
+        app.poll_tunnels();
         app.viewport_width = terminal.size()?.width;
         terminal.draw(|frame| ui::render(frame, &app))?;
 

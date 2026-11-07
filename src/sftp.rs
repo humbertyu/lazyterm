@@ -1152,6 +1152,7 @@ mod tests {
                     user: Some(std::env::var("USER").expect("USER is required").to_string()),
                     port: None,
                     identity_file: None,
+                    proxy_jump: None,
                     managed: false,
                 }],
                 error: None,

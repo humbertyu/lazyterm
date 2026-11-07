@@ -9,8 +9,8 @@ use ratatui::{
 use crate::{
     app::{
         App, ConnectionDialog, FileDialog, FilePane, FilesState, HostPickerItem,
-        LOCAL_BREADCRUMB_SEPARATOR, LocalEntryKind, NavSection, TransferStatus, group_columns,
-        host_browser_width,
+        LOCAL_BREADCRUMB_SEPARATOR, LocalEntryKind, NavSection, TransferStatus, TunnelStatus,
+        group_columns, host_browser_width,
     },
     sftp::SftpEntryKind,
 };
@@ -43,20 +43,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     match app.section {
         NavSection::Hosts => render_hosts(frame, page[2], app),
         NavSection::Files => render_files(frame, page[2], app),
-        NavSection::Tunnels => {
-            let description = app.selected_host().map_or_else(
-                || "Create local, remote, or SOCKS port forwards.".to_string(),
-                |host| format!("Tunnel manager for {} will appear here.", host.alias),
-            );
-            render_placeholder(
-                frame,
-                page[2],
-                "Tunnels",
-                "Port forwarding",
-                &description,
-                "Planned",
-            );
-        }
+        NavSection::Tunnels => render_tunnels(frame, page[2], app),
         NavSection::Snippets => render_placeholder(
             frame,
             page[2],
@@ -75,6 +62,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if let Some(dialog) = &app.host_dialog {
         render_host_dialog(frame, dialog);
+    }
+    if let Some(dialog) = &app.tunnel_dialog {
+        render_tunnel_dialog(frame, dialog);
+    }
+    if app.tunnel_host_picker_open {
+        render_tunnel_host_picker(frame, app);
     }
     if let Some((alias, tags)) = &app.tags_dialog {
         let area = centered_rect(68, 7, frame.area());
@@ -96,6 +89,199 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if let Some(dialog) = &app.file_dialog {
         render_file_dialog(frame, dialog);
+    }
+}
+
+fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
+    let columns =
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
+    let list_block = Block::default()
+        .title(" PORT FORWARDING ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(PANEL));
+    let list_inner = list_block.inner(columns[0]);
+    frame.render_widget(list_block, columns[0]);
+
+    let mut rows = vec![ListItem::new(Line::from(Span::styled(
+        "  + New forwarding    a add",
+        Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+    )))];
+    rows.extend(app.metadata.tunnels.iter().map(|tunnel| {
+        let selected = app
+            .selected_tunnel_definition()
+            .is_some_and(|selected| selected.id == tunnel.id);
+        let status = app
+            .tunnel_statuses
+            .get(&tunnel.id)
+            .cloned()
+            .unwrap_or(TunnelStatus::Stopped);
+        let (status_label, status_color) = tunnel_status_display(&status);
+        let route = match tunnel.kind {
+            crate::metadata::TunnelKind::Dynamic => {
+                format!("{}:{}  SOCKS", tunnel.bind_address, tunnel.local_port)
+            }
+            _ => format!(
+                "{}:{}  ->  {}:{}",
+                tunnel.bind_address,
+                tunnel.local_port,
+                tunnel.remote_host.as_deref().unwrap_or("-"),
+                tunnel.remote_port.unwrap_or_default()
+            ),
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { " > " } else { "   " },
+                Style::default().fg(if selected { GREEN } else { MUTED }),
+            ),
+            Span::styled(
+                format!("{} ", tunnel_kind_label(tunnel.kind)),
+                Style::default().fg(if selected { GREEN } else { MUTED }),
+            ),
+            Span::styled(
+                format!("{status_label:<9}"),
+                Style::default().fg(status_color),
+            ),
+            Span::styled(
+                format!("{:<18}", tunnel.label),
+                Style::default()
+                    .fg(if selected { TEXT } else { MUTED })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(route, Style::default().fg(MUTED)),
+        ]))
+    }));
+    frame.render_widget(List::new(rows), list_inner);
+
+    let detail_block = Block::default()
+        .title(" EDIT PORT FORWARDING ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(PANEL));
+    let detail_inner = detail_block.inner(columns[1]);
+    frame.render_widget(detail_block, columns[1]);
+    let Some(tunnel) = app.selected_tunnel_definition() else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No forwarding selected.",
+                    Style::default().fg(TEXT),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press a to create a local forward.",
+                    Style::default().fg(MUTED),
+                )),
+            ])
+            .wrap(Wrap { trim: true }),
+            detail_inner,
+        );
+        return;
+    };
+    let status = app
+        .tunnel_statuses
+        .get(&tunnel.id)
+        .cloned()
+        .unwrap_or(crate::app::TunnelStatus::Stopped);
+    let (status_label, status_color) = tunnel_status_display(&status);
+    let status_line = match &status {
+        TunnelStatus::Failed(message) => format!("Status                {status_label}: {message}"),
+        _ => format!("Status                {status_label}"),
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("●  {}", tunnel.label),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "SSH host             {}{}",
+            tunnel.host_alias,
+            if tunnel.custom_host { " (custom)" } else { "" }
+        )),
+        if let Some(proxy_jump) = app
+            .hosts
+            .hosts
+            .iter()
+            .find(|host| host.alias == tunnel.host_alias)
+            .and_then(|host| host.proxy_jump.as_deref())
+        {
+            Line::from(format!("ProxyJump            {proxy_jump}"))
+        } else {
+            Line::from("ProxyJump            none")
+        },
+        Line::from(format!(
+            "{}                 {}:{}",
+            if tunnel.kind == crate::metadata::TunnelKind::Remote {
+                "Remote bind"
+            } else {
+                "Local bind"
+            },
+            tunnel.bind_address,
+            tunnel.local_port
+        )),
+        if tunnel.kind == crate::metadata::TunnelKind::Dynamic {
+            Line::from("SOCKS destination    dynamic")
+        } else {
+            Line::from(format!(
+                "{}           {}:{}",
+                if tunnel.kind == crate::metadata::TunnelKind::Remote {
+                    "Local destination"
+                } else {
+                    "Destination"
+                },
+                tunnel.remote_host.as_deref().unwrap_or("-"),
+                tunnel.remote_port.unwrap_or_default()
+            ))
+        },
+        Line::from(format!(
+            "Mode                 {}",
+            tunnel_kind_label(tunnel.kind)
+        )),
+        Line::from(format!(
+            "Reconnect            {}",
+            if tunnel.auto_reconnect {
+                "enabled"
+            } else {
+                "manual"
+            }
+        )),
+        Line::from(format!(
+            "Timeout / KeepAlive  {}s / {}s",
+            tunnel.connect_timeout_secs, tunnel.keepalive_interval_secs
+        )),
+        Line::from(format!("Lifecycle             {:?}", tunnel.lifecycle)),
+        Line::from(Span::styled(status_line, Style::default().fg(status_color))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "s/Space start/stop   r restart   A auto-reconnect   e edit   d delete",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }),
+        detail_inner,
+    );
+}
+
+fn tunnel_status_display(status: &TunnelStatus) -> (&'static str, Color) {
+    match status {
+        TunnelStatus::Stopped => ("Stopped", MUTED),
+        TunnelStatus::Starting => ("Starting", Color::Yellow),
+        TunnelStatus::Running => ("Running", GREEN),
+        TunnelStatus::Failed(_) => ("Failed", Color::Red),
+    }
+}
+
+fn tunnel_kind_label(kind: crate::metadata::TunnelKind) -> &'static str {
+    match kind {
+        crate::metadata::TunnelKind::Local => "L",
+        crate::metadata::TunnelKind::Remote => "R",
+        crate::metadata::TunnelKind::Dynamic => "D",
     }
 }
 
@@ -1162,7 +1348,19 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "1-4 / F1-F4 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
     };
-    let hint = if app.host_dialog.is_some() {
+    let hint = if app.tunnel_host_picker_open {
+        "↑↓ select group/Host  Enter open/choose  Backspace back  Esc cancel"
+    } else if app.tunnel_dialog.is_some() {
+        if app
+            .tunnel_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        {
+            "y / Enter confirm  n / Esc cancel"
+        } else {
+            "F1 Local  F2 Remote  F3 Dynamic  Tab / ↑↓ field  Enter next/save  Esc cancel"
+        }
+    } else if app.host_dialog.is_some() {
         "Tab / Shift+Tab field  Enter next/save  Esc cancel"
     } else if app.tags_dialog.is_some() {
         "Enter save tags  Esc cancel"
@@ -1217,13 +1415,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
         }
+    } else if app.section == NavSection::Tunnels {
+        "↑↓ select  l local  R remote  D dynamic  s/Space start/stop  r restart  e edit  d delete"
     } else {
         "q quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(
-                if app.host_dialog.is_some()
+                if app.tunnel_dialog.is_some()
+                    || app.host_dialog.is_some()
                     || app.tags_dialog.is_some()
                     || app.file_dialog.is_some()
                 {
@@ -1402,6 +1603,130 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
     );
 }
 
+fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
+    let area = centered_rect(82, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(if dialog.deleting {
+        " DELETE PORT FORWARDING "
+    } else if dialog.editing_id.is_some() {
+        match dialog.kind {
+            crate::metadata::TunnelKind::Local => " EDIT LOCAL FORWARDING ",
+            crate::metadata::TunnelKind::Remote => " EDIT REMOTE FORWARDING ",
+            crate::metadata::TunnelKind::Dynamic => " EDIT DYNAMIC FORWARDING ",
+        }
+    } else {
+        match dialog.kind {
+            crate::metadata::TunnelKind::Local => " NEW LOCAL FORWARDING ",
+            crate::metadata::TunnelKind::Remote => " NEW REMOTE FORWARDING ",
+            crate::metadata::TunnelKind::Dynamic => " NEW DYNAMIC FORWARDING ",
+        }
+    });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if dialog.deleting {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("Delete forwarding \"{}\"?", dialog.fields[0])),
+                Line::from(""),
+                Line::from("y / Enter confirm    n / Esc cancel"),
+            ])
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let labels = [
+        "Label",
+        "SSH host / IP",
+        if dialog.kind == crate::metadata::TunnelKind::Remote {
+            "Remote bind"
+        } else {
+            "Local bind"
+        },
+        if dialog.kind == crate::metadata::TunnelKind::Remote {
+            "Remote port"
+        } else {
+            "Local port"
+        },
+        if dialog.kind == crate::metadata::TunnelKind::Remote {
+            "Local destination"
+        } else {
+            "Destination"
+        },
+        "Destination port",
+        "Connect timeout (s)",
+        "KeepAlive interval (s)",
+    ];
+    let mode = match dialog.kind {
+        crate::metadata::TunnelKind::Local => "Local",
+        crate::metadata::TunnelKind::Remote => "Remote",
+        crate::metadata::TunnelKind::Dynamic => "Dynamic",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Mode  ", Style::default().fg(MUTED)),
+            Span::styled(
+                "[F1 Local]  ",
+                Style::default().fg(if mode == "Local" { GREEN } else { MUTED }),
+            ),
+            Span::styled(
+                "[F2 Remote]  ",
+                Style::default().fg(if mode == "Remote" { GREEN } else { MUTED }),
+            ),
+            Span::styled(
+                "[F3 Dynamic]",
+                Style::default().fg(if mode == "Dynamic" { GREEN } else { MUTED }),
+            ),
+        ])),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let rows = Layout::vertical([Constraint::Length(1); 8]).split(Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(2),
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
+    });
+    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+        let cursor = if index == dialog.selected_field {
+            "_"
+        } else {
+            ""
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{label:<19}"), Style::default().fg(MUTED)),
+                Span::styled(format!("{value}{cursor}"), Style::default().fg(TEXT)),
+            ])),
+            rows[index],
+        );
+    }
+    let help_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(11),
+        width: inner.width,
+        height: inner.height.saturating_sub(11),
+    };
+    frame.render_widget(
+        Paragraph::new(
+            "Use a Host alias from ~/.ssh/config, or enter an IP/domain    Tab / ↑↓ field    Enter next/save    Esc cancel",
+        )
+            .style(Style::default().fg(MUTED)),
+        help_area,
+    );
+}
+
+fn render_tunnel_host_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(64, 20, frame.area());
+    frame.render_widget(Clear, area);
+    render_host_picker(frame, area, app);
+}
+
 fn render_search(frame: &mut Frame, app: &App) {
     let area = centered_rect(60, 5, frame.area());
     frame.render_widget(Clear, area);
@@ -1469,7 +1794,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{App, TransferStatus, TransferTask},
-        hosts::HostCatalog,
+        hosts::{Host, HostCatalog},
     };
 
     #[test]
@@ -1523,6 +1848,7 @@ mod tests {
                         user: None,
                         port: None,
                         identity_file: None,
+                        proxy_jump: None,
                         managed: false,
                     }],
                     error: None,
@@ -1579,6 +1905,51 @@ mod tests {
     }
 
     #[test]
+    fn tunnels_render_list_and_detail_panel() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::with_catalog(
+            HostCatalog {
+                hosts: vec![Host {
+                    alias: "web".into(),
+                    hostname: Some("web.example.com".into()),
+                    user: None,
+                    port: None,
+                    identity_file: None,
+                    proxy_jump: None,
+                    managed: false,
+                }],
+                error: None,
+            },
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Tunnels;
+        app.metadata
+            .tunnels
+            .push(crate::metadata::TunnelDefinition {
+                id: 1,
+                label: "web-db".into(),
+                host_alias: "web".into(),
+                custom_host: false,
+                kind: crate::metadata::TunnelKind::Local,
+                bind_address: "127.0.0.1".into(),
+                local_port: 15432,
+                remote_host: Some("db.internal".into()),
+                remote_port: Some(5432),
+                lifecycle: crate::metadata::TunnelLifecycle::App,
+                auto_reconnect: false,
+                connect_timeout_secs: 10,
+                keepalive_interval_secs: 30,
+            });
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("PORT FORWARDING"));
+        assert!(text.contains("web-db"));
+        assert!(text.contains("db.internal:5432"));
+        assert!(text.contains("EDIT PORT FORWARDING"));
+    }
+
+    #[test]
     fn tabs_share_one_top_row_and_content_has_no_sidebar() {
         for (width, height) in [(120, 40), (80, 24), (54, 18), (42, 18)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1624,6 +1995,7 @@ mod tests {
                     user: None,
                     port: None,
                     identity_file: None,
+                    proxy_jump: None,
                     managed: false,
                 }],
                 error: None,
@@ -1669,6 +2041,7 @@ mod tests {
                     user: None,
                     port: None,
                     identity_file: None,
+                    proxy_jump: None,
                     managed: false,
                 }],
                 error: None,

@@ -12,6 +12,7 @@ pub struct Host {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<String>,
+    pub proxy_jump: Option<String>,
     pub managed: bool,
 }
 
@@ -214,6 +215,7 @@ fn hosts_and_includes(contents: &str) -> io::Result<ConfigEntries> {
                         user: None,
                         port: None,
                         identity_file: None,
+                        proxy_jump: None,
                         managed: managed_marker,
                     })
                     .collect();
@@ -237,6 +239,11 @@ fn hosts_and_includes(contents: &str) -> io::Result<ConfigEntries> {
             "identityfile" if !current.is_empty() => {
                 for host in &mut current {
                     host.identity_file = values.first().cloned();
+                }
+            }
+            "proxyjump" if !current.is_empty() => {
+                for host in &mut current {
+                    host.proxy_jump = values.first().cloned();
                 }
             }
             "match" => {
@@ -525,6 +532,17 @@ mod tests {
         assert!(!is_concrete_alias("*.internal"));
         assert!(!is_concrete_alias("!staging"));
         assert!(is_concrete_alias("prod-web"));
+    }
+
+    #[test]
+    fn parses_proxy_jump_for_host_details() {
+        let entries =
+            hosts_and_includes("Host app\n    HostName app.internal\n    ProxyJump bastion\n")
+                .unwrap();
+        assert_eq!(
+            entries[0].0.as_ref().unwrap().proxy_jump.as_deref(),
+            Some("bastion")
+        );
     }
 
     #[test]

@@ -108,15 +108,15 @@ Release gate: SSH and SFTP use the same host identity and authentication policy;
 
 Goal: manage common port forwards safely.
 
-- [ ] Create and edit local forwards.
-- [ ] Add remote and dynamic/SOCKS forwards.
-- [ ] Display process state, bound address, and startup errors.
-- [ ] Detect local port conflicts.
-- [ ] Add connection timeout and SSH-level Keepalive settings.
-- [ ] Separate connection failure detection from reconnect policy.
-- [ ] Add bounded reconnect backoff and stop/reconnect controls.
+- [x] Create and edit local forwards.
+- [x] Add remote and dynamic/SOCKS forwards.
+- [x] Display process state, bound address, and startup errors.
+- [x] Detect local port conflicts.
+- [x] Add connection timeout and SSH-level Keepalive settings.
+- [x] Separate connection failure detection from reconnect policy.
+- [x] Add bounded reconnect backoff and stop/reconnect controls.
 - [ ] Define `app` lifecycle first; add persistent detached tunnels only with reliable rediscovery and cleanup.
-- [ ] Display `ProxyJump` chains and identify the failing hop where possible.
+- [x] Display configured `ProxyJump` chains. Identifying the failing hop remains open.
 
 Release gate: users can start, inspect, stop, and restart tunnels without orphaning untracked processes.
 

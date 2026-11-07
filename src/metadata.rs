@@ -5,6 +5,50 @@ use serde::{Deserialize, Serialize};
 use crate::hosts::HostCatalog;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TunnelKind {
+    #[default]
+    Local,
+    Remote,
+    Dynamic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TunnelLifecycle {
+    #[default]
+    App,
+    Session,
+    Persistent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TunnelDefinition {
+    pub id: u64,
+    pub label: String,
+    pub host_alias: String,
+    #[serde(default)]
+    pub custom_host: bool,
+    pub kind: TunnelKind,
+    pub bind_address: String,
+    pub local_port: u16,
+    pub remote_host: Option<String>,
+    pub remote_port: Option<u16>,
+    pub lifecycle: TunnelLifecycle,
+    pub auto_reconnect: bool,
+    #[serde(default = "default_tunnel_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_secs: u64,
+}
+
+fn default_tunnel_timeout() -> u64 {
+    10
+}
+
+fn default_keepalive_interval() -> u64 {
+    30
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HostView {
     #[default]
     Groups,
@@ -20,6 +64,7 @@ pub struct Metadata {
     pub local_path: Option<PathBuf>,
     pub remote_paths: BTreeMap<String, String>,
     pub show_hidden_files: bool,
+    pub tunnels: Vec<TunnelDefinition>,
 }
 
 impl Default for Metadata {
@@ -31,6 +76,7 @@ impl Default for Metadata {
             local_path: None,
             remote_paths: BTreeMap::new(),
             show_hidden_files: false,
+            tunnels: Vec::new(),
         }
     }
 }
@@ -72,12 +118,14 @@ impl Metadata {
             .iter()
             .map(|host| host.alias.as_str())
             .collect::<std::collections::HashSet<_>>();
-        let previous_len = self.tags.len() + self.remote_paths.len();
+        let previous_len = self.tags.len() + self.remote_paths.len() + self.tunnels.len();
         self.tags
             .retain(|alias, _| aliases.contains(alias.as_str()));
         self.remote_paths
             .retain(|alias, _| aliases.contains(alias.as_str()));
-        self.tags.len() + self.remote_paths.len() != previous_len
+        self.tunnels
+            .retain(|tunnel| tunnel.custom_host || aliases.contains(tunnel.host_alias.as_str()));
+        self.tags.len() + self.remote_paths.len() + self.tunnels.len() != previous_len
     }
 
     fn path() -> io::Result<PathBuf> {
@@ -134,6 +182,21 @@ mod tests {
             .remote_paths
             .insert("web".into(), "projects".into());
         metadata.show_hidden_files = true;
+        metadata.tunnels.push(TunnelDefinition {
+            id: 7,
+            label: "web-db".into(),
+            host_alias: "web".into(),
+            custom_host: false,
+            kind: TunnelKind::Local,
+            bind_address: "127.0.0.1".into(),
+            local_port: 5432,
+            remote_host: Some("db.internal".into()),
+            remote_port: Some(5432),
+            lifecycle: TunnelLifecycle::App,
+            auto_reconnect: false,
+            connect_timeout_secs: 10,
+            keepalive_interval_secs: 30,
+        });
         let bytes = serde_json::to_vec(&metadata).unwrap();
         let restored: Metadata = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored.view, HostView::Hosts);
@@ -141,6 +204,62 @@ mod tests {
         assert_eq!(restored.local_path, Some(PathBuf::from("/tmp/lazyterm")));
         assert_eq!(restored.remote_paths["web"], "projects");
         assert!(restored.show_hidden_files);
+        assert_eq!(restored.tunnels[0].label, "web-db");
+        assert_eq!(restored.tunnels[0].local_port, 5432);
+    }
+
+    #[test]
+    fn reconcile_keeps_custom_tunnel_targets() {
+        let catalog = HostCatalog {
+            hosts: vec![crate::hosts::Host {
+                alias: "web".into(),
+                hostname: None,
+                user: None,
+                port: None,
+                identity_file: None,
+                proxy_jump: None,
+                managed: false,
+            }],
+            error: None,
+        };
+        let mut metadata = Metadata {
+            tunnels: vec![
+                TunnelDefinition {
+                    id: 1,
+                    label: "saved".into(),
+                    host_alias: "web".into(),
+                    custom_host: false,
+                    kind: TunnelKind::Local,
+                    bind_address: "127.0.0.1".into(),
+                    local_port: 10001,
+                    remote_host: Some("db".into()),
+                    remote_port: Some(5432),
+                    lifecycle: TunnelLifecycle::App,
+                    auto_reconnect: false,
+                    connect_timeout_secs: 10,
+                    keepalive_interval_secs: 30,
+                },
+                TunnelDefinition {
+                    id: 2,
+                    label: "custom".into(),
+                    host_alias: "192.0.2.10".into(),
+                    custom_host: true,
+                    kind: TunnelKind::Local,
+                    bind_address: "127.0.0.1".into(),
+                    local_port: 10002,
+                    remote_host: Some("db".into()),
+                    remote_port: Some(5432),
+                    lifecycle: TunnelLifecycle::App,
+                    auto_reconnect: false,
+                    connect_timeout_secs: 10,
+                    keepalive_interval_secs: 30,
+                },
+            ],
+            ..Metadata::default()
+        };
+
+        assert!(!metadata.reconcile(&catalog));
+        assert_eq!(metadata.tunnels.len(), 2);
     }
 
     #[test]
@@ -253,6 +372,7 @@ mod tests {
                 user: None,
                 port: None,
                 identity_file: None,
+                proxy_jump: None,
                 managed: false,
             }],
             error: None,
