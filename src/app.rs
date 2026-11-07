@@ -1869,7 +1869,7 @@ impl App {
         }
     }
 
-    fn set_host_context(&mut self, alias: Option<String>) {
+    pub(crate) fn set_host_context(&mut self, alias: Option<String>) {
         if self.host_context != alias {
             self.host_context = alias;
             self.files = FilesState::Idle;

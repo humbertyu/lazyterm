@@ -89,8 +89,10 @@ Goal: use the Hosts catalog for file workflows, without a second host database. 
 - [x] Clean up empty directories created by an interrupted or failed recursive transfer while preserving pre-existing directories.
 - [x] Show remote size, permissions, owner/group IDs, and readable modification time when the server provides them.
 - [x] Add rename, mkdir, and delete with confirmation for individual entries.
-- [ ] Verify the integrated Hosts -> Files -> Hosts workflow against disposable fixtures.
+- [x] Verify the integrated Hosts -> Files -> Hosts workflow against a disposable SSH/SFTP fixture.
 - [x] Reuse one live SFTP connection per host inside a dedicated background Tokio service; the cache is isolated to the LazyTerm process and ends with that service.
+
+An opt-in disposable `sshd` fixture covers the embedded SFTP transport and the application-level Hosts -> Files -> Hosts context flow. Broader refresh, rename, and failure-path acceptance remains tracked separately.
 
 Deferred credential track:
 

@@ -54,6 +54,14 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+The real SSH/SFTP fixture test is opt-in and requires `sshd`, `ssh-keygen`, and `ssh-keyscan`:
+
+```sh
+LAZYTERM_SFTP_FIXTURE=1 cargo test sftp_fixture_end_to_end -- --nocapture
+```
+
+It starts a temporary local `sshd`, uses temporary keys and configuration, tests the embedded SFTP operations, and removes the fixture when the test exits.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -27,6 +27,9 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 const TRANSFER_BUFFER_SIZE: usize = 64 * 1024;
 
+#[cfg(test)]
+static TEST_CONNECTION_CONFIG: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SftpEntry {
     pub name: String,
@@ -330,6 +333,12 @@ async fn connect_sftp(host_alias: &str) -> Result<Sftp, String> {
     builder
         .known_hosts_check(KnownHosts::Strict)
         .connect_timeout(CONNECT_TIMEOUT);
+    #[cfg(test)]
+    if let Some((config_file, known_hosts_file)) = TEST_CONNECTION_CONFIG.get() {
+        builder
+            .config_file(config_file)
+            .user_known_hosts_file(known_hosts_file);
+    }
     let session = builder
         .connect(host_alias)
         .await
@@ -963,6 +972,26 @@ fn permission_mode(permissions: openssh_sftp_client::metadata::Permissions) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        net::TcpStream,
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    struct SshFixture {
+        root: PathBuf,
+        child: Child,
+    }
+
+    impl Drop for SshFixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn entry_kinds_distinguish_navigable_directories() {
@@ -980,5 +1009,355 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn sftp_fixture_end_to_end() {
+        if std::env::var("LAZYTERM_SFTP_FIXTURE").as_deref() != Ok("1") {
+            eprintln!("skipped: set LAZYTERM_SFTP_FIXTURE=1 to run the disposable SSH fixture");
+            return;
+        }
+
+        let Some(sshd) = command_path("sshd") else {
+            eprintln!("skipped: sshd is unavailable");
+            return;
+        };
+        let Some(ssh_keygen) = command_path("ssh-keygen") else {
+            eprintln!("skipped: ssh-keygen is unavailable");
+            return;
+        };
+        let Some(ssh_keyscan) = command_path("ssh-keyscan") else {
+            eprintln!("skipped: ssh-keyscan is unavailable");
+            return;
+        };
+        let sftp_server = [
+            std::env::var_os("LAZYTERM_SFTP_SERVER").map(PathBuf::from),
+            Some(PathBuf::from("/usr/libexec/sftp-server")),
+            Some(PathBuf::from("/usr/lib/openssh/sftp-server")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_file());
+        let Some(sftp_server) = sftp_server else {
+            eprintln!("skipped: sftp-server is unavailable");
+            return;
+        };
+
+        let fixture = create_fixture(&sshd, &ssh_keygen, &ssh_keyscan, &sftp_server);
+        let _ = TEST_CONNECTION_CONFIG.set((
+            fixture.root.join("ssh_config"),
+            fixture.root.join("known_hosts"),
+        ));
+
+        let remote_root = fixture.root.join("remote");
+        let local_root = fixture.root.join("local");
+        fs::create_dir(&remote_root).expect("create remote fixture directory");
+        fs::create_dir(&local_root).expect("create local fixture directory");
+        fs::write(local_root.join("upload.txt"), "fixture upload").expect("write upload fixture");
+
+        let listing = spawn_list("lazyterm-fixture".into(), remote_root.display().to_string())
+            .recv_timeout(Duration::from_secs(15))
+            .expect("receive directory listing")
+            .expect("list remote fixture directory");
+        assert!(listing.entries.is_empty());
+
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        spawn_transfer(
+            TransferRequest {
+                task_id: 1,
+                host_alias: "lazyterm-fixture".into(),
+                local_path: local_root.join("upload.txt"),
+                remote_path: remote_root.join("uploaded.txt").display().to_string(),
+                direction: TransferDirection::Upload,
+                is_dir: false,
+            },
+            event_sender,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_transfer_finished(event_receiver);
+        assert_eq!(
+            fs::read_to_string(remote_root.join("uploaded.txt")).expect("read uploaded file"),
+            "fixture upload"
+        );
+
+        let download_path = local_root.join("downloaded.txt");
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        spawn_transfer(
+            TransferRequest {
+                task_id: 2,
+                host_alias: "lazyterm-fixture".into(),
+                local_path: download_path.clone(),
+                remote_path: remote_root.join("uploaded.txt").display().to_string(),
+                direction: TransferDirection::Download,
+                is_dir: false,
+            },
+            event_sender,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_transfer_finished(event_receiver);
+        assert_eq!(
+            fs::read_to_string(download_path).expect("read downloaded file"),
+            "fixture upload"
+        );
+
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        spawn_mutation(
+            MutationRequest {
+                operation_id: 3,
+                host_alias: "lazyterm-fixture".into(),
+                mutation: Mutation::CreateDir {
+                    path: remote_root.join("created").display().to_string(),
+                },
+            },
+            event_sender,
+        );
+        assert_mutation_finished(event_receiver);
+
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        spawn_mutation(
+            MutationRequest {
+                operation_id: 4,
+                host_alias: "lazyterm-fixture".into(),
+                mutation: Mutation::Rename {
+                    from: remote_root.join("uploaded.txt").display().to_string(),
+                    to: remote_root.join("renamed.txt").display().to_string(),
+                },
+            },
+            event_sender,
+        );
+        assert_mutation_finished(event_receiver);
+        assert!(!remote_root.join("uploaded.txt").exists());
+        assert!(remote_root.join("renamed.txt").exists());
+
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        spawn_mutation(
+            MutationRequest {
+                operation_id: 5,
+                host_alias: "lazyterm-fixture".into(),
+                mutation: Mutation::Delete {
+                    path: remote_root.join("renamed.txt").display().to_string(),
+                    is_dir: false,
+                },
+            },
+            event_sender,
+        );
+        assert_mutation_finished(event_receiver);
+        assert!(!remote_root.join("renamed.txt").exists());
+
+        let mut app = crate::app::App::with_catalog(
+            crate::hosts::HostCatalog {
+                hosts: vec![crate::hosts::Host {
+                    alias: "lazyterm-fixture".into(),
+                    hostname: Some("127.0.0.1".into()),
+                    user: Some(std::env::var("USER").expect("USER is required").to_string()),
+                    port: None,
+                    identity_file: None,
+                    managed: false,
+                }],
+                error: None,
+            },
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.set_host_context(Some("lazyterm-fixture".into()));
+        app.handle_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.start_sftp_listing("lazyterm-fixture".into(), remote_root.display().to_string());
+        for _ in 0..300 {
+            app.poll_sftp();
+            if matches!(app.files, crate::app::FilesState::Loaded(_)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let crate::app::FilesState::Loaded(listing) = &app.files else {
+            panic!("App did not load the fixture directory");
+        };
+        assert_eq!(listing.host_alias, "lazyterm-fixture");
+        assert_eq!(
+            app.context_host().map(|host| host.alias.as_str()),
+            Some("lazyterm-fixture")
+        );
+
+        app.handle_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('1'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.section, crate::app::NavSection::Hosts);
+        app.handle_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.section, crate::app::NavSection::Files);
+        assert_eq!(
+            app.context_host().map(|host| host.alias.as_str()),
+            Some("lazyterm-fixture")
+        );
+
+        drop(fixture);
+    }
+
+    fn command_path(command: &str) -> Option<PathBuf> {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {command}"))
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (!path.is_empty()).then(|| PathBuf::from(path))
+            })
+    }
+
+    fn create_fixture(
+        sshd: &Path,
+        ssh_keygen: &Path,
+        ssh_keyscan: &Path,
+        sftp_server: &Path,
+    ) -> SshFixture {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "lazyterm-sftp-fixture-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create fixture root");
+
+        let client_key = root.join("client_key");
+        run(
+            Command::new(ssh_keygen)
+                .args(["-q", "-t", "ed25519", "-N", ""])
+                .arg("-f")
+                .arg(&client_key),
+            "generate client key",
+        );
+        let host_key = root.join("host_key");
+        run(
+            Command::new(ssh_keygen)
+                .args(["-q", "-t", "ed25519", "-N", ""])
+                .arg("-f")
+                .arg(&host_key),
+            "generate host key",
+        );
+        fs::copy(
+            client_key.with_extension("pub"),
+            root.join("authorized_keys"),
+        )
+        .expect("install authorized key");
+
+        let user = std::env::var("USER").expect("USER is required for the SSH fixture");
+        let port = free_port();
+        let config = format!(
+            "Port {port}\n\
+             ListenAddress 127.0.0.1\n\
+             HostKey {}\n\
+             PidFile {}\n\
+             AuthorizedKeysFile {}\n\
+             AllowUsers {user}\n\
+             PubkeyAuthentication yes\n\
+             PasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\n\
+             StrictModes no\n\
+             Subsystem sftp {}\n\
+             LogLevel ERROR\n",
+            host_key.display(),
+            root.join("sshd.pid").display(),
+            root.join("authorized_keys").display(),
+            sftp_server.display(),
+        );
+        fs::write(root.join("sshd_config"), config).expect("write sshd config");
+
+        let ssh_config = format!(
+            "Host lazyterm-fixture\n\
+             HostName 127.0.0.1\n\
+             Port {port}\n\
+             User {user}\n\
+             IdentityFile {}\n\
+             IdentitiesOnly yes\n\
+             BatchMode yes\n",
+            client_key.display()
+        );
+        fs::write(root.join("ssh_config"), ssh_config).expect("write client config");
+
+        let child = Command::new(sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(root.join("sshd_config"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start fixture sshd");
+        wait_for_port(port);
+
+        let known_hosts = Command::new(ssh_keyscan)
+            .args(["-p", &port.to_string(), "127.0.0.1"])
+            .output()
+            .expect("scan fixture host key");
+        assert!(
+            known_hosts.status.success(),
+            "ssh-keyscan failed: {}",
+            String::from_utf8_lossy(&known_hosts.stderr)
+        );
+        fs::write(root.join("known_hosts"), known_hosts.stdout).expect("write known_hosts");
+
+        SshFixture { root, child }
+    }
+
+    fn run(command: &mut Command, description: &str) {
+        let output = command.output().unwrap_or_else(|error| {
+            panic!("{description} failed to start: {error}");
+        });
+        assert!(
+            output.status.success(),
+            "{description} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind free port");
+        listener.local_addr().expect("read free port").port()
+    }
+
+    fn wait_for_port(port: u16) {
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("fixture sshd did not start on port {port}");
+    }
+
+    fn assert_transfer_finished(receiver: Receiver<TransferEvent>) {
+        let mut finished = false;
+        for _ in 0..10 {
+            match receiver
+                .recv_timeout(Duration::from_secs(15))
+                .expect("receive transfer event")
+            {
+                TransferEvent::Finished { .. } => {
+                    finished = true;
+                    break;
+                }
+                TransferEvent::Failed { message, .. } => panic!("transfer failed: {message}"),
+                TransferEvent::Cancelled { .. } => panic!("transfer unexpectedly cancelled"),
+                TransferEvent::Progress { .. } => {}
+            }
+        }
+        assert!(finished, "transfer did not finish");
+    }
+
+    fn assert_mutation_finished(receiver: Receiver<MutationEvent>) {
+        match receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("receive mutation event")
+        {
+            MutationEvent::Finished { .. } => {}
+            MutationEvent::Failed { message, .. } => panic!("mutation failed: {message}"),
+        }
     }
 }
