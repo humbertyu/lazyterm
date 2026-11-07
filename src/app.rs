@@ -1,7 +1,12 @@
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, Sender, TryRecvError},
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+        mpsc::{Receiver, Sender, TryRecvError},
+    },
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,7 +14,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::hosts::{Host, HostCatalog};
 use crate::metadata::{HostView, Metadata, parse_tags};
 use crate::sftp::{
-    self, SftpListing, SftpResult, TransferDirection, TransferEvent, TransferRequest,
+    self, Mutation, MutationEvent, MutationRequest, SftpListing, SftpResult, TransferDirection,
+    TransferEvent, TransferRequest,
 };
 
 pub const LOCAL_BREADCRUMB_SEPARATOR: &str = "  >  ";
@@ -30,6 +36,27 @@ pub enum HostBrowseItem {
 pub enum FilePane {
     Local,
     Remote,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileDialog {
+    Rename {
+        pane: FilePane,
+        old_name: String,
+        value: String,
+    },
+    Delete {
+        pane: FilePane,
+        name: String,
+        is_dir: bool,
+    },
+    CreateDir {
+        pane: FilePane,
+        value: String,
+    },
+    TransferConflict {
+        request: TransferRequest,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,18 +96,22 @@ pub struct LocalBreadcrumbPart {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransferStatus {
+    Queued,
     Running,
     Completed,
+    Cancelled,
     Failed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferTask {
     pub id: u64,
+    pub host_alias: String,
     pub direction: TransferDirection,
     pub name: String,
     pub local_path: PathBuf,
     pub remote_path: String,
+    pub is_dir: bool,
     pub transferred: u64,
     pub total: u64,
     pub status: TransferStatus,
@@ -164,10 +195,19 @@ pub struct App {
     pub host_picker_group: Option<HostGroup>,
     pub host_picker_selection: usize,
     pub transfer_tasks: Vec<TransferTask>,
+    pub selected_transfer: usize,
+    transfer_queue: VecDeque<TransferRequest>,
+    active_transfer_id: Option<u64>,
+    transfer_cancellation: std::collections::HashMap<u64, Arc<AtomicBool>>,
+    pub file_dialog: Option<FileDialog>,
     next_transfer_id: u64,
+    next_mutation_id: u64,
     sftp_receiver: Option<Receiver<SftpResult>>,
     transfer_sender: Sender<TransferEvent>,
     transfer_receiver: Receiver<TransferEvent>,
+    mutation_sender: Sender<MutationEvent>,
+    mutation_receiver: Receiver<MutationEvent>,
+    mutation_hosts: std::collections::HashMap<u64, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +270,7 @@ impl App {
                 .unwrap_or_default()
         });
         let (transfer_sender, transfer_receiver) = std::sync::mpsc::channel();
+        let (mutation_sender, mutation_receiver) = std::sync::mpsc::channel();
         Self {
             section: NavSection::Hosts,
             previous_section: NavSection::Hosts,
@@ -265,10 +306,19 @@ impl App {
             host_picker_group: None,
             host_picker_selection: 0,
             transfer_tasks: Vec::new(),
+            selected_transfer: 0,
+            transfer_queue: VecDeque::new(),
+            active_transfer_id: None,
+            transfer_cancellation: std::collections::HashMap::new(),
+            file_dialog: None,
             next_transfer_id: 1,
+            next_mutation_id: 1,
             sftp_receiver: None,
             transfer_sender,
             transfer_receiver,
+            mutation_sender,
+            mutation_receiver,
+            mutation_hosts: std::collections::HashMap::new(),
         }
     }
 
@@ -495,10 +545,14 @@ impl App {
         let FilesState::Loaded(listing) = &self.files else {
             return Vec::new();
         };
+        let query = self.file_filter.to_lowercase();
         listing
             .entries
             .iter()
-            .filter(|entry| self.show_hidden_files || !entry.name.starts_with('.'))
+            .filter(|entry| {
+                (self.show_hidden_files || !entry.name.starts_with('.'))
+                    && (query.is_empty() || entry.name.to_lowercase().contains(&query))
+            })
             .collect()
     }
 
@@ -602,6 +656,10 @@ impl App {
 
     fn local_list_start_row(&self) -> u16 {
         5 + u16::from(self.file_filtering || !self.file_filter.is_empty())
+    }
+
+    fn remote_list_start_row(&self) -> u16 {
+        4 + u16::from(self.file_filtering || !self.file_filter.is_empty())
     }
 
     pub fn transfer_panel_height(&self, area_height: u16) -> u16 {
@@ -718,6 +776,7 @@ impl App {
     fn queue_transfer(&mut self, request: TransferRequest) {
         let task = TransferTask {
             id: request.task_id,
+            host_alias: request.host_alias.clone(),
             direction: request.direction,
             name: request.local_path.file_name().map_or_else(
                 || request.remote_path.clone(),
@@ -725,9 +784,10 @@ impl App {
             ),
             local_path: request.local_path.clone(),
             remote_path: request.remote_path.clone(),
+            is_dir: request.is_dir,
             transferred: 0,
             total: 0,
-            status: TransferStatus::Running,
+            status: TransferStatus::Queued,
         };
         self.notice = Some(match request.direction {
             TransferDirection::Upload => format!("Uploading {}...", task.name),
@@ -737,7 +797,147 @@ impl App {
         if self.transfer_tasks.len() > 20 {
             self.transfer_tasks.remove(0);
         }
-        sftp::spawn_transfer(request, self.transfer_sender.clone());
+        self.selected_transfer = self
+            .selected_transfer
+            .min(self.transfer_tasks.len().saturating_sub(1));
+        self.transfer_queue.push_back(request);
+        self.start_next_transfer();
+    }
+
+    fn start_next_transfer(&mut self) {
+        if self.active_transfer_id.is_some() {
+            return;
+        }
+        let Some(request) = self.transfer_queue.pop_front() else {
+            return;
+        };
+        let task_id = request.task_id;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        if let Some(task) = self
+            .transfer_tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+        {
+            task.status = TransferStatus::Running;
+        }
+        self.active_transfer_id = Some(task_id);
+        self.transfer_cancellation
+            .insert(task_id, cancellation.clone());
+        sftp::spawn_transfer(request, self.transfer_sender.clone(), cancellation);
+    }
+
+    fn cancel_active_transfer(&mut self) {
+        let Some(task_id) = self.active_transfer_id else {
+            self.notice = Some("No transfer is currently running.".to_string());
+            return;
+        };
+        if let Some(cancellation) = self.transfer_cancellation.get(&task_id) {
+            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.notice = Some("Cancelling transfer...".to_string());
+        }
+    }
+
+    fn cancel_all_transfers(&mut self) {
+        for cancellation in self.transfer_cancellation.values() {
+            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        for request in self.transfer_queue.drain(..) {
+            if let Some(task) = self
+                .transfer_tasks
+                .iter_mut()
+                .find(|task| task.id == request.task_id)
+            {
+                task.status = TransferStatus::Cancelled;
+            }
+        }
+        if self.active_transfer_id.is_some() {
+            self.notice = Some("Cancelling all transfers...".to_string());
+        } else {
+            self.notice = Some("Cancelled queued transfers.".to_string());
+        }
+    }
+
+    pub fn selected_transfer_task_id(&self) -> Option<u64> {
+        self.transfer_tasks
+            .get(self.selected_transfer)
+            .map(|task| task.id)
+    }
+
+    fn move_transfer_selection(&mut self, direction: KeyCode) {
+        if self.transfer_tasks.is_empty() {
+            return;
+        }
+        if direction == KeyCode::Up {
+            self.selected_transfer =
+                (self.selected_transfer + 1).min(self.transfer_tasks.len() - 1);
+        } else {
+            self.selected_transfer = self.selected_transfer.saturating_sub(1);
+        }
+    }
+
+    fn cancel_selected_transfer(&mut self) {
+        let Some(task_id) = self.selected_transfer_task_id() else {
+            self.notice = Some("No transfer task is selected.".to_string());
+            return;
+        };
+        if self.active_transfer_id == Some(task_id) {
+            self.cancel_active_transfer();
+            return;
+        }
+        if let Some(position) = self
+            .transfer_queue
+            .iter()
+            .position(|request| request.task_id == task_id)
+        {
+            self.transfer_queue.remove(position);
+            if let Some(task) = self
+                .transfer_tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+            {
+                task.status = TransferStatus::Cancelled;
+            }
+            self.notice = Some("Queued transfer cancelled.".to_string());
+        } else {
+            self.notice = Some("Only queued or running transfers can be cancelled.".to_string());
+        }
+    }
+
+    fn retry_selected_transfer(&mut self) {
+        let Some(task) = self.transfer_tasks.get(self.selected_transfer).cloned() else {
+            self.notice = Some("No transfer task is selected.".to_string());
+            return;
+        };
+        if !matches!(
+            task.status,
+            TransferStatus::Failed(_) | TransferStatus::Cancelled
+        ) {
+            self.notice = Some("Only failed or cancelled transfers can be retried.".to_string());
+            return;
+        }
+        let request = TransferRequest {
+            task_id: self.next_transfer_id,
+            host_alias: task.host_alias,
+            local_path: task.local_path,
+            remote_path: task.remote_path,
+            direction: task.direction,
+            is_dir: task.is_dir,
+        };
+        self.next_transfer_id = self.next_transfer_id.saturating_add(1);
+        self.queue_or_confirm_transfer(request);
+    }
+
+    fn clear_finished_transfers(&mut self) {
+        self.transfer_tasks.retain(|task| {
+            matches!(
+                task.status,
+                TransferStatus::Queued | TransferStatus::Running
+            )
+        });
+        self.selected_transfer = self
+            .selected_transfer
+            .min(self.transfer_tasks.len().saturating_sub(1));
+        self.notice = Some("Cleared finished transfer history.".to_string());
     }
 
     fn prepare_upload(&mut self) -> Result<TransferRequest, String> {
@@ -752,8 +952,8 @@ impl App {
         let entry = entries
             .get(self.local_files.selected)
             .ok_or_else(|| "Select a local file to upload.".to_string())?;
-        if entry.kind != LocalEntryKind::File {
-            return Err("Only files can be uploaded right now.".to_string());
+        if !matches!(entry.kind, LocalEntryKind::File | LocalEntryKind::Directory) {
+            return Err("Only files and directories can be uploaded.".to_string());
         }
         let local_path = self.local_files.path.join(&entry.name);
         Ok(TransferRequest {
@@ -762,6 +962,7 @@ impl App {
             local_path,
             remote_path: Self::remote_child_path(&listing.path, &entry.name),
             direction: TransferDirection::Upload,
+            is_dir: entry.kind == LocalEntryKind::Directory,
         })
     }
 
@@ -777,8 +978,11 @@ impl App {
         let entry = entries
             .get(self.selected_file)
             .ok_or_else(|| "Select a remote file to download.".to_string())?;
-        if entry.kind != crate::sftp::SftpEntryKind::File {
-            return Err("Only files can be downloaded right now.".to_string());
+        if !matches!(
+            entry.kind,
+            crate::sftp::SftpEntryKind::File | crate::sftp::SftpEntryKind::Directory
+        ) {
+            return Err("Only files and directories can be downloaded.".to_string());
         }
         Ok(TransferRequest {
             task_id: self.next_transfer_id,
@@ -786,6 +990,7 @@ impl App {
             local_path: self.local_files.path.join(&entry.name),
             remote_path: Self::remote_child_path(&listing.path, &entry.name),
             direction: TransferDirection::Download,
+            is_dir: entry.kind == crate::sftp::SftpEntryKind::Directory,
         })
     }
 
@@ -793,7 +998,7 @@ impl App {
         match self.prepare_upload() {
             Ok(request) => {
                 self.next_transfer_id = self.next_transfer_id.saturating_add(1);
-                self.queue_transfer(request);
+                self.queue_or_confirm_transfer(request);
             }
             Err(message) => self.notice = Some(message),
         }
@@ -803,9 +1008,325 @@ impl App {
         match self.prepare_download() {
             Ok(request) => {
                 self.next_transfer_id = self.next_transfer_id.saturating_add(1);
-                self.queue_transfer(request);
+                self.queue_or_confirm_transfer(request);
             }
             Err(message) => self.notice = Some(message),
+        }
+    }
+
+    fn queue_or_confirm_transfer(&mut self, request: TransferRequest) {
+        let remote_name = Path::new(&request.remote_path)
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let target_exists = match request.direction {
+            TransferDirection::Upload => matches!(
+                &self.files,
+                FilesState::Loaded(listing)
+                    if listing.entries.iter().any(|entry| entry.name == remote_name)
+            ),
+            TransferDirection::Download => request.local_path.exists(),
+        };
+        if target_exists {
+            self.file_dialog = Some(FileDialog::TransferConflict { request });
+        } else {
+            self.queue_transfer(request);
+        }
+    }
+
+    fn selected_file_target(&self) -> Result<(String, bool), String> {
+        match self.active_file_pane {
+            FilePane::Local => {
+                let entry = self
+                    .visible_local_entries()
+                    .get(self.local_files.selected)
+                    .cloned()
+                    .ok_or_else(|| "Select a file or directory first.".to_string())?;
+                if entry.kind == LocalEntryKind::Parent {
+                    return Err("The parent entry cannot be changed.".to_string());
+                }
+                if entry.kind == LocalEntryKind::Other {
+                    return Err("This file type cannot be changed here.".to_string());
+                }
+                Ok((entry.name.clone(), entry.kind == LocalEntryKind::Directory))
+            }
+            FilePane::Remote => {
+                let entry = self
+                    .visible_remote_entries()
+                    .get(self.selected_file)
+                    .cloned()
+                    .ok_or_else(|| "Select a file or directory first.".to_string())?;
+                Ok((
+                    entry.name.clone(),
+                    entry.kind == crate::sftp::SftpEntryKind::Directory,
+                ))
+            }
+        }
+    }
+
+    fn start_file_rename(&mut self) {
+        match self.selected_file_target() {
+            Ok((name, _)) => {
+                self.file_dialog = Some(FileDialog::Rename {
+                    pane: self.active_file_pane,
+                    old_name: name.clone(),
+                    value: name,
+                });
+            }
+            Err(message) => self.notice = Some(message),
+        }
+    }
+
+    fn start_file_delete(&mut self) {
+        match self.selected_file_target() {
+            Ok((name, is_dir)) => {
+                self.file_dialog = Some(FileDialog::Delete {
+                    pane: self.active_file_pane,
+                    name,
+                    is_dir,
+                });
+            }
+            Err(message) => self.notice = Some(message),
+        }
+    }
+
+    fn start_create_dir(&mut self) {
+        self.file_dialog = Some(FileDialog::CreateDir {
+            pane: self.active_file_pane,
+            value: String::new(),
+        });
+    }
+
+    fn submit_create_dir(&mut self, pane: FilePane, value: String) {
+        let name = value.trim().to_string();
+        if name.is_empty() {
+            self.notice = Some("A directory name is required.".to_string());
+            return;
+        }
+        if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+            self.notice = Some("Name must be a single directory name.".to_string());
+            return;
+        }
+
+        match pane {
+            FilePane::Local => {
+                let path = self.local_files.path.join(&name);
+                match fs::create_dir(path) {
+                    Ok(()) => {
+                        self.file_dialog = None;
+                        self.notice = Some(format!("Created directory {name}."));
+                        self.refresh_local_files();
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("Could not create directory: {error}"));
+                    }
+                }
+            }
+            FilePane::Remote => {
+                let Some(host_alias) = self.context_host().map(|host| host.alias.clone()) else {
+                    self.notice = Some("Select a remote host first.".to_string());
+                    return;
+                };
+                let request = MutationRequest {
+                    operation_id: self.next_mutation_id,
+                    host_alias,
+                    mutation: Mutation::CreateDir {
+                        path: Self::remote_child_path(&self.current_files_path(), &name),
+                    },
+                };
+                self.next_mutation_id = self.next_mutation_id.saturating_add(1);
+                self.mutation_hosts
+                    .insert(request.operation_id, request.host_alias.clone());
+                self.file_dialog = None;
+                self.notice = Some(format!("Creating directory {name}..."));
+                sftp::spawn_mutation(request, self.mutation_sender.clone());
+            }
+        }
+    }
+
+    fn submit_file_rename(&mut self, pane: FilePane, old_name: String, value: String) {
+        let new_name = value.trim().to_string();
+        if new_name.is_empty() {
+            self.notice = Some("A new name is required.".to_string());
+            return;
+        }
+        if new_name == "." || new_name == ".." || new_name.contains('/') || new_name.contains('\\')
+        {
+            self.notice = Some("Name must be a single file or directory name.".to_string());
+            return;
+        }
+        if new_name == old_name {
+            self.file_dialog = None;
+            return;
+        }
+
+        match pane {
+            FilePane::Local => {
+                let from = self.local_files.path.join(&old_name);
+                let to = self.local_files.path.join(&new_name);
+                match fs::rename(from, to) {
+                    Ok(()) => {
+                        self.file_dialog = None;
+                        self.notice = Some(format!("Renamed {old_name} to {new_name}."));
+                        self.refresh_local_files();
+                    }
+                    Err(error) => self.notice = Some(format!("Could not rename file: {error}")),
+                }
+            }
+            FilePane::Remote => {
+                let Some(host_alias) = self.context_host().map(|host| host.alias.clone()) else {
+                    self.notice = Some("Select a remote host first.".to_string());
+                    return;
+                };
+                let path = self.current_files_path();
+                let request = MutationRequest {
+                    operation_id: self.next_mutation_id,
+                    host_alias: host_alias.clone(),
+                    mutation: Mutation::Rename {
+                        from: Self::remote_child_path(&path, &old_name),
+                        to: Self::remote_child_path(&path, &new_name),
+                    },
+                };
+                self.next_mutation_id = self.next_mutation_id.saturating_add(1);
+                self.mutation_hosts
+                    .insert(request.operation_id, host_alias.clone());
+                self.file_dialog = None;
+                self.notice = Some(format!("Renaming {old_name}..."));
+                sftp::spawn_mutation(request, self.mutation_sender.clone());
+            }
+        }
+    }
+
+    fn submit_file_delete(&mut self, pane: FilePane, name: String, is_dir: bool) {
+        match pane {
+            FilePane::Local => {
+                let path = self.local_files.path.join(&name);
+                let result = if is_dir {
+                    fs::remove_dir(path)
+                } else {
+                    fs::remove_file(path)
+                };
+                match result {
+                    Ok(()) => {
+                        self.file_dialog = None;
+                        self.notice = Some(format!("Deleted {name}."));
+                        self.refresh_local_files();
+                    }
+                    Err(error) => self.notice = Some(format!("Could not delete {name}: {error}")),
+                }
+            }
+            FilePane::Remote => {
+                let Some(host_alias) = self.context_host().map(|host| host.alias.clone()) else {
+                    self.notice = Some("Select a remote host first.".to_string());
+                    return;
+                };
+                let path = Self::remote_child_path(&self.current_files_path(), &name);
+                let request = MutationRequest {
+                    operation_id: self.next_mutation_id,
+                    host_alias,
+                    mutation: Mutation::Delete { path, is_dir },
+                };
+                self.next_mutation_id = self.next_mutation_id.saturating_add(1);
+                self.mutation_hosts
+                    .insert(request.operation_id, request.host_alias.clone());
+                self.file_dialog = None;
+                self.notice = Some(format!("Deleting {name}..."));
+                sftp::spawn_mutation(request, self.mutation_sender.clone());
+            }
+        }
+    }
+
+    fn handle_file_dialog_key(&mut self, key: KeyCode) {
+        let Some(dialog) = self.file_dialog.clone() else {
+            return;
+        };
+        match dialog {
+            FileDialog::Rename {
+                pane,
+                old_name,
+                mut value,
+            } => match key {
+                KeyCode::Esc => self.file_dialog = None,
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.file_dialog = Some(FileDialog::Rename {
+                        pane,
+                        old_name,
+                        value,
+                    });
+                }
+                KeyCode::Enter => self.submit_file_rename(pane, old_name, value),
+                KeyCode::Char(character) if !character.is_control() => {
+                    value.push(character);
+                    self.file_dialog = Some(FileDialog::Rename {
+                        pane,
+                        old_name,
+                        value,
+                    });
+                }
+                _ => {}
+            },
+            FileDialog::Delete { pane, name, is_dir } => match key {
+                KeyCode::Char('y') | KeyCode::Enter => self.submit_file_delete(pane, name, is_dir),
+                KeyCode::Char('n') | KeyCode::Esc => self.file_dialog = None,
+                _ => {}
+            },
+            FileDialog::CreateDir { pane, mut value } => match key {
+                KeyCode::Esc => self.file_dialog = None,
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.file_dialog = Some(FileDialog::CreateDir { pane, value });
+                }
+                KeyCode::Enter => self.submit_create_dir(pane, value),
+                KeyCode::Char(character) if !character.is_control() => {
+                    value.push(character);
+                    self.file_dialog = Some(FileDialog::CreateDir { pane, value });
+                }
+                _ => {}
+            },
+            FileDialog::TransferConflict { request } => match key {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.file_dialog = None;
+                    self.queue_transfer(request);
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.file_dialog = None,
+                _ => {}
+            },
+        }
+    }
+
+    pub fn poll_mutations(&mut self) {
+        loop {
+            let event = match self.mutation_receiver.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            };
+            match event {
+                MutationEvent::Finished { operation_id } => {
+                    let Some(host_alias) = self.mutation_hosts.remove(&operation_id) else {
+                        continue;
+                    };
+                    if self.context_host().map(|host| host.alias.as_str())
+                        != Some(host_alias.as_str())
+                    {
+                        continue;
+                    }
+                    self.notice = Some("Remote file operation completed.".to_string());
+                    let path = self.current_files_path();
+                    self.files = FilesState::Loading {
+                        host_alias: host_alias.clone(),
+                        path: path.clone(),
+                    };
+                    self.sftp_receiver = Some(sftp::spawn_list(host_alias, path));
+                }
+                MutationEvent::Failed {
+                    operation_id,
+                    message,
+                } => {
+                    self.mutation_hosts.remove(&operation_id);
+                    self.notice = Some(format!("Remote file operation failed: {message}"));
+                }
+            }
         }
     }
 
@@ -921,12 +1442,10 @@ impl App {
             return InputAction::None;
         }
 
-        if self.active_file_pane == FilePane::Local
-            && key == KeyCode::Esc
-            && !self.file_filter.is_empty()
-        {
+        if key == KeyCode::Esc && !self.file_filter.is_empty() {
             self.file_filter.clear();
             self.local_files.selected = 0;
+            self.selected_file = 0;
             return InputAction::None;
         }
 
@@ -967,10 +1486,23 @@ impl App {
             KeyCode::Char('d') if self.active_file_pane == FilePane::Remote => {
                 self.start_download();
             }
-            KeyCode::Char('/') if self.active_file_pane == FilePane::Local => {
+            KeyCode::Char('c') => self.cancel_selected_transfer(),
+            KeyCode::Char('C') => self.cancel_all_transfers(),
+            KeyCode::Char('[') => self.move_transfer_selection(KeyCode::Up),
+            KeyCode::Char(']') => self.move_transfer_selection(KeyCode::Down),
+            KeyCode::Char('R') => self.retry_selected_transfer(),
+            KeyCode::Char('K') => self.clear_finished_transfers(),
+            KeyCode::Char('m') => self.start_file_rename(),
+            KeyCode::Char('x') => self.start_file_delete(),
+            KeyCode::Char('n') => self.start_create_dir(),
+            KeyCode::Char('/')
+                if self.active_file_pane == FilePane::Local
+                    || self.active_file_pane == FilePane::Remote =>
+            {
                 self.file_filtering = true;
                 self.file_filter.clear();
                 self.local_files.selected = 0;
+                self.selected_file = 0;
             }
             KeyCode::Char('r') => match self.active_file_pane {
                 FilePane::Local => self.refresh_local_files(),
@@ -1051,7 +1583,7 @@ impl App {
         } else if self.host_context.is_none() {
             self.open_host_picker();
         } else if matches!(self.files, FilesState::Loaded(_)) {
-            let index = usize::from(row.saturating_sub(4));
+            let index = usize::from(row.saturating_sub(self.remote_list_start_row()));
             if index < self.visible_remote_entries().len() {
                 self.selected_file = index;
             }
@@ -1174,9 +1706,14 @@ impl App {
                         .iter_mut()
                         .find(|task| task.id == task_id)
                     else {
+                        self.active_transfer_id = None;
+                        self.transfer_cancellation.remove(&task_id);
+                        self.start_next_transfer();
                         continue;
                     };
                     task.status = TransferStatus::Completed;
+                    self.active_transfer_id = None;
+                    self.transfer_cancellation.remove(&task_id);
                     let direction = task.direction;
                     let name = task.name.clone();
                     let remote_path = task.remote_path.clone();
@@ -1200,6 +1737,7 @@ impl App {
                                 name: remote_name,
                                 kind: crate::sftp::SftpEntryKind::File,
                                 size: Some(total),
+                                ..Default::default()
                             });
                             listing.entries.sort_by_key(|entry| {
                                 (
@@ -1210,6 +1748,18 @@ impl App {
                         }
                     }
                 }
+                TransferEvent::Cancelled { task_id } => {
+                    if let Some(task) = self
+                        .transfer_tasks
+                        .iter_mut()
+                        .find(|task| task.id == task_id)
+                    {
+                        task.status = TransferStatus::Cancelled;
+                    }
+                    self.active_transfer_id = None;
+                    self.transfer_cancellation.remove(&task_id);
+                    self.notice = Some("Transfer cancelled.".to_string());
+                }
                 TransferEvent::Failed { task_id, message } => {
                     if let Some(task) = self
                         .transfer_tasks
@@ -1219,8 +1769,11 @@ impl App {
                         task.status = TransferStatus::Failed(message.clone());
                         self.notice = Some(format!("Transfer failed: {message}"));
                     }
+                    self.active_transfer_id = None;
+                    self.transfer_cancellation.remove(&task_id);
                 }
             }
+            self.start_next_transfer();
         }
     }
 
@@ -1249,7 +1802,8 @@ impl App {
     pub fn handle_event(&mut self, key: KeyEvent) -> InputAction {
         let modal = self.host_dialog.is_some()
             || self.tags_dialog.is_some()
-            || self.connection_dialog.is_some();
+            || self.connection_dialog.is_some()
+            || self.file_dialog.is_some();
         if !modal {
             match (key.code, key.modifiers) {
                 (KeyCode::F(number @ 1..=4), KeyModifiers::NONE) => {
@@ -1278,6 +1832,8 @@ impl App {
             self.handle_search_key(key.code);
         } else if self.file_filtering && !modal {
             self.handle_file_filter_key(key.code);
+        } else if self.file_dialog.is_some() {
+            self.handle_file_dialog_key(key.code);
         } else if modal {
             self.handle_key(key.code);
         } else if self.section == NavSection::Hosts && key.code == KeyCode::Enter {
@@ -1565,13 +2121,24 @@ impl App {
     fn handle_file_filter_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Enter => self.file_filtering = false,
-            KeyCode::Up | KeyCode::Down => self.move_local_selection(key),
-            KeyCode::Left => {
-                self.go_to_local_parent();
-            }
+            KeyCode::Up | KeyCode::Down => match self.active_file_pane {
+                FilePane::Local => self.move_local_selection(key),
+                FilePane::Remote => self.move_file_selection(key),
+            },
+            KeyCode::Left => match self.active_file_pane {
+                FilePane::Local => self.go_to_local_parent(),
+                FilePane::Remote => {
+                    let _ = self.go_to_remote_parent();
+                }
+            },
             KeyCode::Right => {
                 self.file_filtering = false;
-                self.open_local_selection();
+                match self.active_file_pane {
+                    FilePane::Local => self.open_local_selection(),
+                    FilePane::Remote => {
+                        let _ = self.open_remote_selection();
+                    }
+                }
             }
             KeyCode::Esc => {
                 self.file_filtering = false;
@@ -1581,6 +2148,7 @@ impl App {
             KeyCode::Backspace => {
                 self.file_filter.pop();
                 self.local_files.selected = 0;
+                self.selected_file = 0;
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.file_filtering = false;
@@ -1592,6 +2160,7 @@ impl App {
             KeyCode::Char(character) if !character.is_control() => {
                 self.file_filter.push(character);
                 self.local_files.selected = 0;
+                self.selected_file = 0;
             }
             _ => {}
         }
@@ -2195,6 +2764,101 @@ mod tests {
     }
 
     #[test]
+    fn local_files_can_be_renamed_and_deleted_with_confirmation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "lazyterm-mutations-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("before.txt"), "content").unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+
+        let mut app = app_fixture();
+        app.section = NavSection::Files;
+        app.active_file_pane = FilePane::Local;
+        app.local_files.path = root.clone();
+        app.refresh_local_files();
+
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.file_dialog,
+            Some(FileDialog::CreateDir { .. })
+        ));
+        for character in "created".chars() {
+            press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(root.join("created").is_dir());
+
+        app.local_files.selected = app
+            .visible_local_entries()
+            .iter()
+            .position(|entry| entry.name == "before.txt")
+            .unwrap();
+
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(matches!(app.file_dialog, Some(FileDialog::Rename { .. })));
+        for _ in "before.txt".chars() {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        for character in "renamed.txt".chars() {
+            press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(root.join("renamed.txt").is_file());
+        assert!(!root.join("before.txt").exists());
+
+        app.refresh_local_files();
+        app.local_files.selected = app
+            .visible_local_entries()
+            .iter()
+            .position(|entry| entry.name == "empty")
+            .unwrap();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.file_dialog,
+            Some(FileDialog::Delete { is_dir: true, .. })
+        ));
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(root.join("empty").is_dir());
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(!root.join("empty").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_mutation_completion_reloads_the_current_directory() {
+        let mut app = grouped_fixture();
+        app.host_context = Some("web".into());
+        app.files = FilesState::Loaded(crate::sftp::SftpListing {
+            host_alias: "web".into(),
+            path: "projects".into(),
+            entries: vec![],
+        });
+        app.mutation_hosts.insert(1, "web".into());
+        app.mutation_sender
+            .send(MutationEvent::Finished { operation_id: 1 })
+            .unwrap();
+
+        app.poll_mutations();
+
+        assert!(matches!(
+            app.files,
+            FilesState::Loading {
+                ref host_alias,
+                ref path
+            } if host_alias == "web" && path == "projects"
+        ));
+        assert!(app.sftp_receiver.is_some());
+    }
+
+    #[test]
     fn remote_hidden_entries_follow_the_same_setting() {
         let mut app = grouped_fixture();
         app.files = FilesState::Loaded(crate::sftp::SftpListing {
@@ -2205,17 +2869,57 @@ mod tests {
                     name: ".ssh".into(),
                     kind: crate::sftp::SftpEntryKind::Directory,
                     size: None,
+                    ..Default::default()
                 },
                 crate::sftp::SftpEntry {
                     name: "README.md".into(),
                     kind: crate::sftp::SftpEntryKind::File,
                     size: Some(1),
+                    ..Default::default()
                 },
             ],
         });
         assert_eq!(app.visible_remote_entries().len(), 1);
         app.show_hidden_files = true;
         assert_eq!(app.visible_remote_entries().len(), 2);
+    }
+
+    #[test]
+    fn remote_file_filter_matches_names() {
+        let mut app = grouped_fixture();
+        app.section = NavSection::Files;
+        app.active_file_pane = FilePane::Remote;
+        app.host_context = Some("web".into());
+        app.files = FilesState::Loaded(crate::sftp::SftpListing {
+            host_alias: "web".into(),
+            path: String::new(),
+            entries: vec![
+                crate::sftp::SftpEntry {
+                    name: "logs".into(),
+                    kind: crate::sftp::SftpEntryKind::Directory,
+                    size: None,
+                    ..Default::default()
+                },
+                crate::sftp::SftpEntry {
+                    name: "README.md".into(),
+                    kind: crate::sftp::SftpEntryKind::File,
+                    size: Some(12),
+                    ..Default::default()
+                },
+            ],
+        });
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for character in "read".chars() {
+            press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            app.visible_remote_entries()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["README.md"]
+        );
     }
 
     #[test]
@@ -2353,11 +3057,13 @@ mod tests {
                     name: "docs".into(),
                     kind: crate::sftp::SftpEntryKind::Directory,
                     size: None,
+                    ..Default::default()
                 },
                 crate::sftp::SftpEntry {
                     name: "README.md".into(),
                     kind: crate::sftp::SftpEntryKind::File,
                     size: Some(12),
+                    ..Default::default()
                 },
             ],
         });
@@ -2384,6 +3090,7 @@ mod tests {
                 name: "docs".into(),
                 kind: crate::sftp::SftpEntryKind::Directory,
                 size: None,
+                ..Default::default()
             }],
         });
         assert_eq!(
@@ -2425,6 +3132,7 @@ mod tests {
                     name: "docs".into(),
                     kind: crate::sftp::SftpEntryKind::Directory,
                     size: None,
+                    ..Default::default()
                 }],
             }))
             .unwrap();
@@ -2463,11 +3171,13 @@ mod tests {
                     name: "remote.txt".into(),
                     kind: crate::sftp::SftpEntryKind::File,
                     size: Some(20),
+                    ..Default::default()
                 },
                 crate::sftp::SftpEntry {
                     name: "remote-folder".into(),
                     kind: crate::sftp::SftpEntryKind::Directory,
                     size: None,
+                    ..Default::default()
                 },
             ],
         });
@@ -2477,12 +3187,10 @@ mod tests {
         assert_eq!(upload.direction, TransferDirection::Upload);
         assert_eq!(upload.local_path, PathBuf::from("/tmp/notes.txt"));
         assert_eq!(upload.remote_path, "incoming/notes.txt");
+        assert!(!upload.is_dir);
 
         app.local_files.selected = 0;
-        assert_eq!(
-            app.prepare_upload().unwrap_err(),
-            "Only files can be uploaded right now."
-        );
+        assert!(app.prepare_upload().unwrap().is_dir);
 
         app.selected_file = 0;
         let download = app
@@ -2491,12 +3199,10 @@ mod tests {
         assert_eq!(download.direction, TransferDirection::Download);
         assert_eq!(download.local_path, PathBuf::from("/tmp/remote.txt"));
         assert_eq!(download.remote_path, "incoming/remote.txt");
+        assert!(!download.is_dir);
 
         app.selected_file = 1;
-        assert_eq!(
-            app.prepare_download().unwrap_err(),
-            "Only files can be downloaded right now."
-        );
+        assert!(app.prepare_download().unwrap().is_dir);
     }
 
     #[test]
@@ -2510,14 +3216,17 @@ mod tests {
                 name: "same.txt".into(),
                 kind: crate::sftp::SftpEntryKind::File,
                 size: Some(1),
+                ..Default::default()
             }],
         });
         app.transfer_tasks.push(TransferTask {
             id: 7,
+            host_alias: "web".into(),
             direction: TransferDirection::Upload,
             name: "same.txt".into(),
             local_path: PathBuf::from("/tmp/same.txt"),
             remote_path: "same.txt".into(),
+            is_dir: false,
             transferred: 0,
             total: 0,
             status: TransferStatus::Running,
@@ -2544,10 +3253,12 @@ mod tests {
 
         app.transfer_tasks.push(TransferTask {
             id: 8,
+            host_alias: "web".into(),
             direction: TransferDirection::Download,
             name: "missing.txt".into(),
             local_path: PathBuf::from("/tmp/missing.txt"),
             remote_path: "missing.txt".into(),
+            is_dir: false,
             transferred: 0,
             total: 0,
             status: TransferStatus::Running,
@@ -2573,10 +3284,12 @@ mod tests {
         app.local_files.selected = 1;
         app.transfer_tasks.push(TransferTask {
             id: 1,
+            host_alias: "web".into(),
             direction: TransferDirection::Upload,
             name: "notes.txt".into(),
             local_path: PathBuf::from("/tmp/notes.txt"),
             remote_path: "notes.txt".into(),
+            is_dir: false,
             transferred: 5,
             total: 10,
             status: TransferStatus::Running,
@@ -2586,6 +3299,81 @@ mod tests {
 
         assert_eq!(app.active_file_pane, FilePane::Remote);
         assert_eq!(app.local_files.selected, 1);
+    }
+
+    #[test]
+    fn transfer_selection_follows_recent_first_visual_order() {
+        let mut app = grouped_fixture();
+        for id in 1..=3 {
+            app.transfer_tasks.push(TransferTask {
+                id,
+                host_alias: "web".into(),
+                direction: TransferDirection::Upload,
+                name: format!("file-{id}"),
+                local_path: PathBuf::from(format!("/tmp/file-{id}")),
+                remote_path: format!("file-{id}"),
+                is_dir: false,
+                transferred: 0,
+                total: 0,
+                status: TransferStatus::Completed,
+            });
+        }
+
+        assert_eq!(app.selected_transfer_task_id(), Some(1));
+        app.move_transfer_selection(KeyCode::Up);
+        assert_eq!(app.selected_transfer_task_id(), Some(2));
+        app.move_transfer_selection(KeyCode::Up);
+        assert_eq!(app.selected_transfer_task_id(), Some(3));
+        app.move_transfer_selection(KeyCode::Down);
+        assert_eq!(app.selected_transfer_task_id(), Some(2));
+    }
+
+    #[test]
+    fn terminal_transfer_history_can_be_cleared_without_touching_active_work() {
+        let mut app = grouped_fixture();
+        app.transfer_tasks = vec![
+            TransferTask {
+                id: 1,
+                host_alias: "web".into(),
+                direction: TransferDirection::Upload,
+                name: "done".into(),
+                local_path: PathBuf::from("/tmp/done"),
+                remote_path: "done".into(),
+                is_dir: false,
+                transferred: 1,
+                total: 1,
+                status: TransferStatus::Completed,
+            },
+            TransferTask {
+                id: 2,
+                host_alias: "web".into(),
+                direction: TransferDirection::Download,
+                name: "running".into(),
+                local_path: PathBuf::from("/tmp/running"),
+                remote_path: "running".into(),
+                is_dir: false,
+                transferred: 0,
+                total: 10,
+                status: TransferStatus::Running,
+            },
+            TransferTask {
+                id: 3,
+                host_alias: "web".into(),
+                direction: TransferDirection::Upload,
+                name: "failed".into(),
+                local_path: PathBuf::from("/tmp/failed"),
+                remote_path: "failed".into(),
+                is_dir: false,
+                transferred: 0,
+                total: 0,
+                status: TransferStatus::Failed("no access".into()),
+            },
+        ];
+
+        app.clear_finished_transfers();
+
+        assert_eq!(app.transfer_tasks.len(), 1);
+        assert_eq!(app.transfer_tasks[0].id, 2);
     }
 
     #[test]

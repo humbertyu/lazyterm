@@ -8,8 +8,9 @@ use ratatui::{
 
 use crate::{
     app::{
-        App, ConnectionDialog, FilePane, FilesState, HostPickerItem, LOCAL_BREADCRUMB_SEPARATOR,
-        LocalEntryKind, NavSection, TransferStatus, group_columns, host_browser_width,
+        App, ConnectionDialog, FileDialog, FilePane, FilesState, HostPickerItem,
+        LOCAL_BREADCRUMB_SEPARATOR, LocalEntryKind, NavSection, TransferStatus, group_columns,
+        host_browser_width,
     },
     sftp::SftpEntryKind,
 };
@@ -93,6 +94,9 @@ pub fn render(frame: &mut Frame, app: &App) {
             area,
         );
     }
+    if let Some(dialog) = &app.file_dialog {
+        render_file_dialog(frame, dialog);
+    }
 }
 
 fn render_files(frame: &mut Frame, area: Rect, app: &App) {
@@ -137,6 +141,7 @@ fn render_transfer_tasks(frame: &mut Frame, area: Rect, app: &App) {
             0.0
         };
         let label = match &task.status {
+            TransferStatus::Queued => format!("{direction} {}  queued", task.name),
             TransferStatus::Running if task.total > 0 => {
                 format!("{direction} {}  {:.0}%", task.name, ratio * 100.0)
             }
@@ -148,10 +153,14 @@ fn render_transfer_tasks(frame: &mut Frame, area: Rect, app: &App) {
                 )
             }
             TransferStatus::Completed => format!("{direction} {}  100% done", task.name),
+            TransferStatus::Cancelled => format!("{direction} {}  cancelled", task.name),
             TransferStatus::Failed(message) => {
                 format!("{direction} {}  failed: {message}", task.name)
             }
         };
+        let selected = app
+            .selected_transfer_task_id()
+            .is_some_and(|task_id| task_id == task.id);
         let gauge = Gauge::default()
             .gauge_style(
                 Style::default().fg(if task.status == TransferStatus::Completed {
@@ -160,8 +169,16 @@ fn render_transfer_tasks(frame: &mut Frame, area: Rect, app: &App) {
                     Color::Rgb(93, 159, 122)
                 }),
             )
-            .label(label)
-            .ratio(ratio);
+            .label(if selected {
+                format!("> {label}")
+            } else {
+                label
+            })
+            .ratio(if task.status == TransferStatus::Queued {
+                0.0
+            } else {
+                ratio
+            });
         if let Some(row) = inner.rows().nth(index) {
             frame.render_widget(gauge, row);
         }
@@ -442,10 +459,40 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
             let inner = block.inner(area);
             frame.render_widget(block, area);
             let entries = app.visible_remote_entries();
+            let filter_visible = app.file_filtering || !app.file_filter.is_empty();
+            let rows = Layout::vertical([
+                Constraint::Length(u16::from(filter_visible)),
+                Constraint::Min(1),
+            ])
+            .split(inner);
+            if filter_visible {
+                let filter_text = if app.file_filtering {
+                    format!("Filter: {}_", app.file_filter)
+                } else {
+                    format!("Filter: {}", app.file_filter)
+                };
+                frame.render_widget(
+                    Paragraph::new(filter_text).style(Style::default().fg(if active {
+                        if app.file_filter.is_empty() {
+                            MUTED
+                        } else {
+                            GREEN
+                        }
+                    } else {
+                        DISABLED
+                    })),
+                    rows[0],
+                );
+            }
             if entries.is_empty() {
                 frame.render_widget(
-                    Paragraph::new("This directory is empty.").style(Style::default().fg(MUTED)),
-                    inner,
+                    Paragraph::new(if app.file_filter.is_empty() {
+                        "This directory is empty."
+                    } else {
+                        "No matching remote files or directories."
+                    })
+                    .style(Style::default().fg(MUTED)),
+                    rows[1],
                 );
                 return;
             }
@@ -458,6 +505,7 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                 let size = entry
                     .size
                     .map_or_else(String::new, |size| format!("  {}", format_bytes(size)));
+                let metadata = format_remote_metadata(entry);
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("  {}{}", entry.name, marker),
@@ -470,7 +518,7 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                         }),
                     ),
                     Span::styled(
-                        size,
+                        format!("{size}{metadata}"),
                         Style::default().fg(if active { MUTED } else { DISABLED }),
                     ),
                 ]))
@@ -481,11 +529,58 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                 List::new(items)
                     .highlight_symbol("> ")
                     .highlight_style(file_selection_style(active)),
-                inner,
+                rows[1],
                 &mut state,
             );
         }
     }
+}
+
+fn format_remote_metadata(entry: &crate::sftp::SftpEntry) -> String {
+    let mut parts = Vec::new();
+    if let Some(mode) = entry.permissions {
+        parts.push(format!("{mode:04o}"));
+    }
+    if let (Some(uid), Some(gid)) = (entry.uid, entry.gid) {
+        parts.push(format!("{uid}:{gid}"));
+    }
+    if let Some(modified) = entry.modified {
+        parts.push(format!("mtime:{}", format_unix_timestamp(modified)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join(" "))
+    }
+}
+
+fn format_unix_timestamp(timestamp: u64) -> String {
+    const SECONDS_PER_MINUTE: u64 = 60;
+    const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+    const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
+    let days = timestamp / SECONDS_PER_DAY;
+    let seconds = timestamp % SECONDS_PER_DAY;
+    let hour = seconds / SECONDS_PER_HOUR;
+    let minute = (seconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
+    let (year, month, day) = civil_date_from_days(days as i64);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+// Howard Hinnant's proleptic Gregorian calendar conversion, with Unix epoch
+// days as input.
+fn civil_date_from_days(days_since_epoch: i64) -> (i64, u8, u8) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year, month as u8, day as u8)
 }
 
 fn render_remote_status(
@@ -1071,10 +1166,17 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "Tab / Shift+Tab field  Enter next/save  Esc cancel"
     } else if app.tags_dialog.is_some() {
         "Enter save tags  Esc cancel"
+    } else if let Some(dialog) = &app.file_dialog {
+        match dialog {
+            FileDialog::Rename { .. } => "Type new name  Enter confirm  Esc cancel",
+            FileDialog::Delete { .. } => "y / Enter confirm  n / Esc cancel",
+            FileDialog::CreateDir { .. } => "Type directory name  Enter confirm  Esc cancel",
+            FileDialog::TransferConflict { .. } => "y / Enter overwrite  n / Esc cancel",
+        }
     } else if app.searching {
         "Type to filter   Enter apply   Esc clear"
     } else if app.file_filtering {
-        "Type to filter local files   ↑↓ move   ← parent   → open   Enter apply   Esc clear"
+        "Type to filter current pane   ↑↓ move   ← parent   → open   Enter apply   Esc clear"
     } else if app.section == NavSection::Hosts {
         if area.width < 75 && app.showing_groups() {
             "Arrows select  Enter open/SSH  / find  q quit"
@@ -1097,21 +1199,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else if area.width < 75 {
             match (app.active_file_pane, app.context_host().is_none()) {
                 (FilePane::Local, _) => {
-                    "Click path  / filter  h hidden files  ↑↓ select  ← parent  →/Enter open"
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  / filter  h hidden  ↑↓ select  ← parent  →/Enter open"
                 }
                 (FilePane::Remote, true) => "Tab local  Enter/s select host",
                 (FilePane::Remote, false) => {
-                    "Tab local  h hidden files  ↑↓ select  ← parent  →/Enter open"
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  Tab local  h hidden  ↑↓ select  ← parent  →/Enter open"
                 }
             }
         } else {
             match (app.active_file_pane, app.context_host().is_none()) {
                 (FilePane::Local, _) => {
-                    "Click path  / filter  h hidden  Tab remote  ↑↓ select  ← parent  →/Enter open  u upload  r reload"
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  / filter  h hidden  Tab remote  ↑↓ select  ← parent  →/Enter open  u upload  r reload"
                 }
                 (FilePane::Remote, true) => "Tab local  Enter/s select host",
                 (FilePane::Remote, false) => {
-                    "Tab local  h hidden  ↑↓ select  ← parent  →/Enter open  d download  s host  o native sftp"
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  Tab local  h hidden  ↑↓ select  ← parent  →/Enter open  d download  s host  o native sftp"
                 }
             }
         }
@@ -1120,13 +1222,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(if app.host_dialog.is_some() || app.tags_dialog.is_some() {
-                ""
-            } else if app.searching {
-                "F1-F4 / Ctrl+Left/Right tabs"
-            } else {
-                navigation
-            }),
+            Line::from(
+                if app.host_dialog.is_some()
+                    || app.tags_dialog.is_some()
+                    || app.file_dialog.is_some()
+                {
+                    ""
+                } else if app.searching {
+                    "F1-F4 / Ctrl+Left/Right tabs"
+                } else {
+                    navigation
+                },
+            ),
             Line::from(hint),
             Line::from(
                 app.notice
@@ -1138,6 +1245,103 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().fg(MUTED)),
         area,
     );
+}
+
+fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
+    match dialog {
+        FileDialog::Rename {
+            old_name, value, ..
+        } => {
+            let area = centered_rect(68, 7, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("Rename \"{old_name}\"")),
+                    Line::from(format!("Name: {value}_")),
+                    Line::from(Span::styled(
+                        "Enter confirm   Esc cancel",
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+                .style(Style::default().fg(TEXT))
+                .block(panel(" RENAME FILE "))
+                .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+        FileDialog::Delete { name, is_dir, .. } => {
+            let area = centered_rect(68, 7, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("Delete \"{name}\"?")),
+                    Line::from(if *is_dir {
+                        "The directory must be empty."
+                    } else {
+                        "This action cannot be undone."
+                    }),
+                    Line::from(Span::styled(
+                        "y / Enter confirm   n / Esc cancel",
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+                .style(Style::default().fg(TEXT))
+                .block(panel(if *is_dir {
+                    " DELETE DIRECTORY "
+                } else {
+                    " DELETE FILE "
+                }))
+                .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+        FileDialog::CreateDir { value, .. } => {
+            let area = centered_rect(68, 7, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("Name: {value}_")),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Enter confirm   Esc cancel",
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+                .style(Style::default().fg(TEXT))
+                .block(panel(" NEW DIRECTORY "))
+                .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+        FileDialog::TransferConflict { request } => {
+            let direction = match request.direction {
+                crate::sftp::TransferDirection::Upload => "Upload",
+                crate::sftp::TransferDirection::Download => "Download",
+            };
+            let target = match request.direction {
+                crate::sftp::TransferDirection::Upload => request.remote_path.clone(),
+                crate::sftp::TransferDirection::Download => {
+                    request.local_path.to_string_lossy().into_owned()
+                }
+            };
+            let area = centered_rect(72, 7, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("{direction} will overwrite:")),
+                    Line::from(target),
+                    Line::from(Span::styled(
+                        "y / Enter overwrite   n / Esc cancel",
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+                .style(Style::default().fg(TEXT))
+                .block(panel(" TRANSFER CONFLICT "))
+                .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+    }
 }
 
 fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
@@ -1278,6 +1482,12 @@ mod tests {
     }
 
     #[test]
+    fn remote_times_use_readable_utc_values() {
+        assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_unix_timestamp(1_704_067_200), "2024-01-01 00:00 UTC");
+    }
+
+    #[test]
     fn all_sections_render_at_desktop_and_compact_sizes() {
         for (width, height) in [(120, 40), (80, 24), (54, 18), (42, 18), (32, 12)] {
             let backend = TestBackend::new(width, height);
@@ -1350,10 +1560,12 @@ mod tests {
         app.section = NavSection::Files;
         app.transfer_tasks.push(TransferTask {
             id: 1,
+            host_alias: "web".into(),
             direction: crate::sftp::TransferDirection::Upload,
             name: "notes.txt".into(),
             local_path: std::path::PathBuf::from("/tmp/notes.txt"),
             remote_path: "notes.txt".into(),
+            is_dir: false,
             transferred: 10,
             total: 10,
             status: TransferStatus::Completed,

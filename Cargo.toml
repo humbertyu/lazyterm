@@ -6,6 +6,7 @@ description = "A lightweight, keyboard-driven workspace for remote hosts"
 license = "MIT"
 
 [dependencies]
+async-recursion = "1"
 color-eyre = "0.6"
 crossterm = "0.29"
 ratatui = "0.30"

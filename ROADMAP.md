@@ -83,15 +83,22 @@ Goal: use the Hosts catalog for file workflows, without a second host database. 
 - [x] Upload and download ordinary files with progress and clear errors.
 - [x] Remember the local directory and the last remote directory for each host.
 - [x] Hide dot files and directories by default, with a shared Files toggle.
-- [ ] Add cancellation and queued-task controls.
-- [ ] Add rename, mkdir, and delete with confirmation.
+- [x] Filter the focused local or remote pane by entry name.
+- [x] Upload and download directories recursively with aggregate progress.
+- [x] Complete cancellation and queued-task controls, including per-task selection/cancellation, retry, history cleanup, progress, and sequential execution.
+- [x] Clean up empty directories created by an interrupted or failed recursive transfer while preserving pre-existing directories.
+- [x] Show remote size, permissions, owner/group IDs, and readable modification time when the server provides them.
+- [x] Add rename, mkdir, and delete with confirmation for individual entries.
 - [ ] Verify the integrated Hosts -> Files -> Hosts workflow against disposable fixtures.
+- [x] Reuse one live SFTP connection per host inside a dedicated background Tokio service; the cache is isolated to the LazyTerm process and ends with that service.
 
 Deferred credential track:
 
 - [ ] Add a macOS Keychain-backed credential store.
 - [ ] Support password authentication without writing secrets to config, arguments, environment, or logs.
 - [ ] Complete a security and behavior spike for supplying a saved password to native OpenSSH; do not ship an `sshpass` dependency.
+
+Password authentication and first-use host-key confirmation remain outside the embedded browser until the backend can provide secure callbacks. The current `openssh` adapter requires non-interactive authentication and strict known-hosts validation; the native `sftp` handoff remains the compatibility path for interactive prompts.
 
 Release gate: SSH and SFTP use the same host identity and authentication policy; transfers handle interruption without freezing the TUI.
 
