@@ -148,16 +148,27 @@ Runtime:
 - [x] Default to current-user non-system listeners; provide Mine, Apps, System, and All category tabs.
 - [x] Color CLI, Agent, desktop, and unknown origins using visible process ancestry; prioritize CLI/Agent listeners.
 - [ ] Add process details and a controlled `KILL` follow-up.
-- [ ] Distinguish LazyTerm-managed processes from external processes.
-- [ ] Add disposable local and remote process fixtures.
+- [x] Identify Project command listeners by owned process group; show project/command names and jump to output.
+- [x] Revalidate the current Project run before confirmed group termination from Runtime.
+- [x] Link recognized external Project listeners with a distinct origin and confirmed individual-process termination.
+- [ ] Identify Tunnel-managed listeners separately from external processes.
+- [x] Add disposable local process fixtures and the Projects -> Runtime -> output -> stop flow.
+- [ ] Add disposable remote Runtime process fixtures.
 
 Project workspaces:
 
-- [ ] Define Projects with a base path and named commands.
-- [ ] Start, stop, and restart project commands with supervised process groups.
-- [ ] Capture complete stdout/stderr and exit status per command.
-- [ ] Keep Project execution separate from Snippet records used as command templates.
-- [ ] Add project persistence, migrations, and backup coverage.
+- [x] Define Projects with a base path, named commands, and optional command working directories.
+- [x] Add/edit/delete Projects and commands with the established a/e/d and Enter semantics.
+- [x] Start, stop, and restart project commands with supervised process groups; start/stop all commands.
+- [x] Capture complete stdout/stderr in per-run private logs and show a bounded scrolling output tail and exit status.
+- [x] Clean up owned process groups on normal app exit; escalate stalled stops after two seconds.
+- [x] Keep Project execution separate from Snippet records used as command templates.
+- [x] Add project persistence, additive version-1 compatibility, atomic writes, backup and save-failure coverage.
+- [x] Detect externally running commands using current-user identity, working directory, and command/descendant evidence.
+- [x] Separate current running status from the last managed result and inspect before starting to avoid recognized duplicates.
+- [x] Confirm external stop/restart, revalidate process identity, and preserve external commands on application exit.
+
+Project limits: local foreground commands only, inherited environment, no interactive PTY, dependency ordering, or persisted run history. Raw logs are retained without rotation. Recovering groups after LazyTerm itself is killed remains in beta hardening; completing this slice does not declare the v0.5.0 release accepted.
 
 Beta hardening:
 

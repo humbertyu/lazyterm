@@ -26,6 +26,8 @@ const DISABLED: Color = Color::Rgb(76, 91, 82);
 fn runtime_origin_color(origin: crate::runtime::RuntimeOrigin) -> Color {
     use crate::runtime::RuntimeOrigin;
     match origin {
+        RuntimeOrigin::Project => GREEN,
+        RuntimeOrigin::ExternalProject => Color::Rgb(103, 211, 211),
         RuntimeOrigin::Agent => Color::Rgb(239, 192, 101),
         RuntimeOrigin::CommandLine => Color::Rgb(103, 211, 211),
         RuntimeOrigin::Desktop => Color::Rgb(160, 171, 190),
@@ -38,15 +40,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Block::default().style(Style::default().bg(BG)),
         frame.area(),
     );
-    let page = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
+    let page = page_layout().split(frame.area());
 
     render_header(frame, page[0], app);
     render_navigation(frame, page[1], app);
@@ -56,8 +50,24 @@ pub fn render(frame: &mut Frame, app: &App) {
         NavSection::Tunnels => render_tunnels(frame, page[2], app),
         NavSection::Snippets => render_snippets(frame, page[2], app),
         NavSection::Runtime => render_runtime(frame, page[2], app),
+        NavSection::Projects => render_projects(frame, page[2], app),
     }
     render_footer(frame, page[3], app);
+    render_dialogs(frame, app);
+}
+
+fn page_layout() -> Layout {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+}
+
+fn render_dialogs(frame: &mut Frame, app: &App) {
     if app.searching {
         render_search(frame, app);
     }
@@ -114,6 +124,431 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if let Some(dialog) = &app.file_dialog {
         render_file_dialog(frame, dialog);
+    }
+    render_workspace_dialog(frame, app);
+}
+
+fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
+    use crate::projects::TaskStatus;
+    if !app.project_service.active(key) {
+        let external = app.external_project_runs(key);
+        if let Some(run) = external.first() {
+            return (
+                format!(
+                    "{}{}",
+                    run.label(),
+                    if external.len() > 1 {
+                        format!(" / {} instances", external.len())
+                    } else {
+                        String::new()
+                    }
+                ),
+                GREEN,
+            );
+        }
+        if app.workspace.monitor.matches(&app.metadata.projects)
+            && app.workspace.monitor.error.is_some()
+        {
+            return ("unknown / inspection failed".into(), Color::Yellow);
+        }
+        if !app.workspace.monitor.matches(&app.metadata.projects) {
+            return ("checking...".into(), MUTED);
+        }
+        return (
+            if app.project_service.tasks.contains_key(&key) {
+                "stopped"
+            } else {
+                "not started"
+            }
+            .into(),
+            MUTED,
+        );
+    }
+    app.project_service.tasks.get(&key).map_or_else(
+        || ("not started".into(), MUTED),
+        |task| {
+            let color = match task.status {
+                TaskStatus::Running => GREEN,
+                TaskStatus::Stopping => Color::Yellow,
+                TaskStatus::Exited(0) | TaskStatus::Stopped => MUTED,
+                TaskStatus::Exited(_) | TaskStatus::Failed(_) => Color::Red,
+            };
+            (task.status.label(), color)
+        },
+    )
+}
+
+fn project_last_result(app: &App, key: crate::projects::TaskKey) -> Option<String> {
+    app.project_service
+        .tasks
+        .get(&key)
+        .filter(|task| !task.active())
+        .map(|task| task.status.label())
+}
+
+fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(project) = app.selected_project() else {
+        frame.render_widget(
+            Paragraph::new("No projects.")
+                .style(Style::default().fg(MUTED))
+                .block(panel(" PROJECTS ")),
+            area,
+        );
+        return;
+    };
+    if app.workspace.output_open {
+        let Some(command) = app.selected_project_command() else {
+            return;
+        };
+        let key = (project.id, command.id);
+        let (status, color) = project_status(app, key);
+        let header_height = if area.height < 12 { 2 } else { 4 };
+        let sections =
+            Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).split(area);
+        let directory = crate::projects::working_directory(project, command).map_or_else(
+            |_| project.base_path.display().to_string(),
+            |path| path.display().to_string(),
+        );
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!(" {} / {}   ", project.name, command.name),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(status, Style::default().fg(color))),
+                Line::from(Span::styled(
+                    format!(" {directory}"),
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    project_last_result(app, key)
+                        .map_or_else(String::new, |result| format!(" Last managed run: {result}")),
+                    Style::default().fg(MUTED),
+                )),
+            ]),
+            sections[0],
+        );
+        let task = app.project_service.tasks.get(&key);
+        let external = !app.external_project_runs(key).is_empty();
+        let block = panel(if external {
+            " OUTPUT / LAST MANAGED RUN "
+        } else if app.workspace.output_scroll.is_some() {
+            " OUTPUT / SCROLLED "
+        } else {
+            " OUTPUT / LIVE "
+        });
+        let inner = block.inner(sections[1]);
+        frame.render_widget(block, sections[1]);
+        let text = task.map_or(
+            if external {
+                "No captured output for the external process."
+            } else {
+                "No output."
+            },
+            |task| task.output.as_str(),
+        );
+        let paragraph = Paragraph::new(text)
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: false });
+        let end = paragraph
+            .line_count(inner.width)
+            .saturating_sub(usize::from(inner.height));
+        let scroll = app.workspace.output_scroll.unwrap_or(end).min(end);
+        frame.render_widget(
+            paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
+        return;
+    }
+
+    let wide = area.width >= 75;
+    let columns = Layout::horizontal([
+        Constraint::Percentage(if wide { 40 } else { 100 }),
+        Constraint::Percentage(if wide { 60 } else { 0 }),
+    ])
+    .split(area);
+    let title = if app.workspace.project_open {
+        format!(" PROJECT / {} ", project.name)
+    } else {
+        " PROJECTS ".into()
+    };
+    let mut state = ListState::default();
+    let rows: Vec<ListItem> = if app.workspace.project_open {
+        state.select(Some(app.workspace.selected_command));
+        project
+            .commands
+            .iter()
+            .map(|command| {
+                let (status, color) = project_status(app, (project.id, command.id));
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        command.name.as_str(),
+                        Style::default().fg(TEXT),
+                    )),
+                    Line::from(Span::styled(
+                        format!("  {status}"),
+                        Style::default().fg(color),
+                    )),
+                ];
+                if let Some(result) = project_last_result(app, (project.id, command.id)) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  last run: {result}"),
+                        Style::default().fg(MUTED),
+                    )));
+                }
+                if !wide {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", command.command),
+                        Style::default().fg(MUTED),
+                    )));
+                }
+                ListItem::new(lines)
+            })
+            .collect()
+    } else {
+        state.select(Some(app.workspace.selected_project));
+        app.metadata
+            .projects
+            .iter()
+            .map(|project| {
+                let running = project
+                    .commands
+                    .iter()
+                    .filter(|command| app.project_is_running((project.id, command.id)))
+                    .count();
+                ListItem::new(vec![
+                    Line::from(Span::styled(
+                        project.name.as_str(),
+                        Style::default().fg(TEXT),
+                    )),
+                    Line::from(Span::styled(
+                        format!("  {}", project.base_path.display()),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(Span::styled(
+                        format!("  {} commands / {running} active", project.commands.len()),
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+            })
+            .collect()
+    };
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No commands.")
+                .style(Style::default().fg(MUTED))
+                .block(panel(&title)),
+            columns[0],
+        );
+    } else {
+        frame.render_stateful_widget(
+            List::new(rows)
+                .block(panel(&title))
+                .highlight_symbol("> ")
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(47, 78, 61))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            columns[0],
+            &mut state,
+        );
+    }
+    if !wide {
+        return;
+    }
+    let mut lines = vec![
+        detail_line("Project", &project.name),
+        detail_line("Base directory", &project.base_path.display().to_string()),
+    ];
+    if app.workspace.project_open
+        && let Some(command) = app.selected_project_command()
+    {
+        let key = (project.id, command.id);
+        lines.extend([
+            detail_line("Command name", &command.name),
+            detail_line("Command", &command.command),
+            detail_line(
+                "Working directory",
+                &command.working_directory.as_ref().map_or_else(
+                    || "(project base)".into(),
+                    |path| path.display().to_string(),
+                ),
+            ),
+            detail_line("Status", &project_status(app, key).0),
+        ]);
+        if let Some(result) = project_last_result(app, key) {
+            lines.push(detail_line("Last managed run", &result));
+        }
+        for run in app.external_project_runs(key) {
+            lines.extend([
+                detail_line("Ownership", "External"),
+                detail_line("External PID", &run.root.pid.to_string()),
+                detail_line("External command", &run.root.command),
+                detail_line("External directory", &run.directory.display().to_string()),
+                detail_line(
+                    "Ports",
+                    &run.ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ]);
+        }
+        if let Some(error) = &app.workspace.monitor.error {
+            lines.push(detail_line("Inspection", error));
+        }
+        if let Some(task) = app.project_service.tasks.get(&key) {
+            lines.extend([
+                detail_line("Process group", &task.owner.process_group.to_string()),
+                detail_line("Executed command", &task.command),
+                detail_line("Executed directory", &task.directory.display().to_string()),
+                detail_line("Stdout log", &task.stdout_log.display().to_string()),
+                detail_line("Stderr log", &task.stderr_log.display().to_string()),
+            ]);
+        }
+    } else {
+        lines.push(detail_line("Commands", &project.commands.len().to_string()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel(" DETAILS "))
+            .wrap(Wrap { trim: false }),
+        columns[1],
+    );
+}
+
+pub(crate) fn project_output_end(app: &App) -> usize {
+    let page = page_layout().split(Rect::new(0, 0, app.viewport_width, app.viewport_height));
+    let header_height = if page[2].height < 12 { 2 } else { 4 };
+    let sections =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).split(page[2]);
+    let inner = panel(" OUTPUT ").inner(sections[1]);
+    app.selected_project_key()
+        .and_then(|key| app.project_service.tasks.get(&key))
+        .map_or(0, |task| {
+            Paragraph::new(task.output.as_str())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+                .saturating_sub(usize::from(inner.height))
+        })
+}
+
+fn render_workspace_dialog(frame: &mut Frame, app: &App) {
+    if let Some(confirmation) = &app.workspace.confirmation {
+        let area = centered_rect(86, 18, frame.area());
+        frame.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::from(
+                if confirmation.action == crate::project_app::ProjectAction::Restart {
+                    "Stop external commands and restart under LazyTerm?"
+                } else {
+                    "Stop external commands and their child processes?"
+                },
+            ),
+            Line::from(""),
+        ];
+        for run in &confirmation.runs {
+            lines.push(Line::from(format!(
+                "{} / {} / PID {}",
+                run.project_name, run.command_name, run.root.pid
+            )));
+            lines.push(Line::from(run.root.command.clone()));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("y / Enter confirm    n / Esc cancel"));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel(" EXTERNAL PROCESS "))
+                .style(Style::default().fg(TEXT))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    } else if let Some(form) = &app.workspace.form {
+        let area = centered_rect(86, (form.fields.len() * 3 + 5) as u16, frame.area());
+        frame.render_widget(Clear, area);
+        let title = format!(
+            " {} {} ",
+            if form.editing_id.is_some() {
+                "EDIT"
+            } else {
+                "ADD"
+            },
+            if form.project_id.is_some() {
+                "COMMAND"
+            } else {
+                "PROJECT"
+            }
+        );
+        let block = panel(&title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let compact = area.height < (form.fields.len() * 3 + 4) as u16;
+        let mut fields = vec![Constraint::Length(if compact { 2 } else { 3 }); form.fields.len()];
+        fields.push(Constraint::Min(1));
+        let rows = Layout::vertical(fields).split(inner);
+        for (index, value) in form.fields.iter().enumerate() {
+            let active = index == form.selected;
+            let inner =
+                if compact {
+                    let fields = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
+                        .split(rows[index]);
+                    frame.render_widget(
+                        Paragraph::new(form.labels()[index])
+                            .style(Style::default().fg(if active { GREEN } else { MUTED })),
+                        fields[0],
+                    );
+                    fields[1]
+                } else {
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(form.labels()[index])
+                        .border_style(Style::default().fg(if active { GREEN } else { BORDER }));
+                    let inner = block.inner(rows[index]);
+                    frame.render_widget(block, rows[index]);
+                    inner
+                };
+            let value = format!("{value}{}", if active { "_" } else { "" });
+            let width = Line::from(value.as_str()).width();
+            frame.render_widget(
+                Paragraph::new(value)
+                    .style(Style::default().fg(TEXT))
+                    .scroll((
+                        0,
+                        width
+                            .saturating_sub(inner.width as usize)
+                            .min(u16::MAX as usize) as u16,
+                    )),
+                inner,
+            );
+        }
+        if let Some(error) = &form.error {
+            frame.render_widget(
+                Paragraph::new(error.as_str())
+                    .style(Style::default().fg(Color::Red))
+                    .wrap(Wrap { trim: false }),
+                rows[form.fields.len()],
+            );
+        }
+    } else if let Some(target) = &app.workspace.delete {
+        let message = match target {
+            crate::project_app::WorkspaceDelete::Project { name, .. } => {
+                format!("Delete project {name} and its command definitions?")
+            }
+            crate::project_app::WorkspaceDelete::Command { name, .. } => {
+                format!("Delete command {name}?")
+            }
+        };
+        let area = centered_rect(72, 7, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(format!("{message}\n\ny / Enter confirm    n / Esc cancel"))
+                .block(panel(" DELETE "))
+                .style(Style::default().fg(TEXT))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 }
 
@@ -398,7 +833,18 @@ fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(Span::styled(
                     format!(
                         "         {:<18} pid {:<8} {}",
-                        entry.process, pid, entry.user
+                        entry.process,
+                        pid,
+                        entry.project.as_ref().map_or_else(
+                            || entry.external_project.as_ref().map_or_else(
+                                || entry.user.clone(),
+                                |run| format!(
+                                    "{} / {} (external)",
+                                    run.project_name, run.command_name
+                                )
+                            ),
+                            |owner| format!("{} / {}", owner.project_name, owner.command_name)
+                        )
                     ),
                     row_style.fg(runtime_origin_color(entry.origin)),
                 )),
@@ -425,7 +871,7 @@ fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
             ))]
         },
         |entry| {
-            vec![
+            let mut lines = vec![
                 detail_line("Protocol", &entry.protocol),
                 detail_line("Address", &entry.address),
                 detail_line("Port", &entry.port.to_string()),
@@ -458,7 +904,17 @@ fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 detail_line("Command", &entry.command),
                 detail_line("Evidence", &entry.origin_reason),
-            ]
+            ];
+            if let Some(owner) = &entry.project {
+                lines.push(detail_line("Project", &owner.project_name));
+                lines.push(detail_line("Project command", &owner.command_name));
+            }
+            if let Some(run) = &entry.external_project {
+                lines.push(detail_line("Project", &run.project_name));
+                lines.push(detail_line("Project command", &run.command_name));
+                lines.push(detail_line("Ownership", "External"));
+            }
+            lines
         },
     );
     frame.render_widget(
@@ -515,9 +971,25 @@ fn render_runtime_kill_confirmation(frame: &mut Frame, entry: &crate::runtime::R
     frame.render_widget(block, area);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!(
-                "Send TERM to {} (PID {pid}) listening on {}:{}?",
-                entry.process, entry.address, entry.port
+            Line::from(entry.project.as_ref().map_or_else(
+                || {
+                    if let Some(run) = &entry.external_project {
+                        return format!(
+                            "Stop external {} / {} (PID {}) and its child processes?",
+                            run.project_name, run.command_name, run.root.pid
+                        );
+                    }
+                    format!(
+                        "Send TERM to {} (PID {pid}) listening on {}:{}?",
+                        entry.process, entry.address, entry.port
+                    )
+                },
+                |owner| {
+                    format!(
+                        "Stop {} / {} and all its child processes?",
+                        owner.project_name, owner.command_name
+                    )
+                },
             )),
             Line::from(Span::styled(
                 "y / Enter confirm    n / Esc cancel",
@@ -1236,7 +1708,7 @@ fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
         Tabs::new(titles)
             .select(selected)
             .padding("", "")
-            .divider(" | ")
+            .divider(if area.width < 35 { " " } else { " | " })
             .style(Style::default().fg(MUTED))
             .highlight_style(
                 Style::default()
@@ -1553,7 +2025,7 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
 
 fn detail_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
+        Span::styled(format!("{label:<11}  "), Style::default().fg(MUTED)),
         Span::styled(value.to_string(), Style::default().fg(TEXT)),
     ])
 }
@@ -2019,11 +2491,23 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let navigation = if area.width < 75 {
-        "1-5 tabs  Tab next  Shift+Tab prev  ` last"
+        "1-6 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
-        "1-5 / F1-F5 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
+        "1-6 / F1-F6 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
     };
-    let hint = if app.snippet_execution_view {
+    let hint = if app.workspace.form.is_some() {
+        "Tab / ↑↓ field  Enter next/save  Esc cancel"
+    } else if app.workspace.delete.is_some() || app.workspace.confirmation.is_some() {
+        "y / Enter confirm  n / Esc cancel"
+    } else if app.section == NavSection::Projects {
+        if app.workspace.output_open {
+            "↑↓ scroll  Home/End  [ ] command  s start  x stop  r restart  Esc back  q quit"
+        } else if app.workspace.project_open {
+            "↑↓ select  Enter output  a add  e edit  d delete  s start  x stop  r restart  A/X all  Esc back"
+        } else {
+            "↑↓ select  Enter open  a add  e edit  d delete  A start all  X stop all  q quit"
+        }
+    } else if app.snippet_execution_view {
         "↑↓ scroll output  [ ] select Host  c cancel  C clear  Esc back  q quit"
     } else if app.snippet_host_picker_open {
         "↑↓ select group/Host  Enter run one  b run group  Backspace back  Esc cancel"
@@ -2112,7 +2596,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else if app.runtime_kill_confirmation.is_some() {
             "y / Enter confirm  n / Esc cancel"
         } else {
-            "Left/Right category  ↑↓ select  s Host  l Local  r refresh  k terminate  q quit"
+            "Left/Right category  ↑↓ select  s Host  l Local  r refresh  k terminate  o project  q quit"
         }
     } else {
         "q quit"
@@ -2130,10 +2614,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     || app.snippet_delete_confirmation.is_some()
                     || app.runtime_host_picker_open
                     || app.runtime_kill_confirmation.is_some()
+                    || app.workspace.form.is_some()
+                    || app.workspace.delete.is_some()
+                    || app.workspace.confirmation.is_some()
                 {
                     ""
                 } else if app.searching {
-                    "F1-F5 / Ctrl+Left/Right tabs"
+                    "F1-F6 / Ctrl+Left/Right tabs"
                 } else {
                     navigation
                 },
@@ -2516,6 +3003,113 @@ mod tests {
     }
 
     #[test]
+    fn populated_projects_forms_and_output_render_and_scroll_at_supported_sizes() {
+        use crate::projects::tests::{Fixture, until};
+        use crossterm::event::KeyCode;
+        let mut fixture = Fixture::new("render");
+        fixture.project.name = "Demo".into();
+        let mut command = fixture.command(
+            "i=0; while [ \"$i\" -lt 200 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i + 1)); done",
+        );
+        command.name = "Server".into();
+        fixture.project.commands.push(command.clone());
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.metadata_error = true;
+        app.metadata.projects.push(fixture.project.clone());
+        app.project_service = fixture.service();
+        app.project_service
+            .start(&fixture.project, &command)
+            .unwrap();
+        until(&mut app.project_service, |s| {
+            !s.active((fixture.project.id, command.id))
+        });
+        for (width, height) in [(120, 40), (80, 24), (54, 18), (42, 18), (32, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            app.section = NavSection::Projects;
+            app.viewport_width = width;
+            app.viewport_height = height;
+            app.workspace.project_open = false;
+            app.workspace.output_open = false;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("Demo"));
+            app.handle_projects_key(KeyCode::Enter);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("Server"));
+            assert!(format!("{}", terminal.backend()).contains("exit 0"));
+            app.handle_projects_key(KeyCode::Enter);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(
+                format!("{}", terminal.backend()).contains("line-199"),
+                "{width}x{height} must follow live tail"
+            );
+            app.handle_projects_key(KeyCode::Home);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("line-000"));
+            assert!(!format!("{}", terminal.backend()).contains("line-199"));
+            app.handle_projects_key(KeyCode::End);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("line-199"));
+            app.handle_projects_key(KeyCode::Char('e'));
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("EDIT COMMAND"));
+            assert!(format!("{}", terminal.backend()).contains("Name"));
+            assert!(format!("{}", terminal.backend()).contains("Working directory"));
+            app.handle_projects_key(KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn runtime_project_source_shows_project_and_command_and_group_stop_confirmation() {
+        use crate::runtime::{RuntimeEntry, RuntimeOrigin, RuntimeProcessKind};
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Runtime;
+        app.runtime_entries.push(RuntimeEntry {
+            protocol: "TCP".into(),
+            address: "127.0.0.1".into(),
+            port: 3000,
+            pid: Some(42),
+            process: "node".into(),
+            user: "501".into(),
+            command: "node server.js".into(),
+            working_directory: Some("/tmp/demo".into()),
+            owned_by_current_user: true,
+            kind: RuntimeProcessKind::Application,
+            origin: RuntimeOrigin::Project,
+            origin_reason: "Managed command: Demo / Dev server".into(),
+            project: Some(crate::projects::ProjectOwner {
+                key: (1, 2),
+                run_id: 3,
+                process_group: 42,
+                project_name: "Demo".into(),
+                command_name: "Dev server".into(),
+            }),
+            external_project: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("PROJECT"));
+        assert!(text.contains("Demo / Dev server"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "P" && cell.fg == GREEN)
+        );
+        app.runtime_kill_confirmation = app.selected_runtime_entry().cloned();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(format!("{}", terminal.backend()).contains("all its child processes"));
+    }
+
+    #[test]
     fn runtime_categories_render_selection_and_filtered_process_details() {
         use crate::runtime::{RuntimeEntry, RuntimeFilter, RuntimeProcessKind};
         for (width, height) in [(120, 30), (80, 24)] {
@@ -2538,6 +3132,8 @@ mod tests {
                 kind: RuntimeProcessKind::Application,
                 origin: crate::runtime::RuntimeOrigin::CommandLine,
                 origin_reason: "Shell ancestor".into(),
+                project: None,
+                external_project: None,
             });
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let text = format!("{}", terminal.backend());

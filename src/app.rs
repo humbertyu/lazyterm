@@ -167,15 +167,17 @@ pub enum NavSection {
     Tunnels,
     Snippets,
     Runtime,
+    Projects,
 }
 
 impl NavSection {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Hosts,
         Self::Files,
         Self::Tunnels,
         Self::Snippets,
         Self::Runtime,
+        Self::Projects,
     ];
 
     pub fn title(self) -> &'static str {
@@ -185,17 +187,21 @@ impl NavSection {
             Self::Tunnels => "Tunnels",
             Self::Snippets => "Snippets",
             Self::Runtime => "Runtime",
+            Self::Projects => "Projects",
         }
     }
 }
 
 pub struct App {
+    pub workspace: crate::project_app::WorkspaceState,
+    pub project_service: crate::projects::ProjectService,
     pub section: NavSection,
     pub previous_section: NavSection,
     pub hosts: HostCatalog,
     pub selected_host: usize,
     pub selected_browse_item: usize,
     pub viewport_width: u16,
+    pub viewport_height: u16,
     pub search_query: String,
     pub searching: bool,
     pub should_quit: bool,
@@ -233,6 +239,8 @@ pub struct App {
     pub tunnel_statuses: std::collections::HashMap<u64, TunnelStatus>,
     pub metadata: Metadata,
     pub metadata_error: bool,
+    #[cfg(test)]
+    pub(crate) metadata_save_path: Option<PathBuf>,
     pub active_group: Option<HostGroup>,
     pub selected_group: usize,
     pub tags_dialog: Option<(String, String)>,
@@ -451,12 +459,19 @@ impl App {
         let (tunnel_sender, tunnel_receiver) = std::sync::mpsc::channel();
         let (runtime_sender, runtime_receiver) = std::sync::mpsc::channel();
         Self {
+            workspace: crate::project_app::WorkspaceState::default(),
+            project_service: crate::projects::ProjectService::new(
+                Metadata::data_dir()
+                    .ok()
+                    .map(|path| path.join("project-logs")),
+            ),
             section: NavSection::Hosts,
             previous_section: NavSection::Hosts,
             hosts,
             selected_host: 0,
             selected_browse_item: 0,
             viewport_width: 80,
+            viewport_height: 24,
             search_query: String::new(),
             searching: false,
             should_quit: false,
@@ -498,6 +513,8 @@ impl App {
                 .collect(),
             metadata,
             metadata_error,
+            #[cfg(test)]
+            metadata_save_path: None,
             active_group: None,
             selected_group: 0,
             tags_dialog: None,
@@ -1645,9 +1662,25 @@ impl App {
     pub fn poll_runtime(&mut self) {
         while let Ok(event) = self.runtime_receiver.try_recv() {
             match event {
-                RuntimeEvent::Listed { target, entries } => {
+                RuntimeEvent::Listed {
+                    target,
+                    mut entries,
+                } => {
                     if target == self.runtime_target {
+                        let owners = self.project_service.owners();
+                        for entry in &mut entries {
+                            if entry.project.as_ref().is_some_and(|owner| {
+                                target != RuntimeTarget::Local || !owners.contains(owner)
+                            }) {
+                                entry.project = None;
+                                entry.pid = None;
+                                entry.origin = runtime::RuntimeOrigin::Unknown;
+                                entry.origin_reason =
+                                    "Project command has ended; refresh inspection.".into();
+                            }
+                        }
                         self.runtime_entries = entries;
+                        self.update_external_runtime_links();
                         self.selected_runtime = self
                             .selected_runtime
                             .min(self.visible_runtime_entries().len().saturating_sub(1));
@@ -1680,7 +1713,11 @@ impl App {
     pub fn refresh_runtime(&mut self) {
         self.runtime_loading = true;
         self.runtime_error = None;
-        runtime::inspect_async(self.runtime_sender.clone(), self.runtime_target.clone());
+        runtime::inspect_async(
+            self.runtime_sender.clone(),
+            self.runtime_target.clone(),
+            self.project_service.owners(),
+        );
     }
 
     pub fn visible_runtime_entries(&self) -> Vec<&RuntimeEntry> {
@@ -1767,6 +1804,36 @@ impl App {
                     let Some(entry) = self.runtime_kill_confirmation.take() else {
                         return;
                     };
+                    if let Some(owner) = entry.project {
+                        if self.runtime_target == RuntimeTarget::Local
+                            && self.project_service.owners().contains(&owner)
+                        {
+                            self.notice = Some(match self.project_service.stop(owner.key) {
+                                Ok(()) => format!(
+                                    "Stopping {} / {}.",
+                                    owner.project_name, owner.command_name
+                                ),
+                                Err(error) => format!("Could not stop command: {error}"),
+                            });
+                        } else {
+                            self.notice =
+                                Some("Project run has changed; refresh before stopping.".into());
+                        }
+                        self.refresh_runtime();
+                        return;
+                    }
+                    if let Some(run) = entry.external_project {
+                        if self.runtime_target == RuntimeTarget::Local {
+                            self.start_confirmed_external_action(
+                                crate::project_app::ExternalConfirmation {
+                                    action: crate::project_app::ProjectAction::Stop,
+                                    keys: vec![run.key],
+                                    runs: vec![run],
+                                },
+                            );
+                        }
+                        return;
+                    }
                     let Some(pid) = entry.pid else {
                         self.notice = Some("The selected entry has no visible PID.".to_string());
                         return;
@@ -1813,6 +1880,7 @@ impl App {
                 self.selected_runtime = 0;
             }
             KeyCode::Char('r') => self.refresh_runtime(),
+            KeyCode::Char('o') => self.open_project_from_runtime(),
             KeyCode::Char('l') => {
                 self.runtime_target = RuntimeTarget::Local;
                 self.selected_runtime = 0;
@@ -2121,6 +2189,12 @@ impl App {
         viewport_width: u16,
         viewport_height: u16,
     ) -> InputAction {
+        if self.workspace.form.is_some()
+            || self.workspace.delete.is_some()
+            || self.workspace.confirmation.is_some()
+        {
+            return InputAction::None;
+        }
         if self.section == NavSection::Snippets {
             if row < 6 || row >= viewport_height.saturating_sub(3) {
                 return InputAction::None;
@@ -2610,13 +2684,25 @@ impl App {
             || self.snippet_delete_confirmation.is_some()
             || self.runtime_host_picker_open
             || self.runtime_kill_confirmation.is_some()
+            || self.workspace.form.is_some()
+            || self.workspace.delete.is_some()
+            || self.workspace.confirmation.is_some()
             || self.tags_dialog.is_some()
             || self.connection_dialog.is_some()
             || self.file_dialog.is_some();
         if !modal {
             match (key.code, key.modifiers) {
-                (KeyCode::F(number @ 1..=5), KeyModifiers::NONE) => {
+                (KeyCode::F(number @ 1..=6), KeyModifiers::NONE) => {
                     self.switch_section(NavSection::ALL[usize::from(number - 1)]);
+                    return InputAction::None;
+                }
+                (KeyCode::Char(number @ '1'..='6'), KeyModifiers::NONE)
+                    if !self.searching
+                        && !self.file_filtering
+                        && !self.host_picker_open
+                        && !self.snippet_host_picker_open =>
+                {
+                    self.switch_section(NavSection::ALL[(number as u8 - b'1') as usize]);
                     return InputAction::None;
                 }
                 (KeyCode::Right, KeyModifiers::CONTROL) => {
@@ -2637,7 +2723,12 @@ impl App {
         {
             return InputAction::None;
         }
-        if self.searching && !modal {
+        if self.workspace.form.is_some()
+            || self.workspace.delete.is_some()
+            || self.workspace.confirmation.is_some()
+        {
+            self.handle_workspace_dialog(key.code);
+        } else if self.searching && !modal {
             self.handle_search_key(key.code);
         } else if self.file_filtering && !modal {
             self.handle_file_filter_key(key.code);
@@ -2666,6 +2757,8 @@ impl App {
             return self.handle_snippets_key(key.code);
         } else if self.section == NavSection::Runtime {
             self.handle_runtime_key(key.code);
+        } else if self.section == NavSection::Projects {
+            self.handle_projects_key(key.code);
         } else {
             self.handle_key(key.code);
         }
@@ -2681,14 +2774,17 @@ impl App {
         }
     }
 
-    fn switch_section(&mut self, section: NavSection) {
+    pub(crate) fn switch_section(&mut self, section: NavSection) {
         if section != self.section {
             self.previous_section = self.section;
             self.section = section;
             self.searching = false;
             self.file_filtering = false;
-            if section == NavSection::Runtime && self.runtime_entries.is_empty() {
+            if section == NavSection::Runtime {
                 self.refresh_runtime();
+            }
+            if section == NavSection::Projects {
+                self.refresh_projects();
             }
         }
     }
@@ -2703,6 +2799,13 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.workspace.form.is_some()
+            || self.workspace.delete.is_some()
+            || self.workspace.confirmation.is_some()
+        {
+            self.handle_workspace_dialog(key);
+            return;
+        }
         if self.tags_dialog.is_some() {
             self.handle_tags_key(key);
             return;
@@ -2725,6 +2828,10 @@ impl App {
         }
         if self.section == NavSection::Runtime {
             self.handle_runtime_key(key);
+            return;
+        }
+        if self.section == NavSection::Projects {
+            self.handle_projects_key(key);
             return;
         }
         if self.section == NavSection::Tunnels {
@@ -2868,6 +2975,7 @@ impl App {
             KeyCode::Char('3') | KeyCode::Char('t') => self.switch_section(NavSection::Tunnels),
             KeyCode::Char('4') | KeyCode::Char('s') => self.switch_section(NavSection::Snippets),
             KeyCode::Char('5') | KeyCode::Char('p') => self.switch_section(NavSection::Runtime),
+            KeyCode::Char('6') => self.switch_section(NavSection::Projects),
             _ => {}
         }
     }
@@ -3986,7 +4094,7 @@ impl App {
         }
     }
 
-    fn next_section(&mut self) {
+    pub(crate) fn next_section(&mut self) {
         let index = NavSection::ALL
             .iter()
             .position(|section| *section == self.section)
@@ -3994,7 +4102,7 @@ impl App {
         self.switch_section(NavSection::ALL[(index + 1) % NavSection::ALL.len()]);
     }
 
-    fn previous_section(&mut self) {
+    pub(crate) fn previous_section(&mut self) {
         let index = NavSection::ALL
             .iter()
             .position(|section| *section == self.section)
@@ -4069,16 +4177,27 @@ impl App {
             .min(self.visible_groups().len().saturating_sub(1));
     }
 
-    fn save_metadata(&mut self) {
+    pub(crate) fn save_metadata(&mut self) -> bool {
         if self.metadata_error {
             self.notice = Some(
                 "Metadata unavailable; changes cannot be saved. Reload after fixing hosts.json."
                     .into(),
             );
+            false
         } else {
             self.metadata.reconcile(&self.hosts);
-            if let Err(error) = self.metadata.save() {
+            #[cfg(test)]
+            let result = self
+                .metadata_save_path
+                .as_ref()
+                .map_or_else(|| self.metadata.save(), |path| self.metadata.save_to(path));
+            #[cfg(not(test))]
+            let result = self.metadata.save();
+            if let Err(error) = result {
                 self.notice = Some(format!("Could not save host metadata: {error}"));
+                false
+            } else {
+                true
             }
         }
     }
@@ -4143,6 +4262,315 @@ mod tests {
     }
 
     #[test]
+    fn workspace_forms_navigation_editing_and_delete_share_existing_semantics() {
+        let fixture = crate::projects::tests::Fixture::new("forms");
+        let mut app = app_fixture();
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        press(&mut app, KeyCode::Char('6'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(app.workspace.form.is_some());
+        press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Projects);
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec!["Demo".into(), fixture.root.display().to_string()];
+        form.selected = 1;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.selected_project().unwrap().name, "Demo");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.workspace.project_open);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec!["Check".into(), "printf check".into(), String::new()];
+        form.selected = 2;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.workspace.output_open);
+        assert!(
+            app.project_service.tasks.is_empty(),
+            "Enter must never launch a command"
+        );
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(
+            app.workspace.form.as_ref().unwrap().fields[1],
+            "printf check"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(app.selected_project().unwrap().commands.len(), 1);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.selected_project().unwrap().commands.is_empty());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.metadata.projects.is_empty());
+    }
+
+    #[test]
+    fn workspace_failed_save_keeps_form_and_rolls_back_changes_and_deletion() {
+        let fixture = crate::projects::tests::Fixture::new("save-failure");
+        let mut app = app_fixture();
+        app.section = NavSection::Projects;
+        app.metadata_error = false;
+        let blocked = fixture.root.join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        app.metadata_save_path = Some(blocked.join("hosts.json"));
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec!["Demo".into(), fixture.root.display().to_string()];
+        form.selected = 1;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.metadata.projects.is_empty());
+        assert!(app.workspace.form.as_ref().unwrap().error.is_some());
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.workspace.form.is_none());
+        assert_eq!(app.metadata.projects.len(), 1);
+        app.metadata_save_path = Some(blocked.join("hosts.json"));
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.projects.len(), 1);
+        assert!(app.notice.as_ref().unwrap().contains("Could not save"));
+    }
+
+    fn wait_for_workspace(app: &mut App, condition: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            app.poll_projects();
+            app.poll_runtime();
+            if condition(app) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Workspace timed out: {:?}; inspection: {:?}",
+                app.notice,
+                app.workspace.monitor.error
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn external_project_running_overrides_last_failure_blocks_duplicates_and_restarts_only_after_confirmation()
+     {
+        use crate::project_monitor::tests::ExternalFixture;
+        use crate::projects::tests::until;
+        let external = ExternalFixture::new();
+        let key = (external.project.id, external.command.id);
+        let mut app = app_fixture();
+        app.project_service = external.fixture.service();
+        app.metadata.projects.push(external.project.clone());
+        let failed = crate::projects::ProjectCommand {
+            command: "printf 'previous failure\\n'; exit 1".into(),
+            ..external.command.clone()
+        };
+        app.project_service
+            .start(&external.project, &failed)
+            .unwrap();
+        until(&mut app.project_service, |s| !s.active(key));
+        let previous_run = app.project_service.tasks[&key].owner.run_id;
+        press(&mut app, KeyCode::F(6), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        wait_for_workspace(&mut app, |app| !app.external_project_runs(key).is_empty());
+        let (_, port) = external.fixture.ready().unwrap();
+        assert!(app.project_is_running(key));
+        assert!(app.external_project_runs(key)[0].ports.contains(&port));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("external running"));
+        assert!(text.contains("last run: exit 1"));
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        wait_for_workspace(&mut app, |app| {
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.contains("already running externally"))
+        });
+        assert_eq!(app.project_service.tasks[&key].owner.run_id, previous_run);
+        assert!(!app.project_service.active(key));
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        wait_for_workspace(&mut app, |app| !app.runtime_loading);
+        app.selected_runtime = app
+            .visible_runtime_entries()
+            .iter()
+            .position(|entry| entry.pid == Some(external.child.id()))
+            .expect("external listener visible");
+        assert_eq!(
+            app.selected_runtime_entry().unwrap().origin,
+            runtime::RuntimeOrigin::ExternalProject
+        );
+        assert_eq!(
+            app.selected_runtime_entry()
+                .unwrap()
+                .external_project
+                .as_ref()
+                .unwrap()
+                .key,
+            key
+        );
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(app.workspace.output_open);
+        assert_eq!(app.selected_project_key(), Some(key));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        assert!(format!("{}", terminal.backend()).contains("Last managed run: exit 1"));
+        assert!(format!("{}", terminal.backend()).contains("previous failure"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        wait_for_workspace(&mut app, |app| app.workspace.confirmation.is_some());
+        press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Projects);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        wait_for_workspace(&mut app, |app| app.workspace.confirmation.is_some());
+        assert_eq!(
+            app.workspace.confirmation.as_ref().unwrap().action,
+            crate::project_app::ProjectAction::Restart
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        wait_for_workspace(&mut app, |app| {
+            app.project_service.active(key)
+                && external
+                    .fixture
+                    .ready()
+                    .is_some_and(|(pid, _)| pid != external.child.id())
+        });
+        assert_ne!(app.project_service.tasks[&key].owner.run_id, previous_run);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        until(&mut app.project_service, |s| !s.active(key));
+    }
+
+    #[test]
+    fn workspace_listener_runtime_output_and_confirmed_stop_form_a_complete_flow() {
+        use crate::projects::tests::{Fixture, until};
+        let fixture = Fixture::new("runtime-flow");
+        let mut app = app_fixture();
+        app.project_service = fixture.service();
+        let command = fixture.listener_command(false);
+        let key = (fixture.project.id, command.id);
+        let mut project = fixture.project.clone();
+        project.commands.push(command);
+        app.metadata.projects.push(project);
+        press(&mut app, KeyCode::F(6), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fixture.ready().is_none() {
+            app.poll_projects();
+            assert!(
+                Instant::now() < deadline,
+                "Project start preflight timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (pid, port) = fixture.ready().unwrap();
+        assert!(app.project_service.active(key));
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(
+            app.workspace.form.is_none(),
+            "Live commands must not be edited"
+        );
+        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.runtime_loading {
+            app.project_service.poll();
+            app.poll_runtime();
+            assert!(Instant::now() < deadline, "Runtime inspection timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.runtime_error.is_none(), "{:?}", app.runtime_error);
+        app.selected_runtime = app
+            .visible_runtime_entries()
+            .iter()
+            .position(|entry| entry.pid == Some(pid) && entry.port == port)
+            .expect("fixture listener must be visible in Mine");
+        let entry = app.selected_runtime_entry().unwrap();
+        assert_eq!(entry.origin, runtime::RuntimeOrigin::Project);
+        assert_eq!(entry.project.as_ref().unwrap().key, key);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Projects);
+        assert!(app.workspace.output_open);
+        assert_eq!(app.selected_project_key(), Some(key));
+        // Return without refreshing so the action uses the displayed run identity.
+        app.section = NavSection::Runtime;
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(app.runtime_kill_confirmation.is_some());
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        until(&mut app.project_service, |s| !s.active(key));
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert_eq!(
+            app.project_service.tasks[&key].status,
+            crate::projects::TaskStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn stale_workspace_run_cannot_stop_a_replacement_and_remote_results_cannot_claim_it() {
+        use crate::projects::tests::Fixture;
+        let fixture = Fixture::new("stale");
+        let mut app = app_fixture();
+        app.project_service = fixture.service();
+        let command = fixture.command("sleep 30");
+        app.project_service
+            .start(&fixture.project, &command)
+            .unwrap();
+        let owner = app.project_service.owners().remove(0);
+        let mut stale = owner.clone();
+        stale.run_id += 1;
+        let entry = RuntimeEntry {
+            protocol: "TCP".into(),
+            address: "127.0.0.1".into(),
+            port: 3000,
+            pid: Some(owner.process_group),
+            process: "fixture".into(),
+            user: "0".into(),
+            command: "fixture".into(),
+            working_directory: None,
+            owned_by_current_user: true,
+            kind: runtime::RuntimeProcessKind::Application,
+            origin: runtime::RuntimeOrigin::Project,
+            origin_reason: String::new(),
+            project: Some(stale),
+            external_project: None,
+        };
+        app.section = NavSection::Runtime;
+        app.runtime_kill_confirmation = Some(entry.clone());
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.project_service.active(owner.key));
+        assert_eq!(
+            app.project_service.tasks[&owner.key].status,
+            crate::projects::TaskStatus::Running
+        );
+        app.runtime_target = RuntimeTarget::Host("fixture".into());
+        app.runtime_sender
+            .send(RuntimeEvent::Listed {
+                target: app.runtime_target.clone(),
+                entries: vec![RuntimeEntry {
+                    project: Some(owner),
+                    ..entry
+                }],
+            })
+            .unwrap();
+        app.poll_runtime();
+        assert!(app.runtime_entries[0].project.is_none());
+        assert!(app.runtime_entries[0].pid.is_none());
+        assert_ne!(
+            app.runtime_entries[0].origin,
+            runtime::RuntimeOrigin::Project
+        );
+    }
+
+    #[test]
     fn navigation_wraps_and_host_selection_moves() {
         let mut app = app_fixture();
         app.metadata.view = HostView::Hosts;
@@ -4166,7 +4594,7 @@ mod tests {
                 managed: false,
             },
         ];
-        app.section = NavSection::Runtime;
+        app.section = NavSection::Projects;
         app.handle_key(KeyCode::Tab);
         assert_eq!(app.section, NavSection::Hosts);
         app.handle_key(KeyCode::Down);
@@ -4203,6 +4631,8 @@ mod tests {
             kind: RuntimeProcessKind::Application,
             origin: crate::runtime::RuntimeOrigin::CommandLine,
             origin_reason: "Shell ancestor".into(),
+            project: None,
+            external_project: None,
         };
         let mut system = own.clone();
         system.pid = Some(456);
@@ -4361,7 +4791,7 @@ mod tests {
         let mut app = app_fixture();
         for section in NavSection::ALL {
             app.section = section;
-            for number in 1..=5 {
+            for number in 1..=6 {
                 assert_eq!(
                     press(&mut app, KeyCode::F(number), KeyModifiers::NONE),
                     InputAction::None
@@ -4377,11 +4807,11 @@ mod tests {
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(app.section, NavSection::Hosts);
             press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
-            assert_eq!(app.section, NavSection::Runtime);
+            assert_eq!(app.section, NavSection::Projects);
             press(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
             assert_eq!(app.section, NavSection::Hosts);
             press(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
-            assert_eq!(app.section, NavSection::Runtime);
+            assert_eq!(app.section, NavSection::Projects);
         }
     }
 

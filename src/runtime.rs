@@ -1,3 +1,4 @@
+use crate::projects::ProjectOwner;
 use std::{
     collections::{BTreeMap, HashMap},
     process::{Command, Stdio},
@@ -44,10 +45,14 @@ pub struct RuntimeEntry {
     pub kind: RuntimeProcessKind,
     pub origin: RuntimeOrigin,
     pub origin_reason: String,
+    pub project: Option<ProjectOwner>,
+    pub external_project: Option<crate::project_monitor::ExternalRun>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeOrigin {
+    Project,
+    ExternalProject,
     Agent,
     CommandLine,
     Desktop,
@@ -58,6 +63,8 @@ pub enum RuntimeOrigin {
 impl RuntimeOrigin {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Project => "PROJECT",
+            Self::ExternalProject => "PROJECT / EXT",
             Self::Agent => "AGENT",
             Self::CommandLine => "CLI",
             Self::Desktop => "DESKTOP",
@@ -68,6 +75,7 @@ impl RuntimeOrigin {
 
 struct ProcessObservation {
     parent: u32,
+    group: u32,
     tty: String,
     command: String,
 }
@@ -148,9 +156,13 @@ pub enum RuntimeEvent {
     },
 }
 
-pub fn inspect_async(sender: Sender<RuntimeEvent>, target: RuntimeTarget) {
+pub fn inspect_async(
+    sender: Sender<RuntimeEvent>,
+    target: RuntimeTarget,
+    owners: Vec<ProjectOwner>,
+) {
     std::thread::spawn(move || {
-        let result = inspect(&target);
+        let result = inspect(&target, &owners);
         let event = match result {
             Ok(entries) => RuntimeEvent::Listed { target, entries },
             Err(message) => RuntimeEvent::Failed { target, message },
@@ -178,7 +190,42 @@ pub fn terminate_async(
     });
 }
 
-fn inspect(target: &RuntimeTarget) -> Result<Vec<RuntimeEntry>, String> {
+fn inspect(target: &RuntimeTarget, owners: &[ProjectOwner]) -> Result<Vec<RuntimeEntry>, String> {
+    let mut entries = inspect_listeners(target)?;
+    enrich_process_details(target, &mut entries);
+    let observations = process_observations(target);
+    for entry in &mut entries {
+        entry.kind = classify_process(entry);
+        (entry.origin, entry.origin_reason) = classify_origin(entry.pid, &observations);
+        entry.project = project_owner(target, entry.pid, &observations, owners);
+        if let Some(owner) = &entry.project {
+            entry.origin = RuntimeOrigin::Project;
+            entry.origin_reason = format!(
+                "Managed command: {} / {}",
+                owner.project_name, owner.command_name
+            );
+            entry.kind = RuntimeProcessKind::Application;
+            entry.owned_by_current_user = true;
+        }
+    }
+    entries.sort_by_key(|entry| {
+        (
+            entry.kind.rank(),
+            match entry.origin {
+                RuntimeOrigin::Project | RuntimeOrigin::ExternalProject => 0,
+                RuntimeOrigin::Agent | RuntimeOrigin::CommandLine => 1,
+                RuntimeOrigin::Unknown => 2,
+                RuntimeOrigin::Desktop => 3,
+            },
+            entry.port,
+            entry.address.clone(),
+            entry.process.clone(),
+        )
+    });
+    Ok(entries)
+}
+
+pub(crate) fn inspect_listeners(target: &RuntimeTarget) -> Result<Vec<RuntimeEntry>, String> {
     let output = match target {
         RuntimeTarget::Local => Command::new("sh")
             .args(["-c", INSPECT_SCRIPT])
@@ -200,7 +247,11 @@ fn inspect(target: &RuntimeTarget) -> Result<Vec<RuntimeEntry>, String> {
             .output()
             .map_err(|error| format!("Could not start SSH inspection: {error}"))?,
     };
-    if !output.status.success() {
+    if !(output.status.success()
+        || (output.status.code() == Some(1)
+            && output.stdout.is_empty()
+            && output.stderr.is_empty()))
+    {
         let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if error.is_empty() {
             format!(
@@ -212,37 +263,36 @@ fn inspect(target: &RuntimeTarget) -> Result<Vec<RuntimeEntry>, String> {
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = if stdout.lines().any(|line| line.starts_with('p')) {
+    let entries = if stdout.lines().any(|line| line.starts_with('p')) {
         parse_lsof(&stdout)
     } else {
         parse_ss(&stdout)
     };
-    enrich_process_details(target, &mut entries);
-    let observations = process_observations(target);
-    for entry in &mut entries {
-        entry.kind = classify_process(entry);
-        (entry.origin, entry.origin_reason) = classify_origin(entry.pid, &observations);
-    }
-    entries.sort_by_key(|entry| {
-        (
-            entry.kind.rank(),
-            match entry.origin {
-                RuntimeOrigin::Agent | RuntimeOrigin::CommandLine => 0,
-                RuntimeOrigin::Unknown => 1,
-                RuntimeOrigin::Desktop => 2,
-            },
-            entry.port,
-            entry.address.clone(),
-            entry.process.clone(),
-        )
-    });
     Ok(entries)
+}
+
+fn project_owner(
+    target: &RuntimeTarget,
+    pid: Option<u32>,
+    observations: &HashMap<u32, ProcessObservation>,
+    owners: &[ProjectOwner],
+) -> Option<ProjectOwner> {
+    if *target != RuntimeTarget::Local {
+        return None;
+    }
+    pid.and_then(|pid| observations.get(&pid))
+        .and_then(|process| {
+            owners
+                .iter()
+                .find(|owner| owner.process_group == process.group)
+        })
+        .cloned()
 }
 
 fn process_observations(target: &RuntimeTarget) -> HashMap<u32, ProcessObservation> {
     let output = match target {
         RuntimeTarget::Local => Command::new("ps")
-            .args(["-ww", "-axo", "pid=,ppid=,tty=,command="])
+            .args(["-ww", "-axo", "pid=,ppid=,pgid=,tty=,command="])
             .output(),
         RuntimeTarget::Host(alias) => Command::new("ssh")
             .args([
@@ -254,7 +304,7 @@ fn process_observations(target: &RuntimeTarget) -> HashMap<u32, ProcessObservati
                 "ConnectTimeout=10",
             ])
             .arg(alias)
-            .arg("ps -ww -axo pid=,ppid=,tty=,command=")
+            .arg("ps -ww -axo pid=,ppid=,pgid=,tty=,command=")
             .stdin(Stdio::null())
             .output(),
     };
@@ -278,11 +328,13 @@ fn parse_process_observations(text: &str) -> HashMap<u32, ProcessObservation> {
             };
             let pid = take_field()?.parse().ok()?;
             let parent = take_field()?.parse().ok()?;
+            let group = take_field()?.parse().ok()?;
             let tty = take_field()?.to_string();
             Some((
                 pid,
                 ProcessObservation {
                     parent,
+                    group,
                     tty,
                     command: remaining.to_string(),
                 },
@@ -452,7 +504,7 @@ fn process_details(target: &RuntimeTarget, pid: u32) -> Option<(String, String, 
     ))
 }
 
-fn process_working_directory(target: &RuntimeTarget, pid: u32) -> Option<String> {
+pub(crate) fn process_working_directory(target: &RuntimeTarget, pid: u32) -> Option<String> {
     let output = match target {
         RuntimeTarget::Local => Command::new("sh")
             .args([
@@ -599,6 +651,8 @@ fn lsof_entry(fields: &BTreeMap<char, String>, name: &str) -> Option<RuntimeEntr
         kind: RuntimeProcessKind::Unknown,
         origin: RuntimeOrigin::Unknown,
         origin_reason: String::new(),
+        project: None,
+        external_project: None,
     })
 }
 
@@ -626,6 +680,8 @@ fn parse_ss(output: &str) -> Vec<RuntimeEntry> {
             kind: RuntimeProcessKind::Unknown,
             origin: RuntimeOrigin::Unknown,
             origin_reason: String::new(),
+            project: None,
+            external_project: None,
         });
     }
     entries.sort_by_key(|entry| (entry.port, entry.address.clone(), entry.process.clone()));
@@ -661,18 +717,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_ownership_matches_the_process_group_only_on_local() {
+        let observations = parse_process_observations(
+            "10 1 10 ?? sh -c serve\n11 10 10 ?? server\n12 1 12 ?? server /same/path\n",
+        );
+        let owner = ProjectOwner {
+            key: (1, 2),
+            run_id: 3,
+            process_group: 10,
+            project_name: "Demo".into(),
+            command_name: "Serve".into(),
+        };
+        for pid in [10, 11] {
+            assert_eq!(
+                project_owner(
+                    &RuntimeTarget::Local,
+                    Some(pid),
+                    &observations,
+                    std::slice::from_ref(&owner)
+                ),
+                Some(owner.clone())
+            );
+            assert!(
+                project_owner(
+                    &RuntimeTarget::Host("fixture".into()),
+                    Some(pid),
+                    &observations,
+                    std::slice::from_ref(&owner)
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            project_owner(
+                &RuntimeTarget::Local,
+                Some(12),
+                &observations,
+                std::slice::from_ref(&owner)
+            )
+            .is_none()
+        );
+        assert!(project_owner(&RuntimeTarget::Local, Some(11), &observations, &[]).is_none());
+    }
+
+    #[test]
     fn origin_distinguishes_shell_agent_desktop_and_unknown_ancestry() {
         let processes = parse_process_observations(
-            "10 1 ?? /Applications/WeChat.app/Contents/MacOS/WeChat\n\
-             11 10 ?? /Applications/WeChat.app/Contents/Helpers/network\n\
-             20 1 ttys002 -zsh\n\
-             21 20 ?? node server.js\n\
-             30 20 ?? /usr/local/bin/codex\n\
-             31 30 ?? /bin/sh -c node server.js\n\
-             32 31 ?? node server.js\n\
-             40 1 ?? node orphan.js\n\
-             50 51 ?? worker\n\
-             51 50 ?? worker\n",
+            "10 1 10 ?? /Applications/WeChat.app/Contents/MacOS/WeChat\n\
+             11 10 10 ?? /Applications/WeChat.app/Contents/Helpers/network\n\
+             20 1 20 ttys002 -zsh\n\
+             21 20 21 ?? node server.js\n\
+             30 20 30 ?? /usr/local/bin/codex\n\
+             31 30 30 ?? /bin/sh -c node server.js\n\
+             32 31 30 ?? node server.js\n\
+             40 1 40 ?? node orphan.js\n\
+             50 51 50 ?? worker\n\
+             51 50 50 ?? worker\n",
         );
         assert_eq!(
             classify_origin(Some(11), &processes).0,
@@ -745,6 +845,8 @@ mod tests {
             kind: RuntimeProcessKind::Unknown,
             origin: RuntimeOrigin::Unknown,
             origin_reason: String::new(),
+            project: None,
+            external_project: None,
         };
         let daemon = RuntimeEntry {
             protocol: "TCP".into(),
@@ -759,6 +861,8 @@ mod tests {
             kind: RuntimeProcessKind::Unknown,
             origin: RuntimeOrigin::Unknown,
             origin_reason: String::new(),
+            project: None,
+            external_project: None,
         };
         assert_eq!(
             classify_process(&application),

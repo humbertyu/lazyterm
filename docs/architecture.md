@@ -87,7 +87,7 @@ For reliable CRUD, identify which host entries LazyTerm owns and update only tho
 SSHub centralizes persistent settings and credentials instead of letting each screen write its own files. LazyTerm should have one storage boundary:
 
 ```text
-Host catalog / metadata / snippets / tunnel definitions
+Host catalog / metadata / snippets / tunnel / project definitions
                           |
                      Repository
                           |
@@ -113,13 +113,29 @@ The Runtime view inspects listening TCP sockets on the local machine or on a sel
 
 Inspection runs in a worker thread so the TUI event loop remains responsive. The local and remote adapters use a fixed command policy: prefer `lsof` field output, then fall back to `ss` on systems that provide it. Remote inspection sends the selected alias to OpenSSH and never copies resolved hostname, user, identity, or proxy settings into Runtime state.
 
-Runtime entries are transient observations. PID values are not stable identities and must be revalidated by a fresh inspection before future process actions. When permissions allow, the adapter enriches an entry with the full command line and current working directory using `ps` and `lsof` or `/proc`. The first termination action sends `TERM`; stronger signals require a separate explicit action and are not automatic. Missing tools, permission limits, authentication failures, and unavailable process metadata are displayed as inspection errors or unavailable fields.
+Runtime entries are transient observations. PID values are not stable identities and must be revalidated by a fresh inspection before future process actions. When permissions allow, the adapter enriches an entry with the full command line and current working directory using `ps` and `lsof` or `/proc`. External process termination sends `TERM`; stronger external signals require a separate explicit action and are not automatic. Managed Project commands use the separate group lifecycle described below. Missing tools, permission limits, authentication failures, and unavailable process metadata are displayed as inspection errors or unavailable fields.
 
-### 2.7 Capability-focused tests
-
-Runtime origin is independent of process ownership and system classification. A single `ps` snapshot per inspection supplies PID, PPID, terminal, and command. A bounded, cycle-checked ancestry walk recognizes shells, attached terminals, known Agent executables, and macOS app bundles. Agent ancestry takes precedence over its launcher; a CLI child inside a desktop terminal remains CLI. Missing or reparented ancestors leave origin unknown. Origin is a hint displayed with evidence, not authorization for automatic termination.
+Runtime origin is independent of process ownership and system classification. A single `ps` snapshot per inspection supplies PID, PPID, PGID, terminal, and command. A bounded, cycle-checked ancestry walk recognizes shells, attached terminals, known Agent executables, and macOS app bundles. Agent ancestry takes precedence over its launcher; a CLI child inside a desktop terminal remains CLI. Missing or reparented ancestors leave origin unknown. Origin is a hint displayed with evidence, not authorization for automatic termination.
 
 Runtime defaults to the `Mine` category, comparing process UID against `id -u` on the inspected machine and excluding recognized system services. `Apps`, `System`, and `All` expose broader views. These observations cannot establish Agent provenance. Filtering is shared by rendering, navigation, details, and termination confirmation so a visible selection always refers to the same process.
+
+Local listeners in a currently owned Project process group receive a green `PROJECT` origin, project/command IDs and names, and the current run ID. The UI validates this identity again when receiving worker results and before routing a confirmed stop to the Project supervisor. Remote PID/PGID values never match local ownership. The Runtime `o` action opens the linked command output; entering Runtime refreshes the observation so new project listeners are discoverable.
+
+### 2.7 Project workspaces
+
+`projects.rs` owns Project/command definitions and the local process supervisor; `project_app.rs` owns workspace navigation and forms. A Project has a stable ID, name, base directory, and named commands with stable per-project IDs, shell text, and optional working-directory overrides. Definitions are added to version-1 metadata with an empty default for old files. They share the existing atomic write/backup boundary and survive Host reconciliation. Failed saves roll back definition changes and retain form input.
+
+Execution uses the standard process API with `sh -c`, a validated directory, inherited environment, null stdin, and a new Unix process group. Commands do not start from navigation, tab changes, or application startup. Start, stop, restart, and start/stop-all are explicit actions. Stop sends group TERM and escalates to KILL after two seconds; restart waits for group cleanup and both output readers. If the shell exits while children retain its pipes, the remaining group is also cleaned up. Zombie-only groups do not block completion. Drop kills remaining owned groups and reaps direct children. Daemonized processes that leave the group and recovery after SIGKILL of LazyTerm itself remain unsupported.
+
+Dedicated readers write complete raw stdout/stderr to private per-run files and send bounded chunks over a bounded channel. The event loop drains a bounded number of chunks per frame and keeps a UTF-8-safe 256 KiB display tail. A streaming `vte` parser removes terminal controls for plain output; this is a log view rather than an interactive terminal. The view follows the tail until scrolled, preserves scroll across tab changes, and shows status and executed directory. Full log paths appear in details. Logs live under the metadata directory's `project-logs/`, with directory mode `0700` and file mode `0600`, and are retained when rerunning or deleting a definition. Rotation and persistent run indexing remain deferred.
+
+`project_monitor.rs` observes external commands separately from the owning supervisor. A single-flight worker scans every three seconds, matching effective UID, canonical working directory, and normalized command tokens. npm launch argument rewriting is supported; descendant processes supply listening ports. Managed process groups and the application's ancestors are excluded. Ambiguous definitions are not associated. Returned snapshots carry definitions and managed owner identities; changed definitions or run generations invalidate stale results. Missing inspection data is reported, and actions waiting for inspection fail closed.
+
+Start/start-all and restart wait for a fresh scan before execution. Current external-running status takes priority over a previous managed exit result, which remains separately labeled. External observation never grants lifecycle ownership or output capture. Runtime links external listeners by observed PID and command only on the local target; expired links cannot fall through to a stale generic termination action.
+
+External stop/restart presents an explicit confirmation. Before signaling, the worker revalidates the root's PID, UID, start time, command, and directory, then snapshots descendants. It sends TERM only to individually revalidated processes, protecting unrelated processes that share the terminal process group. External stops do not escalate to KILL; timeout cancels restart. Successful completion triggers a fresh inspection before the requested action, so a replacement external process requires confirmation again. Monitor Drop leaves external processes running.
+
+### 2.8 Capability-focused tests
 
 Connection features should be tested through narrow interfaces and fake implementations:
 
@@ -130,6 +146,10 @@ Connection features should be tested through narrow interfaces and fake implemen
 - fake clock for reconnect backoff.
 
 Do not make unit tests depend on a real SSH server, a real Keychain, or the user's `~/.ssh/config`.
+
+Project process tests launch the test binary as a disposable local server in a temporary directory, bind an OS-assigned loopback port, and remove the fixture on completion. They verify cwd, stdout/stderr, Unicode and ANSI decoding, log retention beyond the display cap, exit codes, concurrent tasks, duplicate rejection, TERM escalation, restart, Drop cleanup, metadata compatibility/backup/failure, and Projects -> Runtime -> output -> confirmed stop. Pure ownership tests cover child PGIDs and remote PID collisions. Nonempty workspace and output rendering is checked from 32x12 through 120x40.
+
+External fixtures run outside the supervisor and deliberately share the test process group. Tests cover conservative command matching, descendants and ports, ambiguous definitions, stale definition/owner snapshots, identity revalidation, non-owning monitor Drop, and individual-process stopping. The App flow retains a previous failed managed run while an external server runs, rejects a duplicate launch, follows its Runtime output link, cancels a stop, then confirms a restart into a new managed generation.
 
 ## 3. LazyTerm target architecture
 
@@ -509,7 +529,7 @@ Development follows integrated vertical slices, not strict release acceptance or
 
 1. OpenSSH is the default interactive SSH and Tunnel backend.
 2. SFTP reuses the OpenSSH alias; the embedded adapter currently requires a trusted host key and key/agent auth, with credential-policy unification still open.
-3. The TUI is a state projection, not a process manager or credential store.
+3. The TUI projects application state; dedicated supervisors own Tunnel and Project processes, and credentials use a separate store.
 4. Persistent tunnels are supervised independently of the interactive SSH handoff.
 5. Password support starts with safe prompts and Keychain storage; automatic native SSH password injection is a separately validated feature.
 6. Reconnect, Keepalive, and timeout are separate policies.

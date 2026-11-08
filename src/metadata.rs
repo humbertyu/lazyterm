@@ -88,6 +88,8 @@ pub struct Metadata {
     pub tunnels: Vec<TunnelDefinition>,
     #[serde(default)]
     pub snippet_packages: Vec<SnippetPackage>,
+    #[serde(default)]
+    pub projects: Vec<crate::projects::ProjectDefinition>,
 }
 
 impl Default for Metadata {
@@ -101,6 +103,7 @@ impl Default for Metadata {
             show_hidden_files: false,
             tunnels: Vec::new(),
             snippet_packages: Vec::new(),
+            projects: Vec::new(),
         }
     }
 }
@@ -128,7 +131,7 @@ impl Metadata {
         self.save_to(&Self::path()?)
     }
 
-    fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
+    pub(crate) fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
         crate::hosts::safe_write(path, &serde_json::to_vec_pretty(self)?)
     }
 
@@ -152,7 +155,7 @@ impl Metadata {
         self.tags.len() + self.remote_paths.len() + self.tunnels.len() != previous_len
     }
 
-    fn path() -> io::Result<PathBuf> {
+    pub(crate) fn data_dir() -> io::Result<PathBuf> {
         let home = env::var_os("HOME")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
         let base = if cfg!(target_os = "macos") {
@@ -162,7 +165,11 @@ impl Metadata {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(home).join(".local/share"))
         };
-        Ok(base.join("lazyterm/hosts.json"))
+        Ok(base.join("lazyterm"))
+    }
+
+    fn path() -> io::Result<PathBuf> {
+        Ok(Self::data_dir()?.join("hosts.json"))
     }
 }
 
@@ -184,6 +191,40 @@ pub fn parse_tags(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projects_upgrade_additively_persist_backup_and_survive_host_reconciliation() {
+        use crate::projects::{ProjectCommand, ProjectDefinition, tests::Fixture};
+        let fixture = Fixture::new("metadata");
+        let path = fixture.root.join("hosts.json");
+        fs::write(&path, r#"{"version":1,"tags":{"gone":["work"]}}"#).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut metadata = Metadata::read_from(&path).unwrap();
+        assert!(metadata.projects.is_empty());
+        let project = ProjectDefinition {
+            id: 41,
+            name: "Demo".into(),
+            base_path: fixture.root.clone(),
+            commands: vec![ProjectCommand {
+                id: 7,
+                name: "Tests".into(),
+                command: "cargo test".into(),
+                working_directory: Some("sub directory".into()),
+            }],
+        };
+        metadata.projects.push(project.clone());
+        assert!(metadata.reconcile(&HostCatalog::default()));
+        assert_eq!(metadata.projects.as_slice(), std::slice::from_ref(&project));
+        metadata.save_to(&path).unwrap();
+        assert_eq!(
+            fs::read(path.with_extension("config.lazyterm.bak")).unwrap(),
+            original
+        );
+        let restored = Metadata::read_from(&path).unwrap();
+        assert_eq!(restored.projects, [project]);
+        assert_eq!(restored.version, 1);
+        assert!(restored.tags.is_empty());
+    }
 
     #[test]
     fn tags_are_trimmed_sorted_and_deduplicated() {
