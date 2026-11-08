@@ -55,7 +55,7 @@ Input event
 
 This is more important than the specific Ratatui widget layout. It keeps the UI testable and prevents network or filesystem work from blocking the event loop.
 
-### 2.2 Separate host configuration from runtime sessions
+### 2.2 Separate host configuration, credentials, and runtime sessions
 
 SSHub distinguishes saved host data from active connections. LazyTerm should do the same:
 
@@ -88,6 +88,7 @@ SSHub centralizes persistent settings and credentials instead of letting each sc
 
 ```text
 Host catalog / metadata / snippets / tunnel / project definitions
+Host credential store (platform secret service)
                           |
                      Repository
                           |
@@ -96,7 +97,15 @@ Host catalog / metadata / snippets / tunnel / project definitions
 
 Secrets go through a separate `CredentialStore`; they must not be serialized into ordinary application records.
 
-### 2.5 Runtime process supervision
+### 2.5 Host credential storage
+
+OpenSSH configuration remains the source of truth for standard Host fields such as `HostName`, `User`, `Port`, identity files, and routing options. LazyTerm metadata stores only UI data and opaque credential references. Host passwords never enter `.ssh/config`, JSON metadata, command arguments, environment variables, logs, or configuration exports.
+
+The credential store provides platform adapters for macOS Keychain, Linux Secret Service, and Windows Credential Manager. A Host credential is keyed by a stable LazyTerm host identity plus the resolved alias, so renaming or reconciling an alias cannot silently attach a password to an unrelated Host. Username may be read from OpenSSH config and optionally saved with the credential record when the user chooses; password retrieval always requires an explicit connection operation.
+
+SSH, SFTP, Tunnel, and remote Project connections use the same credential lookup path. Password authentication is supplied through the connection backend's supported prompt or authentication API; the application must never fall back to `sshpass` or place the secret in a process-visible argument. If the platform store is unavailable, the UI reports the failure and allows an interactive one-time password entry without persisting it.
+
+### 2.6 Runtime process supervision
 
 Tunnel processes, snippet commands, and native SSH sessions need a shared process policy:
 
@@ -107,7 +116,7 @@ Tunnel processes, snippet commands, and native SSH sessions need a shared proces
 - preserve persistent tunnels when the TUI exits;
 - rediscover running persistent tunnels on the next launch.
 
-### 2.6 Runtime inspection
+### 2.7 Runtime inspection
 
 The Runtime view inspects listening TCP sockets on the local machine or on a selected OpenSSH Host. It does not replace Tunnel definitions: Tunnels own forwarding processes that LazyTerm starts, while Runtime observes any listener and can request termination after confirmation.
 
@@ -123,7 +132,7 @@ Runtime separates machine selection (`Local` and a catalog-backed `Hosts` picker
 
 Local listeners in a currently owned Project process group receive a green `PROJECT` origin, project/command IDs and names, and the current run ID. The UI validates this identity again when receiving worker results and before routing a confirmed stop to the Project supervisor. Remote PID/PGID values never match local ownership. The Runtime `o` action opens the linked command output; entering Runtime refreshes the observation so new project listeners are discoverable.
 
-### 2.7 Project workspaces
+### 2.8 Project workspaces
 
 `projects.rs` owns Project/command definitions and the local process supervisor; `project_app.rs` owns workspace navigation and forms. A Project has a stable ID, name, base directory, and named commands with stable per-project IDs, shell text, and optional working-directory overrides. Definitions are added to version-1 metadata with an empty default for old files. They share the existing atomic write/backup boundary and survive Host reconciliation. Failed saves roll back definition changes and retain form input.
 
@@ -132,6 +141,8 @@ Projects optionally persist ordered group names; each command references at most
 Project definitions also contain an additive `links` array of stable ID, name, and URL records; older definitions default to no links. Tree views place links under a distinct default-expanded `Web links` header above command groups. This header uses a typed workspace item and separate per-Project session fold state, avoiding collisions with user-defined command groups; flat views omit headers. Link and command rows share name styling, child indentation, and muted secondary information. Creating/editing a link expands the header and resolves selection through workspace-item identity. Their forms and confirmed deletion share the metadata save/rollback path, and editing a Project preserves its links. Neither link nor link-header selection resolves to a command or a service batch scope. The `url` parser validates HTTP/HTTPS addresses on save and again before opening imported metadata; `webbrowser` handles platform browser launching on a background worker, with completion/errors polled by the App. URLs are literal browser destinations and are independent of the Project's execution target.
 
 Links have optional username and opaque password-reference fields. The `keyring` crate stores passwords under the dedicated `lazyterm.project-links` service, using a random reference per replacement. No password is serialized, embedded in a URL, or passed on a command line. Forms mask new input, preserve existing passwords when blank, and zero their password buffer on drop. A worker prepares a new credential, then the UI saves metadata and commits the reference; a canceled or failed save discards only the prepared credential. Successfully saved edits/deletions asynchronously remove references no longer used by any Project link. Cleanup errors are surfaced; process crashes can leave orphaned keychain entries, and automatic orphan reconciliation is deferred. Credential operations never block the UI event loop. A persistent clipboard worker owns copied text, expires passwords after 30 seconds, and clears only matching clipboard contents; normal application exit requests the same cleanup. Clipboard managers and abnormal termination remain outside that best-effort cleanup. Unit tests use an in-memory credential store; the ignored `native_keychain_round_trip` is an opt-in native-store smoke test.
+
+Settings can export the currently referenced Project Web Link passwords to a user-selected `.age` file. The export asks for a separate passphrase, builds the payload in memory, encrypts it before writing, and never places password material in the ordinary JSON configuration export. Host credentials are still a separate pending part of the Host credential model and are not included in this export.
 
 The additive target model stores a Project default (`Local` or `Host(alias)`) and optional per-command overrides. Target choices come from the existing catalog without copying SSH settings. Remote definitions are preserved when Hosts disappear. Remote execution is deliberately unavailable in this phase: the application refuses remote actions before batching, the supervisor rejects them before launching a process, and external recognition cannot associate them with local processes. Remote paths are stored without local canonicalization; their actual existence must be validated when remote execution is implemented.
 
@@ -147,7 +158,7 @@ Start/start-all and restart wait for a fresh scan before execution. Current exte
 
 External stop/restart presents an explicit confirmation. Before signaling, the worker revalidates the root's PID, UID, start time, command, and directory, then snapshots descendants. It sends TERM only to individually revalidated processes, protecting unrelated processes that share the terminal process group. External stops do not escalate to KILL; timeout cancels restart. Successful completion triggers a fresh inspection before the requested action, so a replacement external process requires confirmation again. Monitor Drop leaves external processes running.
 
-### 2.8 Capability-focused tests
+### 2.9 Capability-focused tests
 
 Connection features should be tested through narrow interfaces and fake implementations:
 

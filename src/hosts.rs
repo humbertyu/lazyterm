@@ -1,11 +1,13 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+use serde::Serialize;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Host {
     pub alias: String,
     pub hostname: Option<String>,
@@ -64,6 +66,19 @@ impl HostCatalog {
 
     pub fn config_path() -> Option<PathBuf> {
         env::var_os("HOME").map(|home| PathBuf::from(home).join(".ssh/config"))
+    }
+
+    pub fn config_snapshot() -> io::Result<BTreeMap<String, String>> {
+        let Some(config_path) = Self::config_path() else {
+            return Ok(BTreeMap::new());
+        };
+        let Some(ssh_dir) = config_path.parent() else {
+            return Ok(BTreeMap::new());
+        };
+        let mut visited = HashSet::new();
+        let mut files = BTreeMap::new();
+        snapshot_file(&config_path, ssh_dir, &mut visited, &mut files)?;
+        Ok(files)
     }
 
     pub fn upsert_managed_from(
@@ -136,6 +151,36 @@ impl HostCatalog {
         *self = Self::load();
         Ok(())
     }
+}
+
+fn snapshot_file(
+    path: &Path,
+    ssh_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    files: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    let canonical = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
+    let contents = fs::read_to_string(&canonical)?;
+    files.insert(canonical.display().to_string(), contents.clone());
+    for (_, includes) in hosts_and_includes(&contents)? {
+        for include in includes {
+            for included_path in expand_include(&include, ssh_dir)? {
+                snapshot_file(&included_path, ssh_dir, visited, files)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn scan_file(

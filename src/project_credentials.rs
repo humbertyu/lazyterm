@@ -164,6 +164,10 @@ pub fn copy_password(reference: String) -> Receiver<Result<String, String>> {
     receiver
 }
 
+pub fn read_password(reference: &str) -> Result<Zeroizing<String>, String> {
+    store().get(reference)
+}
+
 struct CopyRequest {
     text: Zeroizing<String>,
     secret: bool,

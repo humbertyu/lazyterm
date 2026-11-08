@@ -22,6 +22,7 @@ const GREEN: Color = Color::Rgb(133, 196, 159);
 const TEXT: Color = Color::Rgb(215, 228, 218);
 const MUTED: Color = Color::Rgb(107, 126, 116);
 const DISABLED: Color = Color::Rgb(76, 91, 82);
+const LIGHT_BG: Color = Color::Rgb(238, 242, 239);
 
 fn runtime_origin_color(origin: crate::runtime::RuntimeOrigin) -> Color {
     use crate::runtime::RuntimeOrigin;
@@ -38,7 +39,13 @@ fn runtime_origin_color(origin: crate::runtime::RuntimeOrigin) -> Color {
 
 pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(
-        Block::default().style(Style::default().bg(BG)),
+        Block::default().style(Style::default().bg(
+            if app.metadata.theme == crate::metadata::Theme::Light {
+                LIGHT_BG
+            } else {
+                BG
+            },
+        )),
         frame.area(),
     );
     let page = page_layout().split(frame.area());
@@ -52,6 +59,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         NavSection::Snippets => render_snippets(frame, page[2], app),
         NavSection::Runtime => render_runtime(frame, app),
         NavSection::Projects => render_projects(frame, page[2], app),
+        NavSection::Settings => render_settings(frame, page[2], app),
     }
     render_footer(frame, page[3], app);
     render_dialogs(frame, app);
@@ -92,6 +100,9 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
     }
     if let Some(dialog) = &app.package_dialog {
         render_package_dialog(frame, dialog);
+    }
+    if let Some(dialog) = &app.credential_export_dialog {
+        render_credential_export_dialog(frame, dialog);
     }
     if let Some(pending) = &app.snippet_confirmation {
         render_snippet_confirmation(frame, pending);
@@ -1982,12 +1993,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(TEXT),
         ),
         Span::styled("    ~/.ssh/config", Style::default().fg(MUTED)),
+        Span::styled("    [,] Settings", Style::default().fg(GREEN)),
     ]);
     frame.render_widget(Paragraph::new(content), area);
 }
 
 fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
-    let titles = NavSection::ALL.iter().enumerate().map(|(index, section)| {
+    let visible = app.visible_sections();
+    let titles = visible.iter().enumerate().map(|(index, section)| {
         let title = if area.width < 55 {
             format!("{} {}", index + 1, &section.title()[..1])
         } else if area.width < 75 {
@@ -1997,10 +2010,10 @@ fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(title)
     });
-    let selected = NavSection::ALL
+    let selected = visible
         .iter()
         .position(|section| *section == app.section)
-        .unwrap_or_default();
+        .unwrap_or(visible.len());
     frame.render_widget(
         Tabs::new(titles)
             .select(selected)
@@ -2020,6 +2033,56 @@ fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
             ),
         area,
     );
+}
+
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = [
+        ("Theme", app.metadata.theme.label().to_string()),
+        ("Language", app.metadata.language.label().to_string()),
+        (
+            "Show Hosts tab",
+            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Hosts")).to_string(),
+        ),
+        (
+            "Show Files tab",
+            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Files")).to_string(),
+        ),
+        (
+            "Show Tunnels tab",
+            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Tunnels")).to_string(),
+        ),
+        (
+            "Show Snippets tab",
+            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Snippets")).to_string(),
+        ),
+        (
+            "Show Runtime tab",
+            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Runtime")).to_string(),
+        ),
+        (
+            "Show Projects tab",
+            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Projects")).to_string(),
+        ),
+        ("Export configuration", "Press Enter".into()),
+        ("Export credentials", "Encrypted .age file".into()),
+    ];
+    let items = rows.iter().enumerate().map(|(index, (label, value))| {
+        let selected = index == app.selected_setting;
+        let style = if selected {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(if selected { "▸ " } else { "  " }, style),
+            Span::styled(format!("{label:<24}"), style),
+            Span::styled(
+                value,
+                Style::default().fg(if selected { GREEN } else { MUTED }),
+            ),
+        ]))
+    });
+    frame.render_widget(List::new(items).block(panel(" SETTINGS ")), area);
 }
 
 fn render_hosts(frame: &mut Frame, area: Rect, app: &App) {
@@ -2790,7 +2853,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let navigation = if area.width < 75 {
         "1-6 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
-        "1-6 / F1-F6 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
+        "1-6 / F1-F6 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
     };
     let hint = if app
         .workspace
@@ -2910,6 +2973,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "l Local  h/s Hosts  Left/Right category  ↑↓ select  r refresh  k TERM  K KILL  o project  q quit"
         }
+    } else if app.section == NavSection::Settings {
+        "↑↓ select  Enter / Space change  Tab switch tab  q quit"
     } else {
         "q quit"
     };
@@ -2932,7 +2997,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 {
                     ""
                 } else if app.searching {
-                    "F1-F6 / Ctrl+Left/Right tabs"
+                    "F1-F6 / Ctrl+Left/Right tabs  [,] settings"
                 } else {
                     navigation
                 },
@@ -3275,6 +3340,55 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
         )
         .wrap(Wrap { trim: true }),
         area,
+    );
+}
+
+fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::CredentialExportDialog) {
+    let area = centered_rect(68, 12, frame.area());
+    let mask = |value: &str| "*".repeat(value.chars().count());
+    let rows = [
+        ("Export password", mask(&dialog.fields[0])),
+        ("Confirm password", mask(&dialog.fields[1])),
+    ];
+    let items = rows.iter().enumerate().map(|(index, (label, value))| {
+        let selected = index == dialog.selected_field;
+        let style = if selected {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(if selected { "▸ " } else { "  " }, style),
+            Span::styled(format!("{label:<18}"), style),
+            Span::styled(
+                value,
+                Style::default().fg(if selected { GREEN } else { TEXT }),
+            ),
+        ]))
+    });
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(" EXPORT ENCRYPTED CREDENTIALS ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GREEN))
+                    .style(Style::default().bg(PANEL)),
+            )
+            .highlight_style(Style::default().fg(GREEN)),
+        area,
+    );
+    let hint = Rect {
+        x: area.x + 2,
+        y: area.bottom().saturating_sub(2),
+        width: area.width.saturating_sub(4),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new("Tab/↑↓ switch  Enter continue/export  Esc cancel")
+            .style(Style::default().fg(MUTED)),
+        hint,
     );
 }
 

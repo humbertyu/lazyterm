@@ -90,6 +90,55 @@ pub struct Metadata {
     pub snippet_packages: Vec<SnippetPackage>,
     #[serde(default)]
     pub projects: Vec<crate::projects::ProjectDefinition>,
+    #[serde(default)]
+    pub theme: Theme,
+    #[serde(default)]
+    pub language: Language,
+    #[serde(default)]
+    pub hidden_tabs: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ExportBundle<'a> {
+    pub format_version: u32,
+    pub ssh_config_path: Option<String>,
+    pub ssh_config: String,
+    pub ssh_config_files: std::collections::BTreeMap<String, String>,
+    pub hosts: &'a [crate::hosts::Host],
+    pub metadata: &'a Metadata,
+    pub passwords_included: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Language {
+    #[default]
+    English,
+    Chinese,
+}
+
+impl Language {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::Chinese => "中文",
+        }
+    }
 }
 
 impl Default for Metadata {
@@ -104,6 +153,9 @@ impl Default for Metadata {
             tunnels: Vec::new(),
             snippet_packages: Vec::new(),
             projects: Vec::new(),
+            theme: Theme::Dark,
+            language: Language::English,
+            hidden_tabs: Vec::new(),
         }
     }
 }

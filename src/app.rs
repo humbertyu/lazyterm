@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Child, ExitStatus};
 use std::{
     collections::VecDeque,
@@ -12,12 +12,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use age::{Encryptor, secrecy::SecretString};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::Serialize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::hosts::{Host, HostCatalog};
 use crate::metadata::{
-    HostView, Metadata, SnippetDefinition, SnippetPackage, TunnelDefinition, TunnelKind,
-    TunnelLifecycle, parse_tags,
+    ExportBundle, HostView, Language, Metadata, SnippetDefinition, SnippetPackage, Theme,
+    TunnelDefinition, TunnelKind, TunnelLifecycle, parse_tags,
 };
 use crate::runtime::{self, RuntimeEntry, RuntimeEvent, RuntimeFilter, RuntimeTarget};
 use crate::sftp::{
@@ -168,6 +171,7 @@ pub enum NavSection {
     Snippets,
     Runtime,
     Projects,
+    Settings,
 }
 
 impl NavSection {
@@ -188,6 +192,7 @@ impl NavSection {
             Self::Snippets => "Snippets",
             Self::Runtime => "Runtime",
             Self::Projects => "Projects",
+            Self::Settings => "Settings",
         }
     }
 }
@@ -199,6 +204,7 @@ pub struct App {
     pub previous_section: NavSection,
     pub hosts: HostCatalog,
     pub selected_host: usize,
+    pub selected_setting: usize,
     pub selected_browse_item: usize,
     pub viewport_width: u16,
     pub viewport_height: u16,
@@ -211,6 +217,7 @@ pub struct App {
     pub tunnel_dialog: Option<TunnelDialog>,
     pub snippet_dialog: Option<SnippetDialog>,
     pub package_dialog: Option<PackageDialog>,
+    pub credential_export_dialog: Option<CredentialExportDialog>,
     pub tunnel_host_picker_open: bool,
     pub snippet_host_picker_open: bool,
     pub snippet_host_picker_group: Option<HostGroup>,
@@ -331,6 +338,23 @@ pub struct PackageDialog {
     pub fields: [String; 2],
     pub editing_id: Option<u64>,
     pub selected_field: usize,
+}
+
+pub struct CredentialExportDialog {
+    pub fields: [String; 2],
+    pub selected_field: usize,
+}
+
+#[derive(Serialize)]
+struct CredentialExport {
+    format_version: u32,
+    credentials: Vec<CredentialRecord>,
+}
+
+#[derive(Serialize)]
+struct CredentialRecord {
+    reference: String,
+    password: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -474,6 +498,7 @@ impl App {
             previous_section: NavSection::Hosts,
             hosts,
             selected_host: 0,
+            selected_setting: 0,
             selected_browse_item: 0,
             viewport_width: 80,
             viewport_height: 24,
@@ -486,6 +511,7 @@ impl App {
             tunnel_dialog: None,
             snippet_dialog: None,
             package_dialog: None,
+            credential_export_dialog: None,
             tunnel_host_picker_open: false,
             snippet_host_picker_open: false,
             snippet_host_picker_group: None,
@@ -2849,6 +2875,7 @@ impl App {
             || self.tunnel_dialog.is_some()
             || self.snippet_dialog.is_some()
             || self.package_dialog.is_some()
+            || self.credential_export_dialog.is_some()
             || self.snippet_confirmation.is_some()
             || self.snippet_delete_confirmation.is_some()
             || self.runtime_host_picker_open
@@ -2862,17 +2889,24 @@ impl App {
             || self.file_dialog.is_some();
         if !modal {
             match (key.code, key.modifiers) {
-                (KeyCode::F(number @ 1..=6), KeyModifiers::NONE) => {
-                    self.switch_section(NavSection::ALL[usize::from(number - 1)]);
+                (KeyCode::F(number @ 1..=7), KeyModifiers::NONE) => {
+                    let visible = self.visible_sections();
+                    if let Some(section) = visible.get(usize::from(number - 1)) {
+                        self.switch_section(*section);
+                    }
                     return InputAction::None;
                 }
-                (KeyCode::Char(number @ '1'..='6'), KeyModifiers::NONE)
+                (KeyCode::Char(number @ '1'..='7'), KeyModifiers::NONE)
                     if !self.searching
                         && !self.file_filtering
                         && !self.host_picker_open
                         && !self.snippet_host_picker_open =>
                 {
-                    self.switch_section(NavSection::ALL[(number as u8 - b'1') as usize]);
+                    if let Some(section) =
+                        self.visible_sections().get((number as u8 - b'1') as usize)
+                    {
+                        self.switch_section(*section);
+                    }
                     return InputAction::None;
                 }
                 (KeyCode::Right, KeyModifiers::CONTROL) => {
@@ -2893,6 +2927,10 @@ impl App {
         {
             return InputAction::None;
         }
+        if !modal && key.code == KeyCode::Char(',') {
+            self.switch_section(NavSection::Settings);
+            return InputAction::None;
+        }
         if self.workspace.form.is_some()
             || self.workspace.delete.is_some()
             || self.workspace.confirmation.is_some()
@@ -2904,6 +2942,8 @@ impl App {
             self.handle_file_filter_key(key.code);
         } else if self.file_dialog.is_some() {
             self.handle_file_dialog_key(key.code);
+        } else if self.credential_export_dialog.is_some() {
+            self.handle_credential_export_key(key.code);
         } else if self.snippet_confirmation.is_some() {
             return self.handle_snippet_confirmation_key(key.code);
         } else if self.snippet_delete_confirmation.is_some() {
@@ -2930,6 +2970,8 @@ impl App {
             return self.handle_snippets_key(key.code);
         } else if self.section == NavSection::Runtime {
             self.handle_runtime_key(key.code);
+        } else if self.section == NavSection::Settings {
+            self.handle_settings_key(key.code);
         } else if self.section == NavSection::Projects {
             self.handle_projects_key(key.code);
         } else {
@@ -2960,6 +3002,269 @@ impl App {
                 self.refresh_projects();
             }
         }
+    }
+
+    pub fn visible_sections(&self) -> Vec<NavSection> {
+        NavSection::ALL
+            .into_iter()
+            .filter(|section| {
+                !self
+                    .metadata
+                    .hidden_tabs
+                    .iter()
+                    .any(|hidden| hidden == section.title())
+            })
+            .collect()
+    }
+
+    fn export_metadata(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export LazyTerm configuration")
+            .set_file_name("lazyterm-export.json")
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            self.notice = Some("Configuration export cancelled.".into());
+            return;
+        };
+        let (ssh_config_path, ssh_config) = HostCatalog::config_path()
+            .map(|config_path| {
+                let contents = fs::read_to_string(&config_path).unwrap_or_default();
+                (Some(config_path.display().to_string()), contents)
+            })
+            .unwrap_or((None, String::new()));
+        let ssh_config_files = match HostCatalog::config_snapshot() {
+            Ok(files) => files,
+            Err(error) => {
+                self.notice = Some(format!("Could not read SSH config for export: {error}"));
+                return;
+            }
+        };
+        let bundle = ExportBundle {
+            format_version: 1,
+            ssh_config_path,
+            ssh_config,
+            ssh_config_files,
+            hosts: &self.hosts.hosts,
+            metadata: &self.metadata,
+            passwords_included: false,
+        };
+        let result = serde_json::to_vec_pretty(&bundle)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| fs::write(&path, bytes));
+        self.notice = Some(match result {
+            Ok(()) => format!("Configuration exported to {}.", path.display()),
+            Err(error) => format!("Could not export configuration: {error}"),
+        });
+    }
+
+    fn toggle_setting(&mut self) {
+        match self.selected_setting {
+            0 => {
+                self.metadata.theme = match self.metadata.theme {
+                    Theme::Dark => Theme::Light,
+                    Theme::Light => Theme::Dark,
+                };
+                self.save_metadata();
+            }
+            1 => {
+                self.metadata.language = match self.metadata.language {
+                    Language::English => Language::Chinese,
+                    Language::Chinese => Language::English,
+                };
+                self.save_metadata();
+            }
+            2..=7 => {
+                let section = NavSection::ALL[self.selected_setting - 2];
+                let title = section.title().to_string();
+                if self
+                    .metadata
+                    .hidden_tabs
+                    .iter()
+                    .any(|hidden| hidden == &title)
+                {
+                    self.metadata.hidden_tabs.retain(|hidden| hidden != &title);
+                } else {
+                    self.metadata.hidden_tabs.push(title);
+                }
+                self.save_metadata();
+            }
+            8 => self.export_metadata(),
+            9 => {
+                self.credential_export_dialog = Some(CredentialExportDialog {
+                    fields: [String::new(), String::new()],
+                    selected_field: 0,
+                })
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_credential_export_key(&mut self, key: KeyCode) {
+        let Some(dialog) = self.credential_export_dialog.as_mut() else {
+            return;
+        };
+        match key {
+            KeyCode::Esc => {
+                dialog.fields.iter_mut().for_each(String::zeroize);
+                self.credential_export_dialog = None;
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                dialog.selected_field = (dialog.selected_field + 1) % dialog.fields.len();
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                dialog.selected_field =
+                    (dialog.selected_field + dialog.fields.len() - 1) % dialog.fields.len();
+            }
+            KeyCode::Backspace => {
+                dialog.fields[dialog.selected_field].pop();
+            }
+            KeyCode::Enter => {
+                if dialog.selected_field == 0 {
+                    dialog.selected_field = 1;
+                } else {
+                    let Some(mut dialog) = self.credential_export_dialog.take() else {
+                        return;
+                    };
+                    let password = Zeroizing::new(std::mem::take(&mut dialog.fields[0]));
+                    let confirmation = Zeroizing::new(std::mem::take(&mut dialog.fields[1]));
+                    if password.len() < 8 {
+                        self.notice = Some("Export password must be at least 8 characters.".into());
+                        self.credential_export_dialog = Some(CredentialExportDialog {
+                            fields: [password.to_string(), confirmation.to_string()],
+                            selected_field: 0,
+                        });
+                    } else if password.as_str() != confirmation.as_str() {
+                        self.notice = Some("Export passwords do not match.".into());
+                        self.credential_export_dialog = Some(CredentialExportDialog {
+                            fields: [password.to_string(), confirmation.to_string()],
+                            selected_field: 1,
+                        });
+                    } else {
+                        self.export_credentials(password);
+                    }
+                }
+            }
+            KeyCode::Char(value) => {
+                if !value.is_control() {
+                    dialog.fields[dialog.selected_field].push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn export_credentials(&mut self, password: Zeroizing<String>) {
+        let references = self
+            .metadata
+            .projects
+            .iter()
+            .flat_map(|project| project.links.iter())
+            .filter_map(|link| link.password_ref.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        if references.is_empty() {
+            self.notice = Some("No saved credentials to export.".into());
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export encrypted credentials")
+            .set_file_name("lazyterm-credentials.age")
+            .add_filter("Age encrypted file", &["age"])
+            .save_file()
+        else {
+            self.notice = Some("Credential export cancelled.".into());
+            return;
+        };
+        let mut credentials = Vec::with_capacity(references.len());
+        for reference in references {
+            let secret = match crate::project_credentials::read_password(reference) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    self.notice = Some(format!("Could not read credential for export: {error}"));
+                    return;
+                }
+            };
+            credentials.push(CredentialRecord {
+                reference: reference.to_string(),
+                password: secret.to_string(),
+            });
+        }
+        let payload = CredentialExport {
+            format_version: 1,
+            credentials,
+        };
+        let plaintext = match serde_json::to_vec_pretty(&payload) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.notice = Some(format!("Could not prepare credential export: {error}"));
+                return;
+            }
+        };
+        let encrypted = match Self::encrypt_credentials(&plaintext, password) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.notice = Some(format!("Could not encrypt credentials: {error}"));
+                return;
+            }
+        };
+        match fs::write(&path, encrypted) {
+            Ok(()) => {
+                self.notice = Some(format!(
+                    "Encrypted credentials exported to {}.",
+                    path.display()
+                ))
+            }
+            Err(error) => self.notice = Some(format!("Could not export credentials: {error}")),
+        }
+    }
+
+    fn encrypt_credentials(
+        plaintext: &[u8],
+        password: Zeroizing<String>,
+    ) -> std::io::Result<Vec<u8>> {
+        let encryptor = Encryptor::with_user_passphrase(SecretString::from(password.to_string()));
+        let mut output = Vec::new();
+        let mut writer = encryptor
+            .wrap_output(&mut output)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        writer.write_all(plaintext)?;
+        writer
+            .finish()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(output)
+    }
+
+    fn handle_settings_key(&mut self, key: KeyCode) {
+        let count = 10;
+        match key {
+            KeyCode::Up => {
+                self.selected_setting = self.selected_setting.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.selected_setting = (self.selected_setting + 1).min(count - 1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
+            KeyCode::Left | KeyCode::Right
+                if self.selected_setting == 0 || self.selected_setting == 1 =>
+            {
+                self.toggle_setting();
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => self.close_settings(),
+            KeyCode::Char('q') => self.should_quit = true,
+            _ => {}
+        }
+    }
+
+    fn close_settings(&mut self) {
+        let target = if self.visible_sections().contains(&self.previous_section) {
+            self.previous_section
+        } else {
+            self.visible_sections()
+                .into_iter()
+                .next()
+                .unwrap_or(NavSection::Projects)
+        };
+        self.switch_section(target);
     }
 
     pub(crate) fn set_host_context(&mut self, alias: Option<String>) {
@@ -3005,6 +3310,10 @@ impl App {
         }
         if self.section == NavSection::Projects {
             self.handle_projects_key(key);
+            return;
+        }
+        if self.section == NavSection::Settings {
+            self.handle_settings_key(key);
             return;
         }
         if self.section == NavSection::Tunnels {
@@ -3149,6 +3458,7 @@ impl App {
             KeyCode::Char('4') | KeyCode::Char('s') => self.switch_section(NavSection::Snippets),
             KeyCode::Char('5') | KeyCode::Char('p') => self.switch_section(NavSection::Runtime),
             KeyCode::Char('6') => self.switch_section(NavSection::Projects),
+            KeyCode::Char(',') => self.switch_section(NavSection::Settings),
             _ => {}
         }
     }
@@ -4268,21 +4578,21 @@ impl App {
     }
 
     pub(crate) fn next_section(&mut self) {
-        let index = NavSection::ALL
+        let visible = self.visible_sections();
+        let index = visible
             .iter()
             .position(|section| *section == self.section)
             .unwrap_or_default();
-        self.switch_section(NavSection::ALL[(index + 1) % NavSection::ALL.len()]);
+        self.switch_section(visible[(index + 1) % visible.len()]);
     }
 
     pub(crate) fn previous_section(&mut self) {
-        let index = NavSection::ALL
+        let visible = self.visible_sections();
+        let index = visible
             .iter()
             .position(|section| *section == self.section)
             .unwrap_or_default();
-        self.switch_section(
-            NavSection::ALL[(index + NavSection::ALL.len() - 1) % NavSection::ALL.len()],
-        );
+        self.switch_section(visible[(index + visible.len() - 1) % visible.len()]);
     }
 
     fn refresh_hosts(&mut self) {
@@ -4432,6 +4742,27 @@ mod tests {
         app.metadata_error = true;
         app.viewport_width = 32;
         app
+    }
+
+    #[test]
+    fn credential_export_is_age_encrypted_and_round_trips() {
+        let plaintext = br#"{"reference":"web-test","password":"secret-value"}"#;
+        let password = Zeroizing::new("export-password".to_string());
+        let encrypted = App::encrypt_credentials(plaintext, password).unwrap();
+        assert!(encrypted.starts_with(b"age-encryption.org/v1"));
+        assert!(
+            !encrypted
+                .windows(b"secret-value".len())
+                .any(|window| { window == b"secret-value" })
+        );
+
+        let decryptor = age::Decryptor::new(&encrypted[..]).unwrap();
+        let identity =
+            age::scrypt::Identity::new(SecretString::from("export-password".to_string()));
+        let mut reader = decryptor.decrypt(std::iter::once(&identity as _)).unwrap();
+        let mut decrypted = Vec::new();
+        reader.read_to_end(&mut decrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
@@ -4795,6 +5126,21 @@ mod tests {
         app.handle_key(KeyCode::Down);
         assert_eq!(app.selected_browse_item, 2);
         assert_eq!(app.selected_host().unwrap().alias, "two");
+    }
+
+    #[test]
+    fn settings_change_theme_and_hide_tabs_without_breaking_navigation() {
+        let mut app = app_fixture();
+        app.section = NavSection::Settings;
+        app.selected_setting = 0;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.theme, Theme::Light);
+
+        app.selected_setting = 2;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.visible_sections().contains(&NavSection::Hosts));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Files);
     }
 
     #[test]
@@ -5178,6 +5524,14 @@ mod tests {
             press(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
             assert_eq!(app.section, NavSection::Projects);
         }
+    }
+
+    #[test]
+    fn comma_opens_settings_from_projects() {
+        let mut app = app_fixture();
+        app.section = NavSection::Projects;
+        press(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Settings);
     }
 
     #[test]

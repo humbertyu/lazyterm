@@ -15,7 +15,9 @@ The project is at an early stage. The Hosts view reads aliases from `~/.ssh/conf
 cargo run
 ```
 
-The top tab bar switches between Hosts, Files, Tunnels, Snippets, Runtime, and Projects. Use `1`-`6` or `F1`-`F6` to jump directly, `Tab` / `Shift+Tab` or `Ctrl+Left` / `Ctrl+Right` to cycle, and backtick (`` ` ``) to toggle back to the previous tab. Plain arrow keys navigate within Hosts, not between tabs. Returning to Hosts preserves its group, filter, and selection.
+The top tab bar switches between Hosts, Files, Tunnels, Snippets, Runtime, and Projects. Use the visible tab number or matching `F` key to jump directly, `Tab` / `Shift+Tab` or `Ctrl+Left` / `Ctrl+Right` to cycle, and backtick (`` ` ``) to toggle back to the previous tab. Press `,` to open the global Settings panel; press `Esc` or `Tab` there to return. Plain arrow keys navigate within Hosts, not between tabs. Returning to Hosts preserves its group, filter, and selection.
+
+Settings currently stores a Dark/Light theme choice, an English/Chinese language choice, visibility for each workspace tab, and configuration export. Settings itself remains visible so hidden tabs can be restored. Configuration export opens a native save dialog with `lazyterm-export.json` as the suggested name and includes the LazyTerm metadata, the discovered Host catalog, the root OpenSSH config text, and readable `Include` files; it never includes passwords. The separate credential export asks for a confirmation password, opens a native save dialog, and writes an age-encrypted `.age` file. It currently exports saved Project Web Link passwords from the system credential store; Host passwords are not yet part of the Host model.
 
 Search captures typed characters, including digits, rather than switching tabs; `F1`-`F6` and `Ctrl+Left` / `Ctrl+Right` can still switch from search without clearing the filter. Add/edit and tag dialogs keep keyboard focus until saved or cancelled; `Tab` moves between form fields there. Terminal-reserved shortcuts may require terminal configuration; plain digit navigation is available outside text input.
 

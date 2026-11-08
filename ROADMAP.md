@@ -182,13 +182,19 @@ Project limits: app-scoped commands may run through the Hosts catalog, but persi
 
 Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, and ready for user acceptance.
 
-- [ ] Configuration import/export and documented data locations.
+- [ ] Add a cross-platform Host credential store for usernames and passwords.
+- [ ] Reuse Host credentials from SSH, SFTP, Tunnel, and Project connections without writing passwords to OpenSSH config, LazyTerm metadata, arguments, environment, or logs.
+- [ ] Add credential prompts for password authentication and first-use credential setup, with explicit errors for unavailable or rejected platform stores.
+- [x] Configuration export and documented data locations. Credential export uses a user-selected, password-protected age file; Host credential import/export remains pending with the Host credential model.
 - [ ] Schema migrations and backup behavior.
 - [ ] Better diagnostics with secret redaction.
 - [ ] Recovery behavior for killed TUI and tunnel processes.
 - [ ] macOS builds for supported architectures.
 - [ ] Installation instructions and checksums.
 - [ ] User testing of SSH, SFTP, credentials, tunnels, snippets, Runtime, and Projects.
+- [x] Add the first Settings surface for theme, language, tab visibility, and metadata-only export.
+
+0.6 implementation order: Host credentials first, then configuration import and schema migration. The current credential export covers Project Web Link passwords in a user-selected, password-protected age file; ordinary configuration archives never include password material.
 
 ## v0.7.0 - Stable Core
 
