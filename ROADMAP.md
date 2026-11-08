@@ -148,13 +148,13 @@ Runtime:
 - [x] Confirm before sending `TERM` to a selected process.
 - [x] Default to current-user non-system listeners; provide Mine, Apps, System, and All category tabs.
 - [x] Color CLI, Agent, desktop, and unknown origins using visible process ancestry; prioritize CLI/Agent listeners.
-- [ ] Add process details and a controlled `KILL` follow-up.
+- [x] Add process details and a controlled `KILL` follow-up.
 - [x] Identify Project command listeners by owned process group; show project/command names and jump to output.
 - [x] Revalidate the current Project run before confirmed group termination from Runtime.
 - [x] Link recognized external Project listeners with a distinct origin and confirmed individual-process termination.
-- [ ] Identify Tunnel-managed listeners separately from external processes.
+- [x] Identify local Tunnel-managed listeners separately from external processes.
 - [x] Add disposable local process fixtures and the Projects -> Runtime -> output -> stop flow.
-- [ ] Add disposable remote Runtime process fixtures.
+- [x] Add disposable remote Runtime process fixtures.
 
 Project workspaces:
 
@@ -165,7 +165,7 @@ Project workspaces:
 - [x] Add optional web-link usernames, system-keychain passwords, masked editing, and username/password clipboard actions.
 - [x] Distinguish Services from Tasks; scope batch start/stop to Services in a group or project.
 - [x] Persist default Project targets and command overrides; block remote execution until its lifecycle is implemented.
-- [ ] Execute remote Project commands through the Hosts catalog with explicit disconnect/exit behavior.
+- [x] Execute app-scoped remote Project commands through the Hosts catalog with explicit disconnect/exit behavior. Persistent remote commands remain deferred.
 - [x] Start, stop, and restart project commands with supervised process groups; start/stop all commands.
 - [x] Capture complete stdout/stderr in per-run private logs and show a bounded scrolling output tail and exit status.
 - [x] Clean up app-scoped process groups on normal app exit; escalate stalled stops after two seconds.
@@ -176,9 +176,11 @@ Project workspaces:
 - [x] Separate current running status from the last managed result and inspect before starting to avoid recognized duplicates.
 - [x] Confirm external stop/restart, revalidate process identity, and preserve external commands on application exit.
 
-Project limits: local foreground commands only, inherited environment, no interactive PTY or dependency ordering. Only the latest persistent run per command has a saved status/output index; full run history and raw-log rotation remain deferred. App-scoped recovery after forced termination and recovery after the independent runner itself is killed remain in beta hardening. Persistent runs do not automatically relaunch after a crash, logout, or reboot; completing this slice does not declare the v0.5.0 release accepted.
+Project limits: app-scoped commands may run through the Hosts catalog, but persistent remote commands, interactive PTY, dependency ordering, and remote process rediscovery remain deferred. Only the latest persistent run per command has a saved status/output index; full run history and raw-log rotation remain deferred. App-scoped recovery after forced termination and recovery after the independent runner itself is killed remain in beta hardening. Persistent runs do not automatically relaunch after a crash, logout, or reboot; completing this slice does not declare the v0.5.0 release accepted.
 
-Beta hardening:
+## v0.6.0 - Beta Hardening
+
+Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, and ready for user acceptance.
 
 - [ ] Configuration import/export and documented data locations.
 - [ ] Schema migrations and backup behavior.
@@ -188,7 +190,7 @@ Beta hardening:
 - [ ] Installation instructions and checksums.
 - [ ] User testing of SSH, SFTP, credentials, tunnels, snippets, Runtime, and Projects.
 
-## v1.0.0 - Stable
+## v0.7.0 - Stable Core
 
 Goal: declare the core local workflow stable.
 

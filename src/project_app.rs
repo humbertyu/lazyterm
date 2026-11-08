@@ -534,18 +534,23 @@ impl App {
             return;
         }
         for key in &keys {
-            if let Some(project) = self
+            let Some(project) = self
                 .metadata
                 .projects
                 .iter()
                 .find(|project| project.id == key.0)
-                && let Some(command) = project.commands.iter().find(|command| command.id == key.1)
-                && *execution_target(project, command) != ProjectTarget::Local
+            else {
+                continue;
+            };
+            let Some(command) = project.commands.iter().find(|command| command.id == key.1) else {
+                continue;
+            };
+            if let ProjectTarget::Host(alias) = execution_target(project, command)
+                && !self.hosts.hosts.iter().any(|host| host.alias == *alias)
             {
                 self.notice = Some(format!(
-                    "{} targets {}; remote Project execution is not available yet.",
-                    command.name,
-                    execution_target(project, command).label()
+                    "{} targets missing Host {}; choose another target first.",
+                    command.name, alias
                 ));
                 return;
             }
@@ -1836,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn target_inheritance_never_executes_remote_commands_locally() {
+    fn target_inheritance_runs_remote_commands_through_ssh() {
         let fixture = Fixture::new("group-target");
         let mut app = grouped_app(&fixture);
         app.metadata.projects[0].target = ProjectTarget::Host("web".into());
@@ -1846,8 +1851,19 @@ mod tests {
             execution_target(&project, command),
             &ProjectTarget::Host("web".into())
         );
-        assert!(app.project_service.start(&project, command).is_err());
-        assert!(app.project_service.tasks.is_empty());
+        assert!(app.project_service.start(&project, command).is_ok());
+        assert!(
+            app.project_service
+                .tasks
+                .contains_key(&(project.id, command.id))
+        );
+        app.project_service.stop((project.id, command.id)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.project_service.active((project.id, command.id)) {
+            app.project_service.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         app.handle_projects_key(KeyCode::Enter);
         app.handle_projects_key(KeyCode::Down);
         app.handle_projects_key(KeyCode::Char('s'));
@@ -1855,8 +1871,9 @@ mod tests {
         assert!(
             app.notice
                 .as_ref()
-                .unwrap()
-                .contains("remote Project execution")
+                .is_some_and(|notice| notice.contains("Host")),
+            "{:?}",
+            app.notice
         );
         app.metadata.projects[0].commands[0].target = Some(ProjectTarget::Local);
         assert!(

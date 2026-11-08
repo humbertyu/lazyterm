@@ -146,7 +146,7 @@ pub fn working_directory(
 ) -> io::Result<PathBuf> {
     if *execution_target(project, command) != ProjectTarget::Local {
         return Err(io::Error::other(
-            "Remote Project execution is not available yet.",
+            "Use remote_working_directory for Host targets.",
         ));
     }
     let base = expand_home(&project.base_path)?;
@@ -165,6 +165,38 @@ pub fn working_directory(
         return Err(io::Error::other("Working directory is not a directory"));
     }
     Ok(directory)
+}
+
+pub fn remote_working_directory(
+    project: &ProjectDefinition,
+    command: &ProjectCommand,
+) -> io::Result<PathBuf> {
+    if !matches!(execution_target(project, command), ProjectTarget::Host(_)) {
+        return Err(io::Error::other("Project target is not a Host."));
+    }
+    let base = project.base_path.to_string_lossy();
+    if !(base.starts_with('/') || base.starts_with("~/")) {
+        return Err(io::Error::other(
+            "Remote Project base path must be absolute or start with ~/",
+        ));
+    }
+    Ok(match &command.working_directory {
+        Some(path) if path.is_absolute() || path.starts_with("~/") => path.clone(),
+        Some(path) => project.base_path.join(path),
+        None => project.base_path.clone(),
+    })
+}
+
+fn remote_shell_command(directory: &Path, command: &str) -> String {
+    format!(
+        "cd -- {} && exec sh -c {}",
+        shell_quote(&directory.to_string_lossy()),
+        shell_quote(command)
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn expand_home(path: &Path) -> io::Result<PathBuf> {
@@ -378,7 +410,16 @@ impl ProjectService {
         project: &ProjectDefinition,
         command: &ProjectCommand,
     ) -> io::Result<()> {
-        working_directory(project, command)?;
+        let target = execution_target(project, command);
+        if *target == ProjectTarget::Local {
+            working_directory(project, command)?;
+        } else if command.lifecycle == ProjectLifecycle::Persistent {
+            return Err(io::Error::other(
+                "Persistent lifecycle is currently available only for Local Projects.",
+            ));
+        } else {
+            remote_working_directory(project, command)?;
+        }
         let key = (project.id, command.id);
         self.recover_task(key)?;
         if self.active(key) {
@@ -411,7 +452,12 @@ impl ProjectService {
         if command.command.trim().is_empty() {
             return Err(io::Error::other("Command is empty"));
         }
-        let directory = working_directory(project, command)?;
+        let target = execution_target(project, command).clone();
+        let directory = if target == ProjectTarget::Local {
+            working_directory(project, command)?
+        } else {
+            remote_working_directory(project, command)?
+        };
         let log_root = self
             .log_root
             .as_ref()
@@ -438,11 +484,29 @@ impl ProjectService {
         let stderr_log = log_root.join(format!("{prefix}.stderr.log"));
         let stdout_file = private_log(&stdout_log)?;
         let stderr_file = private_log(&stderr_log)?;
-        let mut process = Command::new("sh");
+        let mut process = if let ProjectTarget::Host(alias) = &target {
+            let mut process = Command::new("ssh");
+            process
+                .args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "RequestTTY=no",
+                    "-o",
+                    "ConnectTimeout=10",
+                ])
+                .arg(alias)
+                .arg(remote_shell_command(&directory, &command.command));
+            process
+        } else {
+            let mut process = Command::new("sh");
+            process
+                .arg("-c")
+                .arg(&command.command)
+                .current_dir(&directory);
+            process
+        };
         process
-            .arg("-c")
-            .arg(&command.command)
-            .current_dir(&directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -505,7 +569,11 @@ impl ProjectService {
         project: &ProjectDefinition,
         command: &ProjectCommand,
     ) -> io::Result<()> {
-        working_directory(project, command)?;
+        if *execution_target(project, command) == ProjectTarget::Local {
+            working_directory(project, command)?;
+        } else {
+            remote_working_directory(project, command)?;
+        }
         let key = (project.id, command.id);
         if let Some(task) = self.tasks.get_mut(&key)
             && task.active()
@@ -978,6 +1046,33 @@ pub(crate) mod tests {
                 &command
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_projects_build_a_quoted_remote_working_directory() {
+        let project = ProjectDefinition {
+            id: 7,
+            name: "Remote".into(),
+            base_path: "~/apps/demo".into(),
+            target: ProjectTarget::Host("fixture".into()),
+            ..Default::default()
+        };
+        let command = ProjectCommand {
+            working_directory: Some("service's api".into()),
+            command: "printf 'remote output'".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            remote_working_directory(&project, &command).unwrap(),
+            PathBuf::from("~/apps/demo/service's api")
+        );
+        assert_eq!(
+            remote_shell_command(
+                &PathBuf::from("~/apps/demo/service's api"),
+                "printf 'remote output'"
+            ),
+            "cd -- '~/apps/demo/service'\\''s api' && exec sh -c 'printf '\\''remote output'\\'''"
         );
     }
 

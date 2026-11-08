@@ -28,6 +28,7 @@ fn runtime_origin_color(origin: crate::runtime::RuntimeOrigin) -> Color {
     match origin {
         RuntimeOrigin::Project => GREEN,
         RuntimeOrigin::ExternalProject => Color::Rgb(103, 211, 211),
+        RuntimeOrigin::Tunnel => Color::Rgb(190, 145, 255),
         RuntimeOrigin::Agent => Color::Rgb(239, 192, 101),
         RuntimeOrigin::CommandLine => Color::Rgb(103, 211, 211),
         RuntimeOrigin::Desktop => Color::Rgb(160, 171, 190),
@@ -102,7 +103,10 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
         render_runtime_host_picker(frame, app);
     }
     if let Some(entry) = &app.runtime_kill_confirmation {
-        render_runtime_kill_confirmation(frame, entry, &app.runtime_target);
+        render_runtime_kill_confirmation(frame, entry, &app.runtime_target, false);
+    }
+    if let Some(entry) = &app.runtime_force_kill_confirmation {
+        render_runtime_kill_confirmation(frame, entry, &app.runtime_target, true);
     }
     if let Some((alias, tags)) = &app.tags_dialog {
         let area = centered_rect(68, 7, frame.area());
@@ -130,17 +134,6 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
 
 fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
     use crate::projects::TaskStatus;
-    if let Some(project) = app
-        .metadata
-        .projects
-        .iter()
-        .find(|project| project.id == key.0)
-        && let Some(command) = project.commands.iter().find(|command| command.id == key.1)
-        && *crate::projects::execution_target(project, command)
-            != crate::projects::ProjectTarget::Local
-    {
-        return ("remote execution pending".into(), Color::Yellow);
-    }
     if !app.project_service.active(key) {
         let external = app.external_project_runs(key);
         if let Some(run) = external.first() {
@@ -1242,13 +1235,18 @@ fn render_runtime_kill_confirmation(
     frame: &mut Frame,
     entry: &crate::runtime::RuntimeEntry,
     target: &crate::runtime::RuntimeTarget,
+    force: bool,
 ) {
     let area = centered_rect(76, 12, frame.area());
     frame.render_widget(Clear, area);
     let pid = entry
         .pid
         .map_or_else(|| "?".to_string(), |pid| pid.to_string());
-    let block = panel(" TERMINATE PROCESS ");
+    let block = panel(if force {
+        " FORCE KILL PROCESS "
+    } else {
+        " TERMINATE PROCESS "
+    });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -1263,26 +1261,33 @@ fn render_runtime_kill_confirmation(
                 Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(entry.project.as_ref().map_or_else(
-                || {
-                    if let Some(run) = &entry.external_project {
-                        return format!(
-                            "Stop external {} / {} (PID {}) and its child processes?",
-                            run.project_name, run.command_name, run.root.pid
-                        );
-                    }
-                    format!(
-                        "Send TERM to {} (PID {pid}) listening on {}:{}?",
-                        entry.process, entry.address, entry.port
-                    )
-                },
-                |owner| {
-                    format!(
-                        "Stop {} / {} and all its child processes?",
-                        owner.project_name, owner.command_name
-                    )
-                },
-            )),
+            Line::from(if force {
+                format!(
+                    "Send KILL to {} (PID {pid}) listening on {}:{}?",
+                    entry.process, entry.address, entry.port
+                )
+            } else {
+                entry.project.as_ref().map_or_else(
+                    || {
+                        if let Some(run) = &entry.external_project {
+                            return format!(
+                                "Stop external {} / {} (PID {}) and its child processes?",
+                                run.project_name, run.command_name, run.root.pid
+                            );
+                        }
+                        format!(
+                            "Send TERM to {} (PID {pid}) listening on {}:{}?",
+                            entry.process, entry.address, entry.port
+                        )
+                    },
+                    |owner| {
+                        format!(
+                            "Stop {} / {} and all its child processes?",
+                            owner.project_name, owner.command_name
+                        )
+                    },
+                )
+            }),
             Line::from(Span::styled(
                 "y / Enter confirm    n / Esc cancel",
                 Style::default().fg(MUTED),
@@ -2898,10 +2903,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.section == NavSection::Runtime {
         if app.runtime_host_picker_open {
             "↑↓ select group/Host  Enter choose  Backspace back  Esc cancel"
-        } else if app.runtime_kill_confirmation.is_some() {
+        } else if app.runtime_kill_confirmation.is_some()
+            || app.runtime_force_kill_confirmation.is_some()
+        {
             "y / Enter confirm  n / Esc cancel"
         } else {
-            "l Local  h/s Hosts  Left/Right category  ↑↓ select  r refresh  k terminate  o project  q quit"
+            "l Local  h/s Hosts  Left/Right category  ↑↓ select  r refresh  k TERM  K KILL  o project  q quit"
         }
     } else {
         "q quit"
@@ -3395,6 +3402,7 @@ mod tests {
                 command_name: "Dev server".into(),
             }),
             external_project: None,
+            tunnel: None,
         });
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -3439,6 +3447,7 @@ mod tests {
                 origin_reason: "Shell ancestor".into(),
                 project: None,
                 external_project: None,
+                tunnel: None,
             });
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let text = format!("{}", terminal.backend());

@@ -238,6 +238,7 @@ pub struct App {
     pub runtime_host_picker_group: Option<HostGroup>,
     pub runtime_host_picker_selection: usize,
     pub runtime_kill_confirmation: Option<RuntimeEntry>,
+    pub runtime_force_kill_confirmation: Option<RuntimeEntry>,
     pub selected_tunnel: usize,
     pub tunnel_statuses: std::collections::HashMap<u64, TunnelStatus>,
     pub metadata: Metadata,
@@ -512,6 +513,7 @@ impl App {
             runtime_host_picker_group: None,
             runtime_host_picker_selection: 0,
             runtime_kill_confirmation: None,
+            runtime_force_kill_confirmation: None,
             selected_tunnel: 0,
             tunnel_statuses: metadata
                 .tunnels
@@ -1759,11 +1761,14 @@ impl App {
             self.runtime_target.clone(),
             self.runtime_request,
             self.project_service.owners(),
+            self.metadata.tunnels.clone(),
         );
     }
 
     pub(crate) fn switch_runtime_target(&mut self, target: RuntimeTarget) {
-        if self.runtime_kill_confirmation.is_some() {
+        if self.runtime_kill_confirmation.is_some()
+            || self.runtime_force_kill_confirmation.is_some()
+        {
             return;
         }
         self.restore_runtime_view(target);
@@ -1889,6 +1894,28 @@ impl App {
     }
 
     fn handle_runtime_key(&mut self, key: KeyCode) {
+        if self.runtime_force_kill_confirmation.is_some() {
+            match key {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let Some(entry) = self.runtime_force_kill_confirmation.take() else {
+                        return;
+                    };
+                    if let Some(pid) = entry.pid {
+                        runtime::kill_async(
+                            self.runtime_sender.clone(),
+                            self.runtime_target.clone(),
+                            pid,
+                            entry.process,
+                        );
+                    } else {
+                        self.notice = Some("The selected entry has no visible PID.".into());
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.runtime_force_kill_confirmation = None,
+                _ => {}
+            }
+            return;
+        }
         if self.runtime_kill_confirmation.is_some() {
             match key {
                 KeyCode::Char('y') | KeyCode::Enter => {
@@ -1992,6 +2019,15 @@ impl App {
                     self.runtime_kill_confirmation = Some(entry.clone());
                 } else {
                     self.notice = Some("The selected entry has no visible PID.".to_string());
+                }
+            }
+            KeyCode::Char('K') => {
+                if let Some(entry) = self.selected_runtime_entry()
+                    && entry.pid.is_some()
+                {
+                    self.runtime_force_kill_confirmation = Some(entry.clone());
+                } else {
+                    self.notice = Some("The selected entry has no visible PID.".into());
                 }
             }
             _ => {}
@@ -2289,7 +2325,10 @@ impl App {
             return InputAction::None;
         }
         if self.section == NavSection::Runtime {
-            if self.runtime_host_picker_open || self.runtime_kill_confirmation.is_some() {
+            if self.runtime_host_picker_open
+                || self.runtime_kill_confirmation.is_some()
+                || self.runtime_force_kill_confirmation.is_some()
+            {
                 return InputAction::None;
             }
             self.viewport_width = viewport_width;
@@ -2814,6 +2853,7 @@ impl App {
             || self.snippet_delete_confirmation.is_some()
             || self.runtime_host_picker_open
             || self.runtime_kill_confirmation.is_some()
+            || self.runtime_force_kill_confirmation.is_some()
             || self.workspace.form.is_some()
             || self.workspace.delete.is_some()
             || self.workspace.confirmation.is_some()
@@ -2868,7 +2908,10 @@ impl App {
             return self.handle_snippet_confirmation_key(key.code);
         } else if self.snippet_delete_confirmation.is_some() {
             self.handle_snippet_delete_key(key.code);
-        } else if self.runtime_host_picker_open || self.runtime_kill_confirmation.is_some() {
+        } else if self.runtime_host_picker_open
+            || self.runtime_kill_confirmation.is_some()
+            || self.runtime_force_kill_confirmation.is_some()
+        {
             self.handle_runtime_key(key.code);
         } else if modal {
             self.handle_key(key.code);
@@ -4691,6 +4734,7 @@ mod tests {
             origin_reason: String::new(),
             project: Some(stale),
             external_project: None,
+            tunnel: None,
         };
         app.section = NavSection::Runtime;
         app.runtime_kill_confirmation = Some(entry.clone());
@@ -4779,6 +4823,7 @@ mod tests {
             origin_reason: "Shell ancestor".into(),
             project: None,
             external_project: None,
+            tunnel: None,
         }
     }
 
@@ -4948,6 +4993,7 @@ mod tests {
             origin_reason: "Shell ancestor".into(),
             project: None,
             external_project: None,
+            tunnel: None,
         };
         let mut system = own.clone();
         system.pid = Some(456);
@@ -4956,8 +5002,12 @@ mod tests {
         app.runtime_entries = vec![system.clone(), own.clone()];
         assert_eq!(app.selected_runtime_entry(), Some(&own));
         press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-        assert_eq!(app.runtime_kill_confirmation, Some(own));
+        assert_eq!(app.runtime_kill_confirmation, Some(own.clone()));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('K'), KeyModifiers::NONE);
+        assert_eq!(app.runtime_force_kill_confirmation, Some(own));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.runtime_force_kill_confirmation.is_none());
         press(&mut app, KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(app.runtime_filter, RuntimeFilter::Applications);
         press(&mut app, KeyCode::Right, KeyModifiers::NONE);

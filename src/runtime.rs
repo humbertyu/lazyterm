@@ -56,12 +56,14 @@ pub struct RuntimeEntry {
     pub origin_reason: String,
     pub project: Option<ProjectOwner>,
     pub external_project: Option<crate::project_monitor::ExternalRun>,
+    pub tunnel: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeOrigin {
     Project,
     ExternalProject,
+    Tunnel,
     Agent,
     CommandLine,
     Desktop,
@@ -74,6 +76,7 @@ impl RuntimeOrigin {
         match self {
             Self::Project => "PROJECT",
             Self::ExternalProject => "PROJECT / EXT",
+            Self::Tunnel => "TUNNEL",
             Self::Agent => "AGENT",
             Self::CommandLine => "CLI",
             Self::Desktop => "DESKTOP",
@@ -172,9 +175,10 @@ pub fn inspect_async(
     target: RuntimeTarget,
     request: u64,
     owners: Vec<ProjectOwner>,
+    tunnels: Vec<crate::metadata::TunnelDefinition>,
 ) {
     std::thread::spawn(move || {
-        let result = inspect(&target, &owners);
+        let result = inspect(&target, &owners, &tunnels);
         let event = match result {
             Ok(entries) => RuntimeEvent::Listed {
                 target,
@@ -210,7 +214,25 @@ pub fn terminate_async(
     });
 }
 
-fn inspect(target: &RuntimeTarget, owners: &[ProjectOwner]) -> Result<Vec<RuntimeEntry>, String> {
+pub fn kill_async(sender: Sender<RuntimeEvent>, target: RuntimeTarget, pid: u32, process: String) {
+    std::thread::spawn(move || {
+        let result = signal_process(&target, pid, "KILL");
+        let event = match result {
+            Ok(()) => RuntimeEvent::ActionCompleted {
+                target,
+                message: format!("Sent KILL to {process} ({pid})."),
+            },
+            Err(message) => RuntimeEvent::ActionFailed { target, message },
+        };
+        let _ = sender.send(event);
+    });
+}
+
+fn inspect(
+    target: &RuntimeTarget,
+    owners: &[ProjectOwner],
+    tunnels: &[crate::metadata::TunnelDefinition],
+) -> Result<Vec<RuntimeEntry>, String> {
     let mut entries = inspect_listeners(target)?;
     enrich_process_details(target, &mut entries);
     let observations = process_observations(target);
@@ -227,12 +249,29 @@ fn inspect(target: &RuntimeTarget, owners: &[ProjectOwner]) -> Result<Vec<Runtim
             entry.kind = RuntimeProcessKind::Application;
             entry.owned_by_current_user = true;
         }
+        if *target == RuntimeTarget::Local {
+            entry.tunnel = tunnels
+                .iter()
+                .find(|tunnel| {
+                    matches!(
+                        tunnel.kind,
+                        crate::metadata::TunnelKind::Local | crate::metadata::TunnelKind::Dynamic
+                    ) && tunnel.local_port == entry.port
+                })
+                .map(|tunnel| tunnel.id);
+            if entry.tunnel.is_some() && entry.project.is_none() {
+                entry.origin = RuntimeOrigin::Tunnel;
+                entry.origin_reason = "Managed by a LazyTerm tunnel".into();
+            }
+        }
     }
     entries.sort_by_key(|entry| {
         (
             entry.kind.rank(),
             match entry.origin {
-                RuntimeOrigin::Project | RuntimeOrigin::ExternalProject => 0,
+                RuntimeOrigin::Project | RuntimeOrigin::ExternalProject | RuntimeOrigin::Tunnel => {
+                    0
+                }
                 RuntimeOrigin::Agent | RuntimeOrigin::CommandLine => 1,
                 RuntimeOrigin::Unknown => 2,
                 RuntimeOrigin::Desktop => 3,
@@ -246,26 +285,47 @@ fn inspect(target: &RuntimeTarget, owners: &[ProjectOwner]) -> Result<Vec<Runtim
 }
 
 pub(crate) fn inspect_listeners(target: &RuntimeTarget) -> Result<Vec<RuntimeEntry>, String> {
+    inspect_listeners_with_config(target, None)
+}
+
+#[cfg(test)]
+pub(crate) fn inspect_listeners_with_test_config(
+    target: &RuntimeTarget,
+    config_file: &std::path::Path,
+) -> Result<Vec<RuntimeEntry>, String> {
+    inspect_listeners_with_config(target, Some(config_file))
+}
+
+fn inspect_listeners_with_config(
+    target: &RuntimeTarget,
+    config_file: Option<&std::path::Path>,
+) -> Result<Vec<RuntimeEntry>, String> {
     let output = match target {
         RuntimeTarget::Local => Command::new("sh")
             .args(["-c", INSPECT_SCRIPT])
             .stdin(Stdio::null())
             .output()
             .map_err(|error| format!("Could not start local port inspection: {error}"))?,
-        RuntimeTarget::Host(alias) => Command::new("ssh")
-            .args([
+        RuntimeTarget::Host(alias) => {
+            let mut command = Command::new("ssh");
+            command.args([
                 "-o",
                 "BatchMode=yes",
                 "-o",
                 "RequestTTY=no",
                 "-o",
                 "ConnectTimeout=10",
-            ])
-            .arg(alias)
-            .arg(INSPECT_SCRIPT)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("Could not start SSH inspection: {error}"))?,
+            ]);
+            if let Some(config_file) = config_file {
+                command.arg("-F").arg(config_file);
+            }
+            command
+                .arg(alias)
+                .arg(INSPECT_SCRIPT)
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| format!("Could not start SSH inspection: {error}"))?
+        }
     };
     if !(output.status.success()
         || (output.status.code() == Some(1)
@@ -601,11 +661,15 @@ fn classify_process(entry: &RuntimeEntry) -> RuntimeProcessKind {
 }
 
 fn terminate(target: &RuntimeTarget, pid: u32) -> Result<(), String> {
+    signal_process(target, pid, "TERM")
+}
+
+fn signal_process(target: &RuntimeTarget, pid: u32, signal: &str) -> Result<(), String> {
     let status = match target {
         RuntimeTarget::Local => Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+            .args([&format!("-{signal}"), &pid.to_string()])
             .status()
-            .map_err(|error| format!("Could not send TERM to {pid}: {error}"))?,
+            .map_err(|error| format!("Could not send {signal} to {pid}: {error}"))?,
         RuntimeTarget::Host(alias) => Command::new("ssh")
             .args([
                 "-o",
@@ -616,16 +680,16 @@ fn terminate(target: &RuntimeTarget, pid: u32) -> Result<(), String> {
                 "ConnectTimeout=10",
             ])
             .arg(alias)
-            .args(["kill", "-TERM", &pid.to_string()])
+            .args(["kill", &format!("-{signal}"), &pid.to_string()])
             .stdin(Stdio::null())
             .status()
-            .map_err(|error| format!("Could not send TERM to {pid}: {error}"))?,
+            .map_err(|error| format!("Could not send {signal} to {pid}: {error}"))?,
     };
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "Could not terminate process {pid} ({}).",
+            "Could not send {signal} to process {pid} ({}).",
             exit_label(status.code())
         ))
     }
@@ -673,6 +737,7 @@ fn lsof_entry(fields: &BTreeMap<char, String>, name: &str) -> Option<RuntimeEntr
         origin_reason: String::new(),
         project: None,
         external_project: None,
+        tunnel: None,
     })
 }
 
@@ -702,6 +767,7 @@ fn parse_ss(output: &str) -> Vec<RuntimeEntry> {
             origin_reason: String::new(),
             project: None,
             external_project: None,
+            tunnel: None,
         });
     }
     entries.sort_by_key(|entry| (entry.port, entry.address.clone(), entry.process.clone()));
@@ -867,6 +933,7 @@ mod tests {
             origin_reason: String::new(),
             project: None,
             external_project: None,
+            tunnel: None,
         };
         let daemon = RuntimeEntry {
             protocol: "TCP".into(),
@@ -883,6 +950,7 @@ mod tests {
             origin_reason: String::new(),
             project: None,
             external_project: None,
+            tunnel: None,
         };
         assert_eq!(
             classify_process(&application),

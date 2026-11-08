@@ -982,6 +982,7 @@ mod tests {
 
     struct SshFixture {
         root: PathBuf,
+        port: u16,
         child: Child,
     }
 
@@ -1048,6 +1049,19 @@ mod tests {
             fixture.root.join("ssh_config"),
             fixture.root.join("known_hosts"),
         ));
+
+        let remote_runtime = crate::runtime::inspect_listeners_with_test_config(
+            &crate::runtime::RuntimeTarget::Host("lazyterm-fixture".into()),
+            &fixture.root.join("ssh_config"),
+        )
+        .expect("inspect the disposable remote Runtime fixture");
+        assert!(
+            remote_runtime
+                .iter()
+                .any(|entry| entry.port == fixture.port),
+            "remote Runtime did not report fixture sshd port {}: {remote_runtime:?}",
+            fixture.port
+        );
 
         let remote_root = fixture.root.join("remote");
         let local_root = fixture.root.join("local");
@@ -1303,8 +1317,22 @@ mod tests {
             String::from_utf8_lossy(&known_hosts.stderr)
         );
         fs::write(root.join("known_hosts"), known_hosts.stdout).expect("write known_hosts");
+        let ssh_config = format!(
+            "Host lazyterm-fixture\n\
+             HostName 127.0.0.1\n\
+             Port {port}\n\
+             User {user}\n\
+             IdentityFile {}\n\
+             IdentitiesOnly yes\n\
+             BatchMode yes\n\
+             UserKnownHostsFile {}\n\
+             StrictHostKeyChecking yes\n",
+            client_key.display(),
+            root.join("known_hosts").display(),
+        );
+        fs::write(root.join("ssh_config"), ssh_config).expect("update client config");
 
-        SshFixture { root, child }
+        SshFixture { root, port, child }
     }
 
     fn run(command: &mut Command, description: &str) {
