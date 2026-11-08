@@ -134,9 +134,32 @@ Goal: make repeatable remote tasks easy without requiring an embedded terminal.
 
 Release gate: batch results clearly distinguish success, command failure, connection failure, and cancellation.
 
-## v0.5.0 - Beta Hardening
+## v0.5.0 - Runtime and Project Workspaces
 
-Goal: make the tool practical to install and operate across repeated daily use.
+Goal: make the tool useful for inspecting live workloads and running repeatable commands inside local projects.
+
+Runtime:
+
+- [x] Add a Runtime view for local TCP listeners.
+- [x] Reuse the Hosts catalog to inspect a remote machine over OpenSSH.
+- [x] Show protocol, listen address, port, PID, process, user, command, and working directory when available.
+- [x] Refresh inspection results without blocking the TUI.
+- [x] Confirm before sending `TERM` to a selected process.
+- [x] Default to current-user non-system listeners; provide Mine, Apps, System, and All category tabs.
+- [x] Color CLI, Agent, desktop, and unknown origins using visible process ancestry; prioritize CLI/Agent listeners.
+- [ ] Add process details and a controlled `KILL` follow-up.
+- [ ] Distinguish LazyTerm-managed processes from external processes.
+- [ ] Add disposable local and remote process fixtures.
+
+Project workspaces:
+
+- [ ] Define Projects with a base path and named commands.
+- [ ] Start, stop, and restart project commands with supervised process groups.
+- [ ] Capture complete stdout/stderr and exit status per command.
+- [ ] Keep Project execution separate from Snippet records used as command templates.
+- [ ] Add project persistence, migrations, and backup coverage.
+
+Beta hardening:
 
 - [ ] Configuration import/export and documented data locations.
 - [ ] Schema migrations and backup behavior.
@@ -144,7 +167,7 @@ Goal: make the tool practical to install and operate across repeated daily use.
 - [ ] Recovery behavior for killed TUI and tunnel processes.
 - [ ] macOS builds for supported architectures.
 - [ ] Installation instructions and checksums.
-- [ ] User testing of SSH, SFTP, credentials, tunnels, and snippets.
+- [ ] User testing of SSH, SFTP, credentials, tunnels, snippets, Runtime, and Projects.
 
 ## v1.0.0 - Stable
 

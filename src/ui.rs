@@ -23,6 +23,16 @@ const TEXT: Color = Color::Rgb(215, 228, 218);
 const MUTED: Color = Color::Rgb(107, 126, 116);
 const DISABLED: Color = Color::Rgb(76, 91, 82);
 
+fn runtime_origin_color(origin: crate::runtime::RuntimeOrigin) -> Color {
+    use crate::runtime::RuntimeOrigin;
+    match origin {
+        RuntimeOrigin::Agent => Color::Rgb(239, 192, 101),
+        RuntimeOrigin::CommandLine => Color::Rgb(103, 211, 211),
+        RuntimeOrigin::Desktop => Color::Rgb(160, 171, 190),
+        RuntimeOrigin::Unknown => MUTED,
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Block::default().style(Style::default().bg(BG)),
@@ -45,6 +55,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         NavSection::Files => render_files(frame, page[2], app),
         NavSection::Tunnels => render_tunnels(frame, page[2], app),
         NavSection::Snippets => render_snippets(frame, page[2], app),
+        NavSection::Runtime => render_runtime(frame, page[2], app),
     }
     render_footer(frame, page[3], app);
     if app.searching {
@@ -76,6 +87,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if let Some(target) = &app.snippet_delete_confirmation {
         render_snippet_delete_confirmation(frame, target);
+    }
+    if app.runtime_host_picker_open {
+        render_runtime_host_picker(frame, app);
+    }
+    if let Some(entry) = &app.runtime_kill_confirmation {
+        render_runtime_kill_confirmation(frame, entry);
     }
     if let Some((alias, tags)) = &app.tags_dialog {
         let area = centered_rect(68, 7, frame.area());
@@ -273,6 +290,243 @@ fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }),
         detail_inner,
+    );
+}
+
+fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
+    let sections = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
+    let selected_filter = crate::runtime::RuntimeFilter::ALL
+        .iter()
+        .position(|filter| *filter == app.runtime_filter)
+        .unwrap_or(0);
+    let filter_titles = crate::runtime::RuntimeFilter::ALL.iter().map(|filter| {
+        let count = app
+            .runtime_entries
+            .iter()
+            .filter(|entry| filter.matches(entry))
+            .count();
+        Line::from(format!("{} {count}", filter.title()))
+    });
+    frame.render_widget(
+        Tabs::new(filter_titles)
+            .select(selected_filter)
+            .style(Style::default().fg(MUTED))
+            .highlight_style(
+                Style::default()
+                    .fg(GREEN)
+                    .bg(Color::Rgb(47, 78, 61))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        sections[0],
+    );
+    let area = sections[1];
+    let entries = app.visible_runtime_entries();
+    let columns =
+        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).split(area);
+    let target = app.runtime_target.label();
+    let title = if app.runtime_loading {
+        format!(" RUNTIME / {target}  loading... ")
+    } else {
+        format!(" RUNTIME / {target} ")
+    };
+    let block = panel(&title);
+    let inner = block.inner(columns[0]);
+    frame.render_widget(block, columns[0]);
+
+    if let Some(error) = &app.runtime_error {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Port inspection failed",
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(error.as_str()),
+                Line::from("Press r to retry, l for Local, or s to choose a Host."),
+            ])
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+    } else if entries.is_empty() && !app.runtime_loading {
+        frame.render_widget(
+            Paragraph::new("No listeners in this category.")
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+    } else {
+        let rows = entries.iter().enumerate().map(|(index, entry)| {
+            let selected = index == app.selected_runtime;
+            let pid = entry
+                .pid
+                .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+            let row_background = if selected {
+                Color::Rgb(47, 78, 61)
+            } else {
+                PANEL
+            };
+            let row_style = Style::default().bg(row_background);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        if selected { ">> " } else { "   " },
+                        row_style.fg(if selected { GREEN } else { MUTED }),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{:<5} {:<5} {}  {}",
+                            entry.port,
+                            entry.protocol,
+                            entry.address,
+                            entry.kind.label()
+                        ),
+                        row_style
+                            .fg(if selected { GREEN } else { TEXT })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        format!("  {}", entry.origin.label()),
+                        row_style
+                            .fg(runtime_origin_color(entry.origin))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        "         {:<18} pid {:<8} {}",
+                        entry.process, pid, entry.user
+                    ),
+                    row_style.fg(runtime_origin_color(entry.origin)),
+                )),
+            ])
+            .style(row_style)
+        });
+        let mut state = ListState::default();
+        if !entries.is_empty() {
+            state.select(Some(app.selected_runtime));
+        }
+        frame.render_stateful_widget(
+            List::new(rows).block(panel(" LISTENERS ")),
+            inner,
+            &mut state,
+        );
+    }
+
+    let detail = app.selected_runtime_entry();
+    let detail_lines = detail.map_or_else(
+        || {
+            vec![Line::from(Span::styled(
+                "Select a listener to inspect it.",
+                Style::default().fg(MUTED),
+            ))]
+        },
+        |entry| {
+            vec![
+                detail_line("Protocol", &entry.protocol),
+                detail_line("Address", &entry.address),
+                detail_line("Port", &entry.port.to_string()),
+                detail_line(
+                    "PID",
+                    &entry
+                        .pid
+                        .map_or_else(|| "Unavailable".to_string(), |pid| pid.to_string()),
+                ),
+                detail_line("Process", &entry.process),
+                detail_line(
+                    "User",
+                    if entry.user.is_empty() {
+                        "Unavailable"
+                    } else {
+                        &entry.user
+                    },
+                ),
+                detail_line("Class", entry.kind.label()),
+                Line::from(vec![
+                    Span::styled("Origin              ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        entry.origin.label(),
+                        Style::default().fg(runtime_origin_color(entry.origin)),
+                    ),
+                ]),
+                detail_line(
+                    "Working dir",
+                    entry.working_directory.as_deref().unwrap_or("Unavailable"),
+                ),
+                detail_line("Command", &entry.command),
+                detail_line("Evidence", &entry.origin_reason),
+            ]
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(detail_lines)
+            .block(panel(" PROCESS "))
+            .wrap(Wrap { trim: false }),
+        columns[1],
+    );
+}
+
+fn render_runtime_host_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(76, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let title = app.runtime_host_picker_group.as_ref().map_or_else(
+        || " SELECT RUNTIME HOST ".to_string(),
+        |group| format!(" SELECT HOST / {} ", group.title()),
+    );
+    let items = app.runtime_host_picker_items_for_ui();
+    let rows = items.iter().map(|item| match item {
+        crate::app::HostPickerItem::Group(group) => {
+            ListItem::new(format!("> {}", group.title())).style(Style::default().fg(GREEN))
+        }
+        crate::app::HostPickerItem::Host(alias) => {
+            ListItem::new(format!("  {alias}")).style(Style::default().fg(TEXT))
+        }
+    });
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(app.runtime_host_picker_selection.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(rows)
+            .block(panel(&title))
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(TEXT)
+                    .bg(Color::Rgb(34, 54, 47))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        area,
+        &mut state,
+    );
+}
+
+fn render_runtime_kill_confirmation(frame: &mut Frame, entry: &crate::runtime::RuntimeEntry) {
+    let area = centered_rect(76, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let pid = entry
+        .pid
+        .map_or_else(|| "?".to_string(), |pid| pid.to_string());
+    let block = panel(" TERMINATE PROCESS ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "Send TERM to {} (PID {pid}) listening on {}:{}?",
+                entry.process, entry.address, entry.port
+            )),
+            Line::from(Span::styled(
+                "y / Enter confirm    n / Esc cancel",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .style(Style::default().fg(TEXT))
+        .wrap(Wrap { trim: false }),
+        inner,
     );
 }
 
@@ -965,9 +1219,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
     let titles = NavSection::ALL.iter().enumerate().map(|(index, section)| {
-        let title = if area.width < 34 {
+        let title = if area.width < 55 {
             format!("{} {}", index + 1, &section.title()[..1])
-        } else if area.width < 42 {
+        } else if area.width < 75 {
             section.title().to_string()
         } else {
             format!("{} {}", index + 1, section.title())
@@ -1765,9 +2019,9 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let navigation = if area.width < 75 {
-        "1-4 tabs  Tab next  Shift+Tab prev  ` last"
+        "1-5 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
-        "1-4 / F1-F4 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
+        "1-5 / F1-F5 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
     };
     let hint = if app.snippet_execution_view {
         "↑↓ scroll output  [ ] select Host  c cancel  C clear  Esc back  q quit"
@@ -1852,6 +2106,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "↑↓ select package  Enter open  e edit  a add  d delete"
         }
+    } else if app.section == NavSection::Runtime {
+        if app.runtime_host_picker_open {
+            "↑↓ select group/Host  Enter choose  Backspace back  Esc cancel"
+        } else if app.runtime_kill_confirmation.is_some() {
+            "y / Enter confirm  n / Esc cancel"
+        } else {
+            "Left/Right category  ↑↓ select  s Host  l Local  r refresh  k terminate  q quit"
+        }
     } else {
         "q quit"
     };
@@ -1866,10 +2128,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     || app.package_dialog.is_some()
                     || app.snippet_confirmation.is_some()
                     || app.snippet_delete_confirmation.is_some()
+                    || app.runtime_host_picker_open
+                    || app.runtime_kill_confirmation.is_some()
                 {
                     ""
                 } else if app.searching {
-                    "F1-F4 / Ctrl+Left/Right tabs"
+                    "F1-F5 / Ctrl+Left/Right tabs"
                 } else {
                     navigation
                 },
@@ -2252,6 +2516,61 @@ mod tests {
     }
 
     #[test]
+    fn runtime_categories_render_selection_and_filtered_process_details() {
+        use crate::runtime::{RuntimeEntry, RuntimeFilter, RuntimeProcessKind};
+        for (width, height) in [(120, 30), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut app = App::with_catalog(
+                HostCatalog::default(),
+                Ok(crate::metadata::Metadata::default()),
+            );
+            app.section = NavSection::Runtime;
+            app.runtime_entries.push(RuntimeEntry {
+                protocol: "TCP".into(),
+                address: "127.0.0.1".into(),
+                port: 3000,
+                pid: Some(123),
+                process: "node".into(),
+                user: "501".into(),
+                command: "node server.js".into(),
+                working_directory: Some("/tmp/project".into()),
+                owned_by_current_user: true,
+                kind: RuntimeProcessKind::Application,
+                origin: crate::runtime::RuntimeOrigin::CommandLine,
+                origin_reason: "Shell ancestor".into(),
+            });
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Mine 1"));
+            assert!(text.contains("Apps 1"));
+            assert!(text.contains("System 0"));
+            assert!(text.contains(">> 3000"));
+            assert!(text.contains("CLI"));
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "n"
+                        && cell.fg
+                            == runtime_origin_color(crate::runtime::RuntimeOrigin::CommandLine))
+            );
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "3" && cell.bg == Color::Rgb(47, 78, 61))
+            );
+            app.runtime_filter = RuntimeFilter::System;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(!format!("{}", terminal.backend()).contains("node"));
+        }
+    }
+
+    #[test]
     fn all_sections_render_at_desktop_and_compact_sizes() {
         for (width, height) in [(120, 40), (80, 24), (54, 18), (42, 18), (32, 12)] {
             let backend = TestBackend::new(width, height);
@@ -2403,11 +2722,23 @@ mod tests {
                 let row = &buffer.content[usize::from(width)..usize::from(width) * 2];
                 let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
                 for (number, tab) in NavSection::ALL.iter().enumerate() {
-                    assert!(text.contains(&format!("{} {}", number + 1, tab.title())));
+                    let label = if width < 55 {
+                        format!("{} {}", number + 1, &tab.title()[..1])
+                    } else if width < 75 {
+                        tab.title().to_string()
+                    } else {
+                        format!("{} {}", number + 1, tab.title())
+                    };
+                    assert!(text.contains(&label));
                 }
-                let selected = text
-                    .find(&format!("{} {}", index + 1, section.title()))
-                    .unwrap();
+                let selected_label = if width < 55 {
+                    format!("{} {}", index + 1, &section.title()[..1])
+                } else if width < 75 {
+                    section.title().to_string()
+                } else {
+                    format!("{} {}", index + 1, section.title())
+                };
+                let selected = text.find(&selected_label).unwrap();
                 assert_eq!(row[selected].fg, GREEN);
                 assert_eq!(row[selected].bg, Color::Rgb(34, 54, 47));
                 assert!(!format!("{}", terminal.backend()).contains("WORKSPACE"));

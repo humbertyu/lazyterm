@@ -107,7 +107,19 @@ Tunnel processes, snippet commands, and native SSH sessions need a shared proces
 - preserve persistent tunnels when the TUI exits;
 - rediscover running persistent tunnels on the next launch.
 
-### 2.6 Capability-focused tests
+### 2.6 Runtime inspection
+
+The Runtime view inspects listening TCP sockets on the local machine or on a selected OpenSSH Host. It does not replace Tunnel definitions: Tunnels own forwarding processes that LazyTerm starts, while Runtime observes any listener and can request termination after confirmation.
+
+Inspection runs in a worker thread so the TUI event loop remains responsive. The local and remote adapters use a fixed command policy: prefer `lsof` field output, then fall back to `ss` on systems that provide it. Remote inspection sends the selected alias to OpenSSH and never copies resolved hostname, user, identity, or proxy settings into Runtime state.
+
+Runtime entries are transient observations. PID values are not stable identities and must be revalidated by a fresh inspection before future process actions. When permissions allow, the adapter enriches an entry with the full command line and current working directory using `ps` and `lsof` or `/proc`. The first termination action sends `TERM`; stronger signals require a separate explicit action and are not automatic. Missing tools, permission limits, authentication failures, and unavailable process metadata are displayed as inspection errors or unavailable fields.
+
+### 2.7 Capability-focused tests
+
+Runtime origin is independent of process ownership and system classification. A single `ps` snapshot per inspection supplies PID, PPID, terminal, and command. A bounded, cycle-checked ancestry walk recognizes shells, attached terminals, known Agent executables, and macOS app bundles. Agent ancestry takes precedence over its launcher; a CLI child inside a desktop terminal remains CLI. Missing or reparented ancestors leave origin unknown. Origin is a hint displayed with evidence, not authorization for automatic termination.
+
+Runtime defaults to the `Mine` category, comparing process UID against `id -u` on the inspected machine and excluding recognized system services. `Apps`, `System`, and `All` expose broader views. These observations cannot establish Agent provenance. Filtering is shared by rendering, navigation, details, and termination confirmation so a visible selection always refers to the same process.
 
 Connection features should be tested through narrow interfaces and fake implementations:
 
@@ -478,6 +490,14 @@ Keychain and automatic saved-password entry are a separate deferred track, not a
 - preview, confirmation, output capture, and cancellation;
 - timeout/Keepalive controls;
 - ProxyJump display and hop-specific errors.
+
+### Phase 5a: Runtime and Project workspaces
+
+- inspect local and remote listeners through the Hosts catalog;
+- add confirmed process termination with platform-specific diagnostics;
+- define local Projects with base paths and named commands;
+- supervise project process groups and capture complete output;
+- keep Project execution separate from Snippet command records.
 
 ### Phase 6: reassess embedded sessions
 

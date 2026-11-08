@@ -19,6 +19,7 @@ use crate::metadata::{
     HostView, Metadata, SnippetDefinition, SnippetPackage, TunnelDefinition, TunnelKind,
     TunnelLifecycle, parse_tags,
 };
+use crate::runtime::{self, RuntimeEntry, RuntimeEvent, RuntimeFilter, RuntimeTarget};
 use crate::sftp::{
     self, Mutation, MutationEvent, MutationRequest, SftpListing, SftpResult, TransferDirection,
     TransferEvent, TransferRequest,
@@ -165,10 +166,17 @@ pub enum NavSection {
     Files,
     Tunnels,
     Snippets,
+    Runtime,
 }
 
 impl NavSection {
-    pub const ALL: [Self; 4] = [Self::Hosts, Self::Files, Self::Tunnels, Self::Snippets];
+    pub const ALL: [Self; 5] = [
+        Self::Hosts,
+        Self::Files,
+        Self::Tunnels,
+        Self::Snippets,
+        Self::Runtime,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -176,6 +184,7 @@ impl NavSection {
             Self::Files => "Files",
             Self::Tunnels => "Tunnels",
             Self::Snippets => "Snippets",
+            Self::Runtime => "Runtime",
         }
     }
 }
@@ -210,6 +219,16 @@ pub struct App {
     pub snippet_delete_confirmation: Option<SnippetDeleteTarget>,
     pub snippet_execution_view: bool,
     pub snippet_output_scroll: u16,
+    pub runtime_target: RuntimeTarget,
+    pub runtime_entries: Vec<RuntimeEntry>,
+    pub runtime_filter: RuntimeFilter,
+    pub selected_runtime: usize,
+    pub runtime_loading: bool,
+    pub runtime_error: Option<String>,
+    pub runtime_host_picker_open: bool,
+    pub runtime_host_picker_group: Option<HostGroup>,
+    pub runtime_host_picker_selection: usize,
+    pub runtime_kill_confirmation: Option<RuntimeEntry>,
     pub selected_tunnel: usize,
     pub tunnel_statuses: std::collections::HashMap<u64, TunnelStatus>,
     pub metadata: Metadata,
@@ -244,6 +263,8 @@ pub struct App {
     mutation_hosts: std::collections::HashMap<u64, String>,
     tunnel_sender: Sender<tunnel::TunnelEvent>,
     tunnel_receiver: Receiver<tunnel::TunnelEvent>,
+    runtime_sender: Sender<RuntimeEvent>,
+    runtime_receiver: Receiver<RuntimeEvent>,
     tunnel_processes: std::collections::HashMap<u64, Child>,
     snippet_processes: std::collections::HashMap<u64, SnippetProcess>,
     next_snippet_run_id: u64,
@@ -428,6 +449,7 @@ impl App {
         let (transfer_sender, transfer_receiver) = std::sync::mpsc::channel();
         let (mutation_sender, mutation_receiver) = std::sync::mpsc::channel();
         let (tunnel_sender, tunnel_receiver) = std::sync::mpsc::channel();
+        let (runtime_sender, runtime_receiver) = std::sync::mpsc::channel();
         Self {
             section: NavSection::Hosts,
             previous_section: NavSection::Hosts,
@@ -458,6 +480,16 @@ impl App {
             snippet_delete_confirmation: None,
             snippet_execution_view: false,
             snippet_output_scroll: 0,
+            runtime_target: RuntimeTarget::Local,
+            runtime_entries: Vec::new(),
+            runtime_filter: RuntimeFilter::Mine,
+            selected_runtime: 0,
+            runtime_loading: false,
+            runtime_error: None,
+            runtime_host_picker_open: false,
+            runtime_host_picker_group: None,
+            runtime_host_picker_selection: 0,
+            runtime_kill_confirmation: None,
             selected_tunnel: 0,
             tunnel_statuses: metadata
                 .tunnels
@@ -501,6 +533,8 @@ impl App {
             mutation_hosts: std::collections::HashMap::new(),
             tunnel_sender,
             tunnel_receiver,
+            runtime_sender,
+            runtime_receiver,
             tunnel_processes: std::collections::HashMap::new(),
             snippet_processes: std::collections::HashMap::new(),
             next_snippet_run_id: 1,
@@ -1608,6 +1642,202 @@ impl App {
         }
     }
 
+    pub fn poll_runtime(&mut self) {
+        while let Ok(event) = self.runtime_receiver.try_recv() {
+            match event {
+                RuntimeEvent::Listed { target, entries } => {
+                    if target == self.runtime_target {
+                        self.runtime_entries = entries;
+                        self.selected_runtime = self
+                            .selected_runtime
+                            .min(self.visible_runtime_entries().len().saturating_sub(1));
+                        self.runtime_loading = false;
+                        self.runtime_error = None;
+                    }
+                }
+                RuntimeEvent::Failed { target, message } => {
+                    if target == self.runtime_target {
+                        self.runtime_loading = false;
+                        self.runtime_error = Some(message.clone());
+                        self.notice = Some(format!("Runtime inspection failed: {message}"));
+                    }
+                }
+                RuntimeEvent::ActionCompleted { target, message } => {
+                    if target == self.runtime_target {
+                        self.notice = Some(message);
+                        self.refresh_runtime();
+                    }
+                }
+                RuntimeEvent::ActionFailed { target, message } => {
+                    if target == self.runtime_target {
+                        self.notice = Some(format!("Could not terminate process: {message}"));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn refresh_runtime(&mut self) {
+        self.runtime_loading = true;
+        self.runtime_error = None;
+        runtime::inspect_async(self.runtime_sender.clone(), self.runtime_target.clone());
+    }
+
+    pub fn visible_runtime_entries(&self) -> Vec<&RuntimeEntry> {
+        self.runtime_entries
+            .iter()
+            .filter(|entry| self.runtime_filter.matches(entry))
+            .collect()
+    }
+
+    pub fn selected_runtime_entry(&self) -> Option<&RuntimeEntry> {
+        self.visible_runtime_entries()
+            .get(self.selected_runtime)
+            .copied()
+    }
+
+    pub(crate) fn runtime_host_picker_items_for_ui(&self) -> Vec<HostPickerItem> {
+        if let Some(group) = &self.runtime_host_picker_group {
+            return self
+                .hosts
+                .hosts
+                .iter()
+                .filter(|host| self.matches_group(host, group))
+                .map(|host| HostPickerItem::Host(host.alias.clone()))
+                .collect();
+        }
+        self.visible_groups()
+            .into_iter()
+            .map(HostPickerItem::Group)
+            .chain(
+                self.hosts
+                    .hosts
+                    .iter()
+                    .map(|host| HostPickerItem::Host(host.alias.clone())),
+            )
+            .collect()
+    }
+
+    fn handle_runtime_host_picker_key(&mut self, key: KeyCode) {
+        let items = self.runtime_host_picker_items_for_ui();
+        match key {
+            KeyCode::Esc => self.runtime_host_picker_open = false,
+            KeyCode::Backspace => {
+                if self.runtime_host_picker_group.is_some() {
+                    self.runtime_host_picker_group = None;
+                    self.runtime_host_picker_selection = 0;
+                } else {
+                    self.runtime_host_picker_open = false;
+                }
+            }
+            KeyCode::Up => {
+                self.runtime_host_picker_selection =
+                    self.runtime_host_picker_selection.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.runtime_host_picker_selection =
+                    (self.runtime_host_picker_selection + 1).min(items.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let Some(item) = items.get(self.runtime_host_picker_selection).cloned() else {
+                    return;
+                };
+                match item {
+                    HostPickerItem::Group(group) => {
+                        self.runtime_host_picker_group = Some(group);
+                        self.runtime_host_picker_selection = 0;
+                    }
+                    HostPickerItem::Host(alias) => {
+                        self.runtime_target = RuntimeTarget::Host(alias);
+                        self.runtime_host_picker_open = false;
+                        self.runtime_host_picker_group = None;
+                        self.selected_runtime = 0;
+                        self.refresh_runtime();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_runtime_key(&mut self, key: KeyCode) {
+        if self.runtime_kill_confirmation.is_some() {
+            match key {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let Some(entry) = self.runtime_kill_confirmation.take() else {
+                        return;
+                    };
+                    let Some(pid) = entry.pid else {
+                        self.notice = Some("The selected entry has no visible PID.".to_string());
+                        return;
+                    };
+                    runtime::terminate_async(
+                        self.runtime_sender.clone(),
+                        self.runtime_target.clone(),
+                        pid,
+                        entry.process,
+                    );
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.runtime_kill_confirmation = None,
+                _ => {}
+            }
+            return;
+        }
+        if self.runtime_host_picker_open {
+            self.handle_runtime_host_picker_key(key);
+            return;
+        }
+        match key {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Tab => self.next_section(),
+            KeyCode::BackTab => self.previous_section(),
+            KeyCode::Char('`') => self.switch_section(self.previous_section),
+            KeyCode::Up => {
+                self.selected_runtime = self.selected_runtime.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.selected_runtime = (self.selected_runtime + 1)
+                    .min(self.visible_runtime_entries().len().saturating_sub(1));
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let index = RuntimeFilter::ALL
+                    .iter()
+                    .position(|filter| *filter == self.runtime_filter)
+                    .unwrap_or(0);
+                let next = if key == KeyCode::Right {
+                    (index + 1) % RuntimeFilter::ALL.len()
+                } else {
+                    (index + RuntimeFilter::ALL.len() - 1) % RuntimeFilter::ALL.len()
+                };
+                self.runtime_filter = RuntimeFilter::ALL[next];
+                self.selected_runtime = 0;
+            }
+            KeyCode::Char('r') => self.refresh_runtime(),
+            KeyCode::Char('l') => {
+                self.runtime_target = RuntimeTarget::Local;
+                self.selected_runtime = 0;
+                self.refresh_runtime();
+            }
+            KeyCode::Char('s') => {
+                self.runtime_host_picker_open = true;
+                self.runtime_host_picker_group = None;
+                self.runtime_host_picker_selection = 0;
+            }
+            KeyCode::Char('k') => {
+                if !self.runtime_loading
+                    && self.runtime_error.is_none()
+                    && let Some(entry) = self.selected_runtime_entry()
+                    && entry.pid.is_some()
+                {
+                    self.runtime_kill_confirmation = Some(entry.clone());
+                } else {
+                    self.notice = Some("The selected entry has no visible PID.".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn start_selected_tunnel(&mut self) {
         let Some(tunnel) = self.selected_tunnel_definition().cloned() else {
             self.notice = Some("Select a tunnel first.".to_string());
@@ -2378,12 +2608,14 @@ impl App {
             || self.package_dialog.is_some()
             || self.snippet_confirmation.is_some()
             || self.snippet_delete_confirmation.is_some()
+            || self.runtime_host_picker_open
+            || self.runtime_kill_confirmation.is_some()
             || self.tags_dialog.is_some()
             || self.connection_dialog.is_some()
             || self.file_dialog.is_some();
         if !modal {
             match (key.code, key.modifiers) {
-                (KeyCode::F(number @ 1..=4), KeyModifiers::NONE) => {
+                (KeyCode::F(number @ 1..=5), KeyModifiers::NONE) => {
                     self.switch_section(NavSection::ALL[usize::from(number - 1)]);
                     return InputAction::None;
                 }
@@ -2415,6 +2647,8 @@ impl App {
             return self.handle_snippet_confirmation_key(key.code);
         } else if self.snippet_delete_confirmation.is_some() {
             self.handle_snippet_delete_key(key.code);
+        } else if self.runtime_host_picker_open || self.runtime_kill_confirmation.is_some() {
+            self.handle_runtime_key(key.code);
         } else if modal {
             self.handle_key(key.code);
         } else if self.section == NavSection::Hosts && key.code == KeyCode::Enter {
@@ -2430,6 +2664,8 @@ impl App {
             return self.handle_files_key(key.code);
         } else if self.section == NavSection::Snippets {
             return self.handle_snippets_key(key.code);
+        } else if self.section == NavSection::Runtime {
+            self.handle_runtime_key(key.code);
         } else {
             self.handle_key(key.code);
         }
@@ -2451,6 +2687,9 @@ impl App {
             self.section = section;
             self.searching = false;
             self.file_filtering = false;
+            if section == NavSection::Runtime && self.runtime_entries.is_empty() {
+                self.refresh_runtime();
+            }
         }
     }
 
@@ -2482,6 +2721,10 @@ impl App {
         }
         if self.host_dialog.is_some() {
             self.handle_host_dialog_key(key);
+            return;
+        }
+        if self.section == NavSection::Runtime {
+            self.handle_runtime_key(key);
             return;
         }
         if self.section == NavSection::Tunnels {
@@ -2624,6 +2867,7 @@ impl App {
             KeyCode::Char('2') | KeyCode::Char('f') => self.switch_section(NavSection::Files),
             KeyCode::Char('3') | KeyCode::Char('t') => self.switch_section(NavSection::Tunnels),
             KeyCode::Char('4') | KeyCode::Char('s') => self.switch_section(NavSection::Snippets),
+            KeyCode::Char('5') | KeyCode::Char('p') => self.switch_section(NavSection::Runtime),
             _ => {}
         }
     }
@@ -3922,13 +4166,62 @@ mod tests {
                 managed: false,
             },
         ];
-        app.section = NavSection::Snippets;
+        app.section = NavSection::Runtime;
         app.handle_key(KeyCode::Tab);
         assert_eq!(app.section, NavSection::Hosts);
         app.handle_key(KeyCode::Down);
         app.handle_key(KeyCode::Down);
         assert_eq!(app.selected_browse_item, 2);
         assert_eq!(app.selected_host().unwrap().alias, "two");
+    }
+
+    #[test]
+    fn runtime_enter_stays_on_listener_and_s_opens_host_picker() {
+        let mut app = app_fixture();
+        app.section = NavSection::Runtime;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.runtime_host_picker_open);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(app.runtime_host_picker_open);
+    }
+
+    #[test]
+    fn runtime_categories_keep_selection_and_termination_on_visible_entries() {
+        use crate::runtime::RuntimeProcessKind;
+        let mut app = app_fixture();
+        app.section = NavSection::Runtime;
+        let own = RuntimeEntry {
+            protocol: "TCP".into(),
+            address: "127.0.0.1".into(),
+            port: 3000,
+            pid: Some(123),
+            process: "node".into(),
+            user: "501".into(),
+            command: "node server.js".into(),
+            working_directory: Some("/tmp/project".into()),
+            owned_by_current_user: true,
+            kind: RuntimeProcessKind::Application,
+            origin: crate::runtime::RuntimeOrigin::CommandLine,
+            origin_reason: "Shell ancestor".into(),
+        };
+        let mut system = own.clone();
+        system.pid = Some(456);
+        system.kind = RuntimeProcessKind::System;
+        system.owned_by_current_user = false;
+        app.runtime_entries = vec![system.clone(), own.clone()];
+        assert_eq!(app.selected_runtime_entry(), Some(&own));
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.runtime_kill_confirmation, Some(own));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.runtime_filter, RuntimeFilter::Applications);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.selected_runtime_entry(), Some(&system));
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.visible_runtime_entries().len(), 2);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.runtime_filter, RuntimeFilter::Mine);
+        assert_eq!(app.selected_runtime, 0);
     }
 
     #[test]
@@ -4068,7 +4361,7 @@ mod tests {
         let mut app = app_fixture();
         for section in NavSection::ALL {
             app.section = section;
-            for number in 1..=4 {
+            for number in 1..=5 {
                 assert_eq!(
                     press(&mut app, KeyCode::F(number), KeyModifiers::NONE),
                     InputAction::None
@@ -4084,11 +4377,11 @@ mod tests {
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(app.section, NavSection::Hosts);
             press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
-            assert_eq!(app.section, NavSection::Snippets);
+            assert_eq!(app.section, NavSection::Runtime);
             press(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
             assert_eq!(app.section, NavSection::Hosts);
             press(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
-            assert_eq!(app.section, NavSection::Snippets);
+            assert_eq!(app.section, NavSection::Runtime);
         }
     }
 

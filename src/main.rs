@@ -1,6 +1,7 @@
 mod app;
 mod hosts;
 mod metadata;
+mod runtime;
 mod sftp;
 mod tunnel;
 mod ui;
@@ -42,6 +43,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         app.poll_mutations();
         app.poll_tunnels();
         app.poll_snippet_runs();
+        app.poll_runtime();
         app.viewport_width = terminal.size()?.width;
         terminal.draw(|frame| ui::render(frame, &app))?;
 
