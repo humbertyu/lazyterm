@@ -1,12 +1,13 @@
 use crossterm::event::KeyCode;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     app::{App, NavSection},
     project_monitor::{ExternalRun, ProjectMonitor, stop_external_async},
     projects::{
-        CommandKind, ProjectCommand, ProjectDefinition, ProjectTarget, TaskKey, execution_target,
-        working_directory,
+        CommandKind, ProjectCommand, ProjectDefinition, ProjectLifecycle, ProjectLink,
+        ProjectTarget, TaskKey, execution_target, working_directory,
     },
 };
 
@@ -16,6 +17,7 @@ pub struct WorkspaceState {
     pub selected_command: usize,
     pub selected_item: usize,
     collapsed_groups: std::collections::HashSet<(u64, String)>,
+    collapsed_links: std::collections::HashSet<u64>,
     pub flat: bool,
     pub project_open: bool,
     pub output_open: bool,
@@ -26,6 +28,9 @@ pub struct WorkspaceState {
     pub confirmation: Option<ExternalConfirmation>,
     pending: Option<PendingAction>,
     stopping: Option<ExternalStop>,
+    opening_link: Option<Receiver<Result<(), String>>>,
+    saving_password: Option<Receiver<Result<crate::project_credentials::PreparedPassword, String>>>,
+    credential_jobs: Vec<Receiver<Result<String, String>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +66,7 @@ pub struct WorkspaceForm {
     pub selected: usize,
     pub error: Option<String>,
     pub group_form: bool,
+    pub link_form: bool,
     pub original_group: Option<String>,
 }
 
@@ -68,6 +74,14 @@ impl WorkspaceForm {
     pub fn labels(&self) -> &[&str] {
         if self.group_form {
             &["Group name"]
+        } else if self.link_form {
+            &[
+                "Link name",
+                "URL",
+                "Username (optional)",
+                "Password (blank keeps saved)",
+                "Remove saved password",
+            ]
         } else if self.project_id.is_some() {
             &[
                 "Name",
@@ -76,6 +90,7 @@ impl WorkspaceForm {
                 "Group (optional)",
                 "Type",
                 "Target",
+                "On exit",
             ]
         } else {
             &["Project name", "Base directory", "Default target"]
@@ -83,16 +98,42 @@ impl WorkspaceForm {
     }
 }
 
+impl Drop for WorkspaceForm {
+    fn drop(&mut self) {
+        if self.link_form
+            && let Some(password) = self.fields.get_mut(3)
+        {
+            password.zeroize();
+        }
+    }
+}
+
 pub enum WorkspaceDelete {
-    Project { id: u64, name: String },
-    Command { key: TaskKey, name: String },
-    Group { project_id: u64, name: String },
+    Project {
+        id: u64,
+        name: String,
+    },
+    Command {
+        key: TaskKey,
+        name: String,
+    },
+    Group {
+        project_id: u64,
+        name: String,
+    },
+    Link {
+        project_id: u64,
+        id: u64,
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceItem {
+    Links,
     Group(String),
     Command(usize),
+    Link(usize),
 }
 
 impl App {
@@ -117,12 +158,19 @@ impl App {
         let Some(project) = self.selected_project() else {
             return Vec::new();
         };
-        if self.workspace.flat {
-            return (0..project.commands.len())
-                .map(WorkspaceItem::Command)
-                .collect();
-        }
         let mut items = Vec::new();
+        if !project.links.is_empty() {
+            if !self.workspace.flat {
+                items.push(WorkspaceItem::Links);
+            }
+            if self.workspace.flat || !self.project_links_collapsed() {
+                items.extend((0..project.links.len()).map(WorkspaceItem::Link));
+            }
+        }
+        if self.workspace.flat {
+            items.extend((0..project.commands.len()).map(WorkspaceItem::Command));
+            return items;
+        }
         for group in self.project_groups() {
             items.push(WorkspaceItem::Group(group.clone()));
             if !self.project_group_collapsed(&group) {
@@ -155,6 +203,30 @@ impl App {
         })
     }
 
+    pub fn project_links_collapsed(&self) -> bool {
+        self.selected_project()
+            .is_some_and(|project| self.workspace.collapsed_links.contains(&project.id))
+    }
+
+    pub fn project_links_header_selected(&self) -> bool {
+        self.workspace.project_open
+            && !self.workspace.output_open
+            && self.project_items().get(self.workspace.selected_item) == Some(&WorkspaceItem::Links)
+    }
+
+    fn toggle_project_links(&mut self, key: KeyCode) {
+        let Some(project) = self.selected_project() else {
+            return;
+        };
+        let id = project.id;
+        if key == KeyCode::Right {
+            self.workspace.collapsed_links.remove(&id);
+        } else if key == KeyCode::Left || !self.workspace.collapsed_links.remove(&id) {
+            self.workspace.collapsed_links.insert(id);
+        }
+        self.workspace.selected_item = 0;
+    }
+
     fn set_project_group_expanded(&mut self, group: &str, expanded: bool) {
         let Some(project) = self.selected_project() else {
             return;
@@ -179,6 +251,16 @@ impl App {
     }
 
     fn handle_project_group_key(&mut self, key: KeyCode) {
+        if self.project_links_header_selected() {
+            self.toggle_project_links(key);
+            return;
+        }
+        if self.selected_project_link().is_some() {
+            if key == KeyCode::Left {
+                self.workspace.selected_item = 0;
+            }
+            return;
+        }
         let Some(group) = self.selected_project_group() else {
             return;
         };
@@ -215,6 +297,9 @@ impl App {
     }
 
     fn project_service_keys(&self) -> Vec<TaskKey> {
+        if self.selected_project_link().is_some() || self.project_links_header_selected() {
+            return Vec::new();
+        }
         let Some(project) = self.selected_project() else {
             return Vec::new();
         };
@@ -257,7 +342,90 @@ impl App {
             .refresh(&self.metadata.projects, self.project_service.owners());
     }
 
+    fn poll_project_credentials(&mut self) {
+        if let Some(receiver) = &self.workspace.saving_password {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("Keychain worker stopped.".into())),
+            };
+            if let Some(result) = result {
+                self.workspace.saving_password = None;
+                if let Some(mut form) = self.workspace.form.take() {
+                    let result = result.and_then(|mut prepared| {
+                        self.save_workspace_form(&form, Some(&prepared.reference))?;
+                        prepared.commit();
+                        Ok(())
+                    });
+                    if let Err(error) = result {
+                        form.error = Some(format!("{error} Re-enter the new password to retry."));
+                        self.workspace.form = Some(form);
+                    }
+                }
+            }
+        }
+        self.workspace
+            .credential_jobs
+            .retain(|receiver| match receiver.try_recv() {
+                Ok(Ok(message)) => {
+                    if !message.is_empty() {
+                        self.notice = Some(message);
+                    }
+                    false
+                }
+                Ok(Err(error)) => {
+                    self.notice = Some(error);
+                    false
+                }
+                Err(TryRecvError::Empty) => true,
+                Err(TryRecvError::Disconnected) => {
+                    self.notice = Some("Account worker stopped.".into());
+                    false
+                }
+            });
+    }
+
+    fn cleanup_link_passwords(&mut self, previous: &[ProjectDefinition]) {
+        let used: std::collections::HashSet<_> = self
+            .metadata
+            .projects
+            .iter()
+            .flat_map(|project| &project.links)
+            .filter_map(|link| link.password_ref.as_ref())
+            .collect();
+        let unused: std::collections::HashSet<_> = previous
+            .iter()
+            .flat_map(|project| &project.links)
+            .filter_map(|link| link.password_ref.as_ref())
+            .filter(|reference| !used.contains(reference))
+            .cloned()
+            .collect();
+        if !unused.is_empty() {
+            self.workspace
+                .credential_jobs
+                .push(crate::project_credentials::remove_unused(
+                    unused.into_iter().collect(),
+                ));
+        }
+    }
+
     pub fn poll_projects(&mut self) {
+        self.poll_project_credentials();
+        self.project_service.restore(&self.metadata.projects);
+        if let Some(receiver) = &self.workspace.opening_link {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("Browser worker disconnected.".into())),
+            };
+            if let Some(result) = result {
+                self.workspace.opening_link = None;
+                self.notice = Some(match result {
+                    Ok(()) => "Opened project link in browser.".into(),
+                    Err(error) => format!("Could not open project link: {error}"),
+                });
+            }
+        }
         self.project_service.poll();
         if self
             .workspace
@@ -476,6 +644,17 @@ impl App {
         self.metadata.projects.get(self.workspace.selected_project)
     }
 
+    pub fn selected_project_link(&self) -> Option<&ProjectLink> {
+        if !self.workspace.project_open || self.workspace.output_open {
+            return None;
+        }
+        let WorkspaceItem::Link(index) = *self.project_items().get(self.workspace.selected_item)?
+        else {
+            return None;
+        };
+        self.selected_project()?.links.get(index)
+    }
+
     pub fn selected_project_command(&self) -> Option<&ProjectCommand> {
         if self.workspace.project_open && !self.workspace.output_open {
             let WorkspaceItem::Command(index) =
@@ -582,6 +761,7 @@ impl App {
             KeyCode::Enter => {
                 if self.workspace.project_open {
                     match self.project_items().get(self.workspace.selected_item) {
+                        Some(WorkspaceItem::Links) => self.toggle_project_links(KeyCode::Enter),
                         Some(WorkspaceItem::Group(group)) => {
                             let group = group.clone();
                             self.set_project_group_expanded(
@@ -594,6 +774,16 @@ impl App {
                             self.workspace.output_open = true;
                             self.workspace.output_scroll = None;
                         }
+                        Some(WorkspaceItem::Link(_)) => {
+                            if self.workspace.opening_link.is_some() {
+                                self.notice =
+                                    Some("A browser request is already in progress.".into());
+                            } else if let Some(link) = self.selected_project_link() {
+                                self.workspace.opening_link =
+                                    Some(crate::projects::open_link_async(link.url.clone()));
+                                self.notice = Some("Opening project link...".into());
+                            }
+                        }
                         None => {}
                     }
                 } else if self.selected_project().is_some() {
@@ -604,6 +794,30 @@ impl App {
                 }
             }
             KeyCode::Char('a') => self.open_workspace_form(false),
+            KeyCode::Char('L') if self.workspace.project_open && !self.workspace.output_open => {
+                self.open_link_form(false)
+            }
+            KeyCode::Char('u') if self.selected_project_link().is_some() => {
+                let username = self.selected_project_link().unwrap().username.clone();
+                if username.is_empty() {
+                    self.notice = Some("No username saved for this link.".into());
+                } else {
+                    self.workspace
+                        .credential_jobs
+                        .push(crate::project_credentials::copy_username(username));
+                }
+            }
+            KeyCode::Char('p') if self.selected_project_link().is_some() => {
+                if let Some(reference) = self.selected_project_link().unwrap().password_ref.clone()
+                {
+                    self.workspace
+                        .credential_jobs
+                        .push(crate::project_credentials::copy_password(reference));
+                    self.notice = Some("Reading password from system keychain...".into());
+                } else {
+                    self.notice = Some("No password saved for this link.".into());
+                }
+            }
             KeyCode::Char('G') if self.workspace.project_open && !self.workspace.output_open => {
                 self.open_group_form(None)
             }
@@ -675,6 +889,10 @@ impl App {
     }
 
     fn open_workspace_form(&mut self, editing: bool) {
+        if editing && self.selected_project_link().is_some() {
+            self.open_link_form(true);
+            return;
+        }
         if editing
             && self.workspace.project_open
             && !self.workspace.output_open
@@ -715,6 +933,7 @@ impl App {
                             new_group,
                             "Task".into(),
                             "Inherit".into(),
+                            ProjectLifecycle::App.label().into(),
                         ]
                     },
                     |command| {
@@ -729,12 +948,14 @@ impl App {
                             command
                                 .target
                                 .map_or_else(|| "Inherit".into(), |target| target.label()),
+                            command.lifecycle.label().into(),
                         ]
                     },
                 ),
                 selected: 0,
                 error: None,
                 group_form: false,
+                link_form: false,
                 original_group: None,
             }
         } else {
@@ -778,6 +999,7 @@ impl App {
                 selected: 0,
                 error: None,
                 group_form: false,
+                link_form: false,
                 original_group: None,
             }
         };
@@ -795,11 +1017,63 @@ impl App {
             selected: 0,
             error: None,
             group_form: true,
+            link_form: false,
             original_group,
         });
     }
 
+    fn open_link_form(&mut self, editing: bool) {
+        let Some(project) = self.selected_project() else {
+            return;
+        };
+        let link = editing.then(|| self.selected_project_link()).flatten();
+        if editing && link.is_none() {
+            return;
+        }
+        self.workspace.form = Some(WorkspaceForm {
+            project_id: Some(project.id),
+            editing_id: link.map(|link| link.id),
+            fields: link.map_or_else(
+                || {
+                    vec![
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        "No".into(),
+                    ]
+                },
+                |link| {
+                    vec![
+                        link.name.clone(),
+                        link.url.clone(),
+                        link.username.clone(),
+                        String::new(),
+                        "No".into(),
+                    ]
+                },
+            ),
+            selected: 0,
+            error: None,
+            group_form: false,
+            link_form: true,
+            original_group: None,
+        });
+    }
+
     fn request_workspace_delete(&mut self) {
+        if self.project_links_header_selected() {
+            self.notice = Some("Select a web link to delete.".into());
+            return;
+        }
+        if let Some(link) = self.selected_project_link() {
+            self.workspace.delete = Some(WorkspaceDelete::Link {
+                project_id: self.selected_project().expect("project").id,
+                id: link.id,
+                name: link.name.clone(),
+            });
+            return;
+        }
         if self.workspace.project_open {
             if !self.workspace.output_open
                 && let Some(WorkspaceItem::Group(group)) =
@@ -841,6 +1115,13 @@ impl App {
     }
 
     pub fn handle_workspace_dialog(&mut self, key: KeyCode) {
+        if self.workspace.saving_password.is_some() {
+            if key == KeyCode::Esc {
+                self.workspace.saving_password = None;
+                self.workspace.form = None;
+            }
+            return;
+        }
         if self.workspace.confirmation.is_some() {
             match key {
                 KeyCode::Char('y') | KeyCode::Enter => {
@@ -871,6 +1152,16 @@ impl App {
                                 project.commands.retain(|command| command.id != key.1);
                             }
                         }
+                        WorkspaceDelete::Link { project_id, id, .. } => {
+                            if let Some(project) = self
+                                .metadata
+                                .projects
+                                .iter_mut()
+                                .find(|project| project.id == *project_id)
+                            {
+                                project.links.retain(|link| link.id != *id);
+                            }
+                        }
                         WorkspaceDelete::Group { project_id, name } => {
                             if let Some(project) = self
                                 .metadata
@@ -891,11 +1182,26 @@ impl App {
                         self.metadata.projects = previous;
                         return;
                     }
+                    self.cleanup_link_passwords(&previous);
                     match target {
                         WorkspaceDelete::Project { id, .. } => {
+                            if let Some(project) = previous.iter().find(|project| project.id == id)
+                            {
+                                for command in &project.commands {
+                                    if let Err(error) = self
+                                        .project_service
+                                        .forget_persistent_record((id, command.id))
+                                    {
+                                        self.notice = Some(format!(
+                                            "Definition deleted; background record retained: {error}"
+                                        ));
+                                    }
+                                }
+                            }
                             self.workspace
                                 .collapsed_groups
                                 .retain(|(project_id, _)| *project_id != id);
+                            self.workspace.collapsed_links.remove(&id);
                             self.project_service
                                 .tasks
                                 .retain(|(project_id, _), _| *project_id != id);
@@ -905,6 +1211,11 @@ impl App {
                                 .min(self.metadata.projects.len().saturating_sub(1));
                         }
                         WorkspaceDelete::Command { key, .. } => {
+                            if let Err(error) = self.project_service.forget_persistent_record(key) {
+                                self.notice = Some(format!(
+                                    "Definition deleted; background record retained: {error}"
+                                ));
+                            }
                             self.project_service.tasks.remove(&key);
                             let count = self
                                 .selected_project()
@@ -917,6 +1228,7 @@ impl App {
                             self.workspace.collapsed_groups.remove(&(project_id, name));
                             self.workspace.selected_item = 0;
                         }
+                        WorkspaceDelete::Link { .. } => {}
                     }
                     self.sync_project_selection();
                 }
@@ -928,11 +1240,22 @@ impl App {
         let Some(form) = self.workspace.form.as_ref() else {
             return;
         };
-        let type_field = !form.group_form && form.project_id.is_some() && form.selected == 4;
-        let target_field =
-            !form.group_form && form.selected == if form.project_id.is_some() { 5 } else { 2 };
-        let choices = if type_field {
+        let type_field =
+            !form.group_form && !form.link_form && form.project_id.is_some() && form.selected == 4;
+        let target_field = !form.group_form
+            && !form.link_form
+            && form.selected == if form.project_id.is_some() { 5 } else { 2 };
+        let lifecycle_field =
+            !form.group_form && !form.link_form && form.project_id.is_some() && form.selected == 6;
+        let choices = if form.link_form && form.selected == 4 {
+            vec!["No".into(), "Yes".into()]
+        } else if type_field {
             vec!["Task".to_string(), "Service".into()]
+        } else if lifecycle_field {
+            vec![
+                ProjectLifecycle::App.label().into(),
+                ProjectLifecycle::Persistent.label().into(),
+            ]
         } else if target_field {
             let mut choices = vec!["Local".to_string()];
             if form.project_id.is_some() {
@@ -975,10 +1298,35 @@ impl App {
             KeyCode::Char(value) if !value.is_control() && choices.is_empty() => {
                 form.fields[form.selected].push(value)
             }
-            KeyCode::Enter if form.selected + 1 < form.fields.len() => form.selected += 1,
+            KeyCode::Enter if !form.link_form && form.selected + 1 < form.fields.len() => {
+                form.selected += 1
+            }
             KeyCode::Enter => {
                 let mut form = self.workspace.form.take().expect("checked");
-                if let Err(error) = self.save_workspace_form(&form) {
+                if form.link_form && !form.fields.get(3).is_none_or(String::is_empty) {
+                    let validation = crate::projects::validate_link_url(form.fields[1].trim())
+                        .and_then(|()| {
+                            if form.fields[0].trim().is_empty() {
+                                Err("Name is required.".into())
+                            } else if form.fields.get(4).is_some_and(|value| value == "Yes") {
+                                Err("Choose either a new password or removal.".into())
+                            } else {
+                                Ok(())
+                            }
+                        });
+                    if let Err(error) = validation {
+                        form.error = Some(error);
+                    } else {
+                        let password = Zeroizing::new(std::mem::take(&mut form.fields[3]));
+                        self.workspace.saving_password =
+                            Some(crate::project_credentials::prepare(password));
+                        form.error = None;
+                        self.notice = Some("Saving password to system keychain...".into());
+                    }
+                    self.workspace.form = Some(form);
+                    return;
+                }
+                if let Err(error) = self.save_workspace_form(&form, None) {
                     form.error = Some(error);
                     self.workspace.form = Some(form);
                 }
@@ -987,13 +1335,55 @@ impl App {
         }
     }
 
-    fn save_workspace_form(&mut self, form: &WorkspaceForm) -> Result<(), String> {
+    fn save_workspace_form(
+        &mut self,
+        form: &WorkspaceForm,
+        password_reference: Option<&str>,
+    ) -> Result<(), String> {
         let previous = self.metadata.projects.clone();
         let name = form.fields[0].trim().to_string();
         if name.is_empty() {
             return Err("Name is required.".into());
         }
-        if form.group_form {
+        if form.link_form {
+            let value = form.fields[1].trim().to_string();
+            crate::projects::validate_link_url(&value)?;
+            let project = self
+                .metadata
+                .projects
+                .iter_mut()
+                .find(|project| Some(project.id) == form.project_id)
+                .ok_or("Project no longer exists.")?;
+            let link = ProjectLink {
+                id: form.editing_id.unwrap_or_else(|| {
+                    project.links.iter().map(|link| link.id).max().unwrap_or(0) + 1
+                }),
+                name: name.clone(),
+                url: value,
+                username: form.fields.get(2).map_or("", String::as_str).trim().into(),
+                password_ref: if form.fields.get(4).is_some_and(|value| value == "Yes") {
+                    None
+                } else {
+                    password_reference.map(str::to_string).or_else(|| {
+                        project
+                            .links
+                            .iter()
+                            .find(|link| Some(link.id) == form.editing_id)
+                            .and_then(|link| link.password_ref.clone())
+                    })
+                },
+            };
+            if let Some(id) = form.editing_id {
+                let existing = project
+                    .links
+                    .iter_mut()
+                    .find(|link| link.id == id)
+                    .ok_or("Link no longer exists.")?;
+                *existing = link;
+            } else {
+                project.links.push(link);
+            }
+        } else if form.group_form {
             let project = self
                 .metadata
                 .projects
@@ -1052,6 +1442,16 @@ impl App {
                     _ => return Err("Select Service or Task.".into()),
                 },
                 target,
+                lifecycle: match form
+                    .fields
+                    .get(6)
+                    .map(String::as_str)
+                    .unwrap_or("Stop on exit")
+                {
+                    "Stop on exit" => ProjectLifecycle::App,
+                    "Keep running" => ProjectLifecycle::Persistent,
+                    _ => return Err("Select Stop on exit or Keep running.".into()),
+                },
             };
             if command.command.is_empty() {
                 return Err("Command is required.".into());
@@ -1103,6 +1503,15 @@ impl App {
                     .and_then(|id| self.metadata.projects.iter().find(|p| p.id == id))
                     .map_or_else(Vec::new, |project| project.groups.clone()),
                 target,
+                links: form
+                    .editing_id
+                    .and_then(|id| {
+                        self.metadata
+                            .projects
+                            .iter()
+                            .find(|project| project.id == id)
+                    })
+                    .map_or_else(Vec::new, |project| project.links.clone()),
             };
             if project.target == ProjectTarget::Local {
                 working_directory(&project, &ProjectCommand::default())
@@ -1138,8 +1547,27 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| "Could not save project.".into()));
         }
+        self.cleanup_link_passwords(&previous);
         self.notice = Some("Saved project definition.".into());
-        if form.group_form {
+        if form.link_form {
+            if let Some(project_id) = form.project_id {
+                self.workspace.collapsed_links.remove(&project_id);
+            }
+            let index = self
+                .selected_project()
+                .and_then(|project| {
+                    project.links.iter().rposition(|link| {
+                        form.editing_id
+                            .map_or(link.name == name, |id| link.id == id)
+                    })
+                })
+                .unwrap_or(0);
+            self.workspace.selected_item = self
+                .project_items()
+                .iter()
+                .position(|item| *item == WorkspaceItem::Link(index))
+                .unwrap_or(0);
+        } else if form.group_form {
             self.workspace.flat = false;
             if let Some(project_id) = form.project_id
                 && let Some(old) = &form.original_group
@@ -1316,7 +1744,7 @@ mod tests {
         let form = app.workspace.form.as_mut().unwrap();
         assert_eq!(form.fields[3], "Checks");
         form.fields[3] = "Diagnostics".into();
-        form.selected = 5;
+        form.selected = 6;
         app.handle_workspace_dialog(KeyCode::Enter);
         assert!(app.workspace.form.is_none());
         assert_eq!(app.selected_project_key(), Some((fixture.project.id, 2)));
@@ -1458,10 +1886,658 @@ mod tests {
         )
         .unwrap();
         assert!(project.groups.is_empty());
+        assert!(project.links.is_empty());
         assert_eq!(project.target, ProjectTarget::Local);
         assert_eq!(project.commands[0].kind, CommandKind::Task);
         assert!(project.commands[0].group.is_none());
         assert!(project.commands[0].target.is_none());
+        assert_eq!(project.commands[0].lifecycle, ProjectLifecycle::App);
+    }
+
+    #[test]
+    fn command_exit_policy_uses_choices_and_persists_without_starting() {
+        let fixture = Fixture::new("lifecycle-form");
+        let mut app = grouped_app(&fixture);
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Down);
+        app.handle_projects_key(KeyCode::Char('e'));
+        let form = app.workspace.form.as_mut().unwrap();
+        assert_eq!(form.fields[6], "Stop on exit");
+        form.selected = 6;
+        app.handle_workspace_dialog(KeyCode::Right);
+        assert_eq!(
+            app.workspace.form.as_ref().unwrap().fields[6],
+            "Keep running"
+        );
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.workspace.form.is_none());
+        assert_eq!(
+            app.selected_project_command().unwrap().lifecycle,
+            ProjectLifecycle::Persistent
+        );
+        assert!(app.project_service.tasks.is_empty());
+        let restored: Metadata = serde_json::from_slice(
+            &std::fs::read(app.metadata_save_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.projects[0].commands[0].lifecycle,
+            ProjectLifecycle::Persistent
+        );
+        app.handle_projects_key(KeyCode::Char('e'));
+        app.workspace.form.as_mut().unwrap().selected = 6;
+        app.handle_workspace_dialog(KeyCode::Left);
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert_eq!(
+            app.selected_project_command().unwrap().lifecycle,
+            ProjectLifecycle::App
+        );
+    }
+
+    #[test]
+    fn deleting_a_command_cleans_its_background_index_only_after_metadata_saves() {
+        use crate::projects::tests::{PersistentCleanup, until};
+        let fixture = Fixture::new("persistent-delete");
+        let mut app = grouped_app(&fixture);
+        let mut command = fixture.command("printf 'saved output\\n'");
+        command.id = 1;
+        command.group = Some("Services".into());
+        command.lifecycle = ProjectLifecycle::Persistent;
+        let key = (fixture.project.id, command.id);
+        let _cleanup = PersistentCleanup::new(&fixture, key);
+        app.metadata.projects[0].commands[0] = command.clone();
+        app.project_service
+            .start(&app.metadata.projects[0], &command)
+            .unwrap();
+        until(&mut app.project_service, |service| !service.active(key));
+        let log = app.project_service.tasks[&key].stdout_log.clone();
+        let record = fixture
+            .root
+            .join(format!("logs/persistent-{}-{}.json", key.0, key.1));
+        let blocked = fixture.root.join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        app.metadata_save_path = Some(blocked.join("hosts.json"));
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Down);
+        app.handle_projects_key(KeyCode::Char('d'));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(record.is_file());
+        assert_eq!(app.metadata.projects[0].commands.len(), 3);
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        app.handle_projects_key(KeyCode::Char('d'));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(!record.exists());
+        assert_eq!(app.metadata.projects[0].commands.len(), 2);
+        assert!(log.is_file());
+    }
+
+    #[test]
+    fn link_credentials_save_keep_replace_remove_and_rollback() {
+        use crate::project_credentials::tests::password_exists;
+        fn finish(app: &mut App) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while app.workspace.saving_password.is_some()
+                || !app.workspace.credential_jobs.is_empty()
+            {
+                app.poll_project_credentials();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let fixture = Fixture::new("link-credentials");
+        let mut app = grouped_app(&fixture);
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Char('L'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec![
+            "Preview".into(),
+            "http://localhost:3000".into(),
+            "admin".into(),
+            "first secret".into(),
+            "No".into(),
+        ];
+        form.selected = 4;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.workspace.saving_password.is_some());
+        assert!(app.workspace.form.as_ref().unwrap().fields[3].is_empty());
+        finish(&mut app);
+        assert!(app.workspace.form.is_none());
+        let link = app.selected_project_link().unwrap().clone();
+        let old = link.password_ref.clone().unwrap();
+        assert!(password_exists(&old));
+        assert_eq!(link.username, "admin");
+        let json = std::fs::read_to_string(app.metadata_save_path.as_ref().unwrap()).unwrap();
+        assert!(!json.contains("first secret"));
+        assert!(json.contains(&old));
+        let restored: Metadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.projects[0].links.as_slice(),
+            std::slice::from_ref(&link)
+        );
+
+        app.handle_projects_key(KeyCode::Char('e'));
+        let form = app.workspace.form.as_mut().unwrap();
+        assert!(form.fields[3].is_empty());
+        form.fields[0] = "Renamed".into();
+        form.selected = 4;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert_eq!(
+            app.selected_project_link().unwrap().password_ref.as_ref(),
+            Some(&old)
+        );
+        assert!(password_exists(&old));
+
+        let blocked = fixture.root.join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        app.metadata_save_path = Some(blocked.join("hosts.json"));
+        let previous = app.metadata.projects.clone();
+        app.handle_projects_key(KeyCode::Char('e'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields[3] = "replacement secret".into();
+        form.selected = 4;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        let prepared = app
+            .workspace
+            .saving_password
+            .take()
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        let rejected = prepared.reference.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok(prepared)).unwrap();
+        app.workspace.saving_password = Some(receiver);
+        finish(&mut app);
+        assert_eq!(app.metadata.projects, previous);
+        assert!(app.workspace.form.as_ref().unwrap().error.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while password_exists(&rejected) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!password_exists(&rejected));
+        assert!(password_exists(&old));
+
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        app.workspace.form.as_mut().unwrap().fields[3] = "replacement secret".into();
+        app.handle_workspace_dialog(KeyCode::Enter);
+        finish(&mut app);
+        let replacement = app
+            .selected_project_link()
+            .unwrap()
+            .password_ref
+            .clone()
+            .unwrap();
+        assert_ne!(replacement, old);
+        assert!(!password_exists(&old));
+        assert!(password_exists(&replacement));
+        app.handle_projects_key(KeyCode::Char('e'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.selected = 4;
+        app.handle_workspace_dialog(KeyCode::Right);
+        assert_eq!(app.workspace.form.as_ref().unwrap().fields[4], "Yes");
+        app.handle_workspace_dialog(KeyCode::Enter);
+        finish(&mut app);
+        assert!(app.selected_project_link().unwrap().password_ref.is_none());
+        assert!(!password_exists(&replacement));
+        assert_eq!(app.selected_project_link().unwrap().username, "admin");
+    }
+
+    #[test]
+    fn account_shortcuts_report_results_without_exposing_passwords() {
+        let fixture = Fixture::new("account-shortcuts");
+        let mut app = grouped_app(&fixture);
+        app.metadata.projects[0].links.push(ProjectLink {
+            id: 1,
+            name: "Preview".into(),
+            url: "http://localhost:3000/".into(),
+            ..Default::default()
+        });
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Down);
+        app.handle_projects_key(KeyCode::Char('u'));
+        assert!(app.notice.as_ref().unwrap().contains("No username"));
+        app.handle_projects_key(KeyCode::Char('p'));
+        assert!(app.notice.as_ref().unwrap().contains("No password"));
+        let mut prepared =
+            crate::project_credentials::prepare(Zeroizing::new("private-password".into()))
+                .recv()
+                .unwrap()
+                .unwrap();
+        let reference = prepared.reference.clone();
+        prepared.commit();
+        app.metadata.projects[0].links[0].username = "admin".into();
+        app.metadata.projects[0].links[0].password_ref = Some(reference.clone());
+        for (key, message) in [('u', "Username copied"), ('p', "Password copied")] {
+            app.handle_projects_key(KeyCode::Char(key));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !app.workspace.credential_jobs.is_empty() {
+                app.poll_project_credentials();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.notice.as_ref().unwrap().contains(message));
+            assert!(!app.notice.as_ref().unwrap().contains("private-password"));
+            assert!(!app.workspace.output_open);
+        }
+        crate::project_credentials::remove_unused(vec![reference])
+            .recv()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn link_password_rendering_shows_active_input_and_masks_inactive_input() {
+        for (width, height) in [(120, 40), (80, 24)] {
+            let fixture = Fixture::new("password-render");
+            let mut app = grouped_app(&fixture);
+            app.metadata.projects[0].links.push(ProjectLink {
+                id: 1,
+                name: "Preview".into(),
+                url: "http://localhost:3000".into(),
+                username: "admin".into(),
+                password_ref: Some(format!("web-{}", "a".repeat(64))),
+            });
+            app.viewport_width = width;
+            app.viewport_height = height;
+            app.handle_projects_key(KeyCode::Enter);
+            app.handle_projects_key(KeyCode::Down);
+            app.handle_projects_key(KeyCode::Char('e'));
+            {
+                let form = app.workspace.form.as_mut().unwrap();
+                form.fields[3] = "DO-NOT-RENDER-PASSWORD".into();
+                form.selected = 3;
+            }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("DO-NOT-RENDER-PASSWORD"),
+                "{width}x{height}: {text}"
+            );
+            assert!(!text.contains("********"), "{width}x{height}: {text}");
+            app.workspace.form.as_mut().unwrap().selected = 0;
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                !text.contains("DO-NOT-RENDER-PASSWORD"),
+                "{width}x{height}: {text}"
+            );
+            assert!(text.contains("********"), "{width}x{height}: {text}");
+            app.handle_workspace_dialog(KeyCode::Esc);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            assert!(!format!("{}", terminal.backend()).contains("DO-NOT-RENDER"));
+        }
+    }
+
+    #[test]
+    fn link_password_errors_and_cancellation_leave_definition_unchanged() {
+        let fixture = Fixture::new("password-errors");
+        let mut app = grouped_app(&fixture);
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Char('L'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec![
+            "Preview".into(),
+            "http://localhost:3000".into(),
+            "admin".into(),
+            "secret".into(),
+            "Yes".into(),
+        ];
+        form.selected = 4;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.workspace.form.as_ref().unwrap().error.is_some());
+        assert!(app.workspace.saving_password.is_none());
+        assert!(app.metadata.projects[0].links.is_empty());
+        app.workspace.form.as_mut().unwrap().fields[4] = "No".into();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Err("Keychain locked.".into())).unwrap();
+        app.workspace.saving_password = Some(receiver);
+        app.poll_project_credentials();
+        assert!(
+            app.workspace
+                .form
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Keychain locked")
+        );
+        assert!(app.metadata.projects[0].links.is_empty());
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.workspace.saving_password = Some(receiver);
+        app.handle_workspace_dialog(KeyCode::Esc);
+        assert!(app.workspace.form.is_none());
+        assert!(app.workspace.saving_password.is_none());
+    }
+
+    #[test]
+    fn deleting_a_project_cleans_passwords_only_after_successful_save() {
+        use crate::project_credentials::{prepare, tests::password_exists};
+        let fixture = Fixture::new("password-delete");
+        let mut app = grouped_app(&fixture);
+        let mut prepared = prepare(Zeroizing::new("secret".into()))
+            .recv()
+            .unwrap()
+            .unwrap();
+        let reference = prepared.reference.clone();
+        prepared.commit();
+        app.metadata.projects[0].links = vec![
+            ProjectLink {
+                id: 1,
+                name: "Home".into(),
+                url: "http://localhost:3000".into(),
+                password_ref: Some(reference.clone()),
+                ..Default::default()
+            },
+            ProjectLink {
+                id: 2,
+                name: "Buy".into(),
+                url: "http://localhost:3000/buy".into(),
+                password_ref: Some(reference.clone()),
+                ..Default::default()
+            },
+        ];
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Down);
+        app.handle_projects_key(KeyCode::Char('d'));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(password_exists(&reference));
+        assert!(app.workspace.credential_jobs.is_empty());
+        let blocked = fixture.root.join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        app.metadata_save_path = Some(blocked.join("hosts.json"));
+        app.handle_projects_key(KeyCode::Esc);
+        app.handle_projects_key(KeyCode::Char('d'));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(password_exists(&reference));
+        assert_eq!(app.metadata.projects.len(), 1);
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        app.handle_projects_key(KeyCode::Char('d'));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !app.workspace.credential_jobs.is_empty() {
+            app.poll_project_credentials();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!password_exists(&reference));
+        assert!(app.metadata.projects.is_empty());
+    }
+
+    #[test]
+    fn project_links_crud_preserves_commands_and_survives_project_edits() {
+        let fixture = Fixture::new("project-links");
+        let mut app = grouped_app(&fixture);
+        let commands = app.metadata.projects[0].commands.clone();
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Char('L'));
+        let form = app.workspace.form.as_mut().unwrap();
+        assert_eq!(form.labels().len(), 5);
+        form.fields = vec!["Preview".into(), "http://localhost:3000/".into()];
+        form.selected = 1;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.workspace.form.is_none());
+        assert_eq!(app.selected_project_link().unwrap().name, "Preview");
+        assert_eq!(app.selected_project_key(), None);
+        assert_eq!(app.project_items()[0], WorkspaceItem::Links);
+        assert_eq!(app.project_items()[1], WorkspaceItem::Link(0));
+        for key in ['s', 'r', 'x', 'A', 'X'] {
+            app.handle_projects_key(KeyCode::Char(key));
+            assert!(app.workspace.pending.is_none());
+            assert!(app.project_service.tasks.is_empty());
+        }
+        app.handle_projects_key(KeyCode::Char('v'));
+        assert_eq!(app.project_items()[0], WorkspaceItem::Link(0));
+        app.handle_projects_key(KeyCode::Char('e'));
+        let form = app.workspace.form.as_mut().unwrap();
+        assert!(form.link_form);
+        form.fields = vec![
+            "Admin".into(),
+            "https://example.com/admin?tab=users#list".into(),
+        ];
+        form.selected = 1;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        let link = app.selected_project_link().unwrap().clone();
+        assert_eq!(link.name, "Admin");
+        assert_eq!(link.id, 1);
+        app.handle_projects_key(KeyCode::Esc);
+        app.handle_projects_key(KeyCode::Char('e'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields[0] = "Renamed project".into();
+        form.selected = 2;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.workspace.form.is_none());
+        assert_eq!(
+            app.metadata.projects[0].links.as_slice(),
+            std::slice::from_ref(&link)
+        );
+        let restored: Metadata = serde_json::from_slice(
+            &std::fs::read(app.metadata_save_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.projects[0].links, [link]);
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Down);
+        app.handle_projects_key(KeyCode::Char('d'));
+        assert!(matches!(
+            app.workspace.delete,
+            Some(WorkspaceDelete::Link { .. })
+        ));
+        app.handle_workspace_dialog(KeyCode::Esc);
+        assert_eq!(app.metadata.projects[0].links.len(), 1);
+        app.handle_projects_key(KeyCode::Char('d'));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.metadata.projects[0].links.is_empty());
+        assert_eq!(app.metadata.projects[0].commands, commands);
+    }
+
+    #[test]
+    fn web_link_enter_saves_from_any_field() {
+        let fixture = Fixture::new("project-link-enter-save");
+        let mut app = grouped_app(&fixture);
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Char('L'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec![
+            "Preview".into(),
+            "http://localhost:3000/".into(),
+            "admin".into(),
+            String::new(),
+            "No".into(),
+        ];
+        form.selected = 3;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.workspace.form.is_none());
+        assert_eq!(app.selected_project_link().unwrap().name, "Preview");
+        assert_eq!(
+            app.selected_project_link().unwrap().url,
+            "http://localhost:3000/"
+        );
+    }
+
+    #[test]
+    fn invalid_links_and_failed_saves_preserve_metadata_and_selection() {
+        let fixture = Fixture::new("project-links-failure");
+        let mut app = grouped_app(&fixture);
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Char('L'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec!["Bad".into(), "file:///tmp/index.html".into()];
+        form.selected = 1;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(app.metadata.projects[0].links.is_empty());
+        assert!(app.workspace.form.as_ref().unwrap().error.is_some());
+        app.workspace.form.as_mut().unwrap().fields[1] = "http://localhost:3000".into();
+        let blocked = fixture.root.join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        app.metadata_save_path = Some(blocked.join("hosts.json"));
+        let original = app.metadata.projects.clone();
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert_eq!(app.metadata.projects, original);
+        assert!(app.workspace.form.as_ref().unwrap().error.is_some());
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert_eq!(app.selected_project_link().unwrap().name, "Bad");
+        app.metadata_save_path = Some(blocked.join("hosts.json"));
+        let original = app.metadata.projects.clone();
+        app.handle_projects_key(KeyCode::Char('e'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields[0] = "Changed".into();
+        form.selected = 1;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert_eq!(app.metadata.projects, original);
+        app.handle_workspace_dialog(KeyCode::Esc);
+        app.handle_projects_key(KeyCode::Char('d'));
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert_eq!(app.metadata.projects, original);
+        assert_eq!(app.selected_project_link().unwrap().name, "Bad");
+    }
+
+    #[test]
+    fn browser_errors_are_reported_without_opening_command_output() {
+        let fixture = Fixture::new("project-browser-error");
+        let mut app = grouped_app(&fixture);
+        // Imported metadata is validated again before handing it to the browser.
+        app.metadata.projects[0].links.push(ProjectLink {
+            id: 1,
+            name: "Invalid".into(),
+            url: "javascript:alert(1)".into(),
+            ..Default::default()
+        });
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Down);
+        app.handle_projects_key(KeyCode::Enter);
+        assert!(!app.workspace.output_open);
+        assert!(app.workspace.opening_link.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.workspace.opening_link.is_some() {
+            app.poll_projects();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .contains("Could not open project link")
+        );
+        assert!(app.project_service.tasks.is_empty());
+        assert_eq!(app.selected_project_link().unwrap().name, "Invalid");
+    }
+
+    #[test]
+    fn web_links_group_folds_and_keeps_command_actions_separate() {
+        let fixture = Fixture::new("links-group");
+        let mut app = grouped_app(&fixture);
+        app.metadata.projects[0].links = vec![
+            ProjectLink {
+                id: 1,
+                name: "Home".into(),
+                url: "http://localhost:3000/".into(),
+                ..Default::default()
+            },
+            ProjectLink {
+                id: 2,
+                name: "Buy".into(),
+                url: "http://localhost:3000/buy".into(),
+                ..Default::default()
+            },
+        ];
+        app.handle_projects_key(KeyCode::Enter);
+        assert_eq!(
+            &app.project_items()[..4],
+            &[
+                WorkspaceItem::Links,
+                WorkspaceItem::Link(0),
+                WorkspaceItem::Link(1),
+                WorkspaceItem::Group("Services".into()),
+            ]
+        );
+        assert!(app.project_links_header_selected());
+        for key in ['s', 'r', 'x', 'A', 'X', 'e', 'd'] {
+            app.handle_projects_key(KeyCode::Char(key));
+            assert!(app.workspace.pending.is_none());
+            assert!(app.workspace.delete.is_none());
+            assert!(app.workspace.form.is_none());
+        }
+        assert!(app.project_service.tasks.is_empty());
+        app.handle_projects_key(KeyCode::Enter);
+        assert!(app.project_links_collapsed());
+        assert!(!app.project_items().contains(&WorkspaceItem::Link(0)));
+        assert!(app.workspace.opening_link.is_none());
+        app.handle_projects_key(KeyCode::Right);
+        assert!(!app.project_links_collapsed());
+        app.handle_projects_key(KeyCode::Down);
+        assert_eq!(app.selected_project_link().unwrap().name, "Home");
+        app.handle_projects_key(KeyCode::Left);
+        assert!(app.project_links_header_selected());
+        app.handle_projects_key(KeyCode::Left);
+        assert!(app.project_links_collapsed());
+        app.handle_projects_key(KeyCode::Esc);
+        app.handle_projects_key(KeyCode::Enter);
+        assert!(app.project_links_collapsed());
+        app.handle_projects_key(KeyCode::Char('v'));
+        assert_eq!(app.project_items()[0], WorkspaceItem::Link(0));
+        assert_eq!(app.project_items()[1], WorkspaceItem::Link(1));
+        assert!(!app.project_items().contains(&WorkspaceItem::Links));
+        app.handle_projects_key(KeyCode::Char('v'));
+        app.handle_projects_key(KeyCode::Char('L'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields[0] = "Docs".into();
+        form.fields[1] = "https://example.com/docs".into();
+        form.selected = 4;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        assert!(!app.project_links_collapsed());
+        assert_eq!(app.selected_project_link().unwrap().name, "Docs");
+        assert_eq!(app.workspace.selected_item, 3);
+    }
+
+    #[test]
+    fn project_link_only_workspaces_render_and_edit_at_compact_sizes() {
+        for (width, height) in [(120, 40), (80, 24), (54, 18), (32, 12)] {
+            let fixture = Fixture::new("project-link-render");
+            let mut app = grouped_app(&fixture);
+            app.metadata.projects[0].commands.clear();
+            app.metadata.projects[0].groups.clear();
+            app.metadata.projects[0].links.push(ProjectLink {
+                id: 1,
+                name: "Preview".into(),
+                url: "http://localhost:3000/".into(),
+                ..Default::default()
+            });
+            app.viewport_width = width;
+            app.viewport_height = height;
+            app.handle_projects_key(KeyCode::Enter);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Web links"), "{width}x{height}: {text}");
+            assert!(text.contains("Preview"), "{width}x{height}: {text}");
+            assert!(
+                text.contains("http://localhost:3000/"),
+                "{width}x{height}: {text}"
+            );
+            app.handle_projects_key(KeyCode::Down);
+            app.handle_projects_key(KeyCode::Char('e'));
+            app.workspace.form.as_mut().unwrap().selected = 1;
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("URL"), "{width}x{height}: {text}");
+        }
     }
 
     #[test]
@@ -1469,6 +2545,20 @@ mod tests {
         for (width, height) in [(120, 40), (80, 24), (54, 18), (32, 12)] {
             let fixture = Fixture::new("group-render");
             let mut app = grouped_app(&fixture);
+            app.metadata.projects[0].links = vec![
+                ProjectLink {
+                    id: 1,
+                    name: "Home".into(),
+                    url: "http://localhost:3000/".into(),
+                    ..Default::default()
+                },
+                ProjectLink {
+                    id: 2,
+                    name: "Buy".into(),
+                    url: "http://localhost:3000/buy".into(),
+                    ..Default::default()
+                },
+            ];
             app.viewport_width = width;
             app.viewport_height = height;
             app.handle_projects_key(KeyCode::Enter);
@@ -1478,9 +2568,13 @@ mod tests {
             for (index, item) in items.iter().enumerate() {
                 app.workspace.selected_item = index;
                 let name = match item {
+                    WorkspaceItem::Links => "Web links",
                     WorkspaceItem::Group(group) => group.as_str(),
                     WorkspaceItem::Command(index) => {
                         app.metadata.projects[0].commands[*index].name.as_str()
+                    }
+                    WorkspaceItem::Link(index) => {
+                        app.metadata.projects[0].links[*index].name.as_str()
                     }
                 };
                 terminal
@@ -1492,15 +2586,18 @@ mod tests {
             app.workspace.selected_item = 0;
             app.handle_projects_key(KeyCode::Enter);
             app.handle_projects_key(KeyCode::Char('a'));
-            app.workspace.form.as_mut().unwrap().selected = 5;
+            app.workspace.form.as_mut().unwrap().selected = 6;
             terminal
                 .draw(|frame| crate::ui::render(frame, &app))
                 .unwrap();
             let text = format!("{}", terminal.backend());
-            assert!(text.contains("Target"), "{width}x{height}: target hidden");
             assert!(
-                text.contains("Inherit"),
-                "{width}x{height}: target value hidden"
+                text.contains("On exit"),
+                "{width}x{height}: lifecycle hidden"
+            );
+            assert!(
+                text.contains("Stop on exit"),
+                "{width}x{height}: lifecycle value hidden"
             );
         }
     }

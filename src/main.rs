@@ -2,7 +2,9 @@ mod app;
 mod hosts;
 mod metadata;
 mod project_app;
+mod project_credentials;
 mod project_monitor;
+mod project_runner;
 mod projects;
 mod runtime;
 mod sftp;
@@ -30,10 +32,19 @@ use ratatui::DefaultTerminal;
 use crate::app::{App, ConnectionDialog, InputAction};
 
 fn main() -> Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--project-runner")) {
+        let spec = arguments
+            .next()
+            .ok_or_else(|| io::Error::other("Missing runner launch file"))?;
+        crate::project_runner::run(std::path::Path::new(&spec))?;
+        return Ok(());
+    }
     color_eyre::install()?;
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
     let result = run(&mut terminal, App::new());
+    crate::project_credentials::clear_password_clipboard();
     ratatui::restore();
     execute!(io::stdout(), DisableMouseCapture)?;
     result

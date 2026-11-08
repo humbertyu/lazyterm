@@ -440,6 +440,7 @@ impl App {
         let mut app = Self::with_catalog(HostCatalog::load(), Metadata::load());
         app.reconcile_metadata();
         app.refresh_local_files();
+        app.project_service.restore(&app.metadata.projects);
         app
     }
 
@@ -4582,65 +4583,84 @@ mod tests {
     #[test]
     fn workspace_listener_runtime_output_and_confirmed_stop_form_a_complete_flow() {
         use crate::projects::tests::{Fixture, until};
-        let fixture = Fixture::new("runtime-flow");
-        let mut app = app_fixture();
-        app.project_service = fixture.service();
-        let command = fixture.listener_command(false);
-        let key = (fixture.project.id, command.id);
-        let mut project = fixture.project.clone();
-        project.commands.push(command);
-        app.metadata.projects.push(project);
-        press(&mut app, KeyCode::F(6), KeyModifiers::NONE);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while fixture.ready().is_none() {
-            app.poll_projects();
+        for lifecycle in [
+            crate::projects::ProjectLifecycle::App,
+            crate::projects::ProjectLifecycle::Persistent,
+        ] {
+            let fixture = Fixture::new("runtime-flow");
+            let mut app = app_fixture();
+            app.project_service = fixture.service();
+            let mut command = fixture.listener_command(false);
+            command.lifecycle = lifecycle;
+            let key = (fixture.project.id, command.id);
+            let _cleanup = crate::projects::tests::PersistentCleanup::new(&fixture, key);
+            let mut project = fixture.project.clone();
+            project.commands.push(command);
+            app.metadata.projects.push(project);
+            press(&mut app, KeyCode::F(6), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while fixture.ready().is_none() {
+                app.poll_projects();
+                assert!(
+                    Instant::now() < deadline,
+                    "Project start preflight timed out"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let (pid, port) = fixture.ready().unwrap();
+            assert!(app.project_service.active(key));
+            if lifecycle == crate::projects::ProjectLifecycle::Persistent {
+                let definitions = app.metadata.projects.clone();
+                drop(app);
+                assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+                app = app_fixture();
+                app.metadata.projects = definitions;
+                app.project_service = fixture.service();
+                app.poll_projects();
+                assert!(app.project_service.active(key));
+                app.section = NavSection::Projects;
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
             assert!(
-                Instant::now() < deadline,
-                "Project start preflight timed out"
+                app.workspace.form.is_none(),
+                "Live commands must not be edited"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.runtime_loading {
+                app.project_service.poll();
+                app.poll_runtime();
+                assert!(Instant::now() < deadline, "Runtime inspection timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(app.runtime_error.is_none(), "{:?}", app.runtime_error);
+            app.selected_runtime = app
+                .visible_runtime_entries()
+                .iter()
+                .position(|entry| entry.pid == Some(pid) && entry.port == port)
+                .expect("fixture listener must be visible in Mine");
+            let entry = app.selected_runtime_entry().unwrap();
+            assert_eq!(entry.origin, runtime::RuntimeOrigin::Project);
+            assert_eq!(entry.project.as_ref().unwrap().key, key);
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+            assert_eq!(app.section, NavSection::Projects);
+            assert!(app.workspace.output_open);
+            assert_eq!(app.selected_project_key(), Some(key));
+            // Return without refreshing so the action uses the displayed run identity.
+            app.section = NavSection::Runtime;
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert!(app.runtime_kill_confirmation.is_some());
+            press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            until(&mut app.project_service, |s| !s.active(key));
+            assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+            assert_eq!(
+                app.project_service.tasks[&key].status,
+                crate::projects::TaskStatus::Stopped
+            );
         }
-        let (pid, port) = fixture.ready().unwrap();
-        assert!(app.project_service.active(key));
-        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
-        assert!(
-            app.workspace.form.is_none(),
-            "Live commands must not be edited"
-        );
-        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while app.runtime_loading {
-            app.project_service.poll();
-            app.poll_runtime();
-            assert!(Instant::now() < deadline, "Runtime inspection timed out");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(app.runtime_error.is_none(), "{:?}", app.runtime_error);
-        app.selected_runtime = app
-            .visible_runtime_entries()
-            .iter()
-            .position(|entry| entry.pid == Some(pid) && entry.port == port)
-            .expect("fixture listener must be visible in Mine");
-        let entry = app.selected_runtime_entry().unwrap();
-        assert_eq!(entry.origin, runtime::RuntimeOrigin::Project);
-        assert_eq!(entry.project.as_ref().unwrap().key, key);
-        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
-        assert_eq!(app.section, NavSection::Projects);
-        assert!(app.workspace.output_open);
-        assert_eq!(app.selected_project_key(), Some(key));
-        // Return without refreshing so the action uses the displayed run identity.
-        app.section = NavSection::Runtime;
-        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-        assert!(app.runtime_kill_confirmation.is_some());
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
-        until(&mut app.project_service, |s| !s.active(key));
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
-        assert_eq!(
-            app.project_service.tasks[&key].status,
-            crate::projects::TaskStatus::Stopped
-        );
     }
 
     #[test]

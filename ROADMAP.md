@@ -161,19 +161,22 @@ Project workspaces:
 - [x] Define Projects with a base path, named commands, and optional command working directories.
 - [x] Add/edit/delete Projects and commands with the established a/e/d and Enter semantics.
 - [x] Add optional command groups, group CRUD, default-expanded inline commands, session fold state, and a flat all-commands view.
+- [x] Add named Project web links with add/edit/delete, HTTP/HTTPS validation, browser opening, and a default-expanded group matching command hierarchy.
+- [x] Add optional web-link usernames, system-keychain passwords, masked editing, and username/password clipboard actions.
 - [x] Distinguish Services from Tasks; scope batch start/stop to Services in a group or project.
 - [x] Persist default Project targets and command overrides; block remote execution until its lifecycle is implemented.
 - [ ] Execute remote Project commands through the Hosts catalog with explicit disconnect/exit behavior.
 - [x] Start, stop, and restart project commands with supervised process groups; start/stop all commands.
 - [x] Capture complete stdout/stderr in per-run private logs and show a bounded scrolling output tail and exit status.
-- [x] Clean up owned process groups on normal app exit; escalate stalled stops after two seconds.
+- [x] Clean up app-scoped process groups on normal app exit; escalate stalled stops after two seconds.
+- [x] Add per-command exit policy, independent persistent runners, log continuity, and status/output/control restoration across TUI restarts.
 - [x] Keep Project execution separate from Snippet records used as command templates.
 - [x] Add project persistence, additive version-1 compatibility, atomic writes, backup and save-failure coverage.
 - [x] Detect externally running commands using current-user identity, working directory, and command/descendant evidence.
 - [x] Separate current running status from the last managed result and inspect before starting to avoid recognized duplicates.
 - [x] Confirm external stop/restart, revalidate process identity, and preserve external commands on application exit.
 
-Project limits: local foreground commands only, inherited environment, no interactive PTY, dependency ordering, or persisted run history. Raw logs are retained without rotation. Recovering groups after LazyTerm itself is killed remains in beta hardening; completing this slice does not declare the v0.5.0 release accepted.
+Project limits: local foreground commands only, inherited environment, no interactive PTY or dependency ordering. Only the latest persistent run per command has a saved status/output index; full run history and raw-log rotation remain deferred. App-scoped recovery after forced termination and recovery after the independent runner itself is killed remain in beta hardening. Persistent runs do not automatically relaunch after a crash, logout, or reboot; completing this slice does not declare the v0.5.0 release accepted.
 
 Beta hardening:
 

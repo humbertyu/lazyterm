@@ -24,6 +24,48 @@ pub struct ProjectDefinition {
     pub groups: Vec<String>,
     #[serde(default)]
     pub target: ProjectTarget,
+    #[serde(default)]
+    pub links: Vec<ProjectLink>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectLink {
+    pub id: u64,
+    pub name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_ref: Option<String>,
+}
+
+pub fn validate_link_url(value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) || value.chars().any(char::is_whitespace) {
+        return Err("URL cannot contain whitespace; encode spaces as %20.".into());
+    }
+    let parsed = url::Url::parse(value).map_err(|error| format!("Invalid URL: {error}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Keep credentials in the account fields, not in the URL.".into());
+    }
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !value
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(parsed.scheme()))
+    {
+        return Err("Use a complete http:// or https:// URL with a host.".into());
+    }
+    Ok(())
+}
+
+pub fn open_link_async(value: String) -> Receiver<Result<(), String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = validate_link_url(&value)
+            .and_then(|()| webbrowser::open(&value).map_err(|error| error.to_string()));
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,6 +100,22 @@ impl CommandKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ProjectLifecycle {
+    #[default]
+    App,
+    Persistent,
+}
+
+impl ProjectLifecycle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::App => "Stop on exit",
+            Self::Persistent => "Keep running",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectCommand {
     pub id: u64,
@@ -71,6 +129,8 @@ pub struct ProjectCommand {
     pub kind: CommandKind,
     #[serde(default)]
     pub target: Option<ProjectTarget>,
+    #[serde(default)]
+    pub lifecycle: ProjectLifecycle,
 }
 
 pub fn execution_target<'a>(
@@ -116,7 +176,7 @@ fn expand_home(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectOwner {
     pub key: TaskKey,
     pub run_id: u64,
@@ -125,7 +185,7 @@ pub struct ProjectOwner {
     pub command_name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TaskStatus {
     Running,
     Stopping,
@@ -154,6 +214,8 @@ pub struct ProjectTask {
     pub output: String,
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
+    pub lifecycle: ProjectLifecycle,
+    persistent: Option<crate::project_runner::Handle>,
     child: Option<Child>,
     finished: Option<ExitStatus>,
     receiver: Receiver<OutputEvent>,
@@ -166,10 +228,19 @@ pub struct ProjectTask {
 impl ProjectTask {
     pub fn active(&self) -> bool {
         self.child.is_some()
+            || self
+                .persistent
+                .as_ref()
+                .is_some_and(|handle| handle.active())
     }
 
     fn request_stop(&mut self) -> io::Result<()> {
         if !self.active() || self.stop_deadline.is_some() {
+            return Ok(());
+        }
+        if let Some(handle) = &mut self.persistent {
+            handle.stop()?;
+            self.status = handle.snapshot.status.clone();
             return Ok(());
         }
         signal_group(self.owner.process_group, libc::SIGTERM)?;
@@ -199,6 +270,7 @@ pub struct ProjectService {
     pub tasks: BTreeMap<TaskKey, ProjectTask>,
     log_root: Option<PathBuf>,
     next_run: u64,
+    restored_at: Option<Instant>,
 }
 
 impl ProjectService {
@@ -207,6 +279,7 @@ impl ProjectService {
             tasks: BTreeMap::new(),
             log_root,
             next_run: 1,
+            restored_at: None,
         }
     }
 
@@ -222,7 +295,111 @@ impl ProjectService {
         self.tasks.get(&key).is_some_and(ProjectTask::active)
     }
 
+    pub(crate) fn set_next_run(&mut self, run_id: u64) {
+        self.next_run = run_id;
+    }
+
+    fn recover_task(&mut self, key: TaskKey) -> io::Result<()> {
+        if self.active(key) {
+            return Ok(());
+        }
+        let Some(root) = &self.log_root else {
+            return Ok(());
+        };
+        if let Some(handle) = crate::project_runner::recover(root, key)?
+            && self
+                .tasks
+                .get(&key)
+                .is_none_or(|task| task.owner != handle.snapshot.owner)
+        {
+            self.attach_persistent(handle);
+        }
+        Ok(())
+    }
+
+    pub fn restore(&mut self, definitions: &[ProjectDefinition]) {
+        if self
+            .restored_at
+            .is_some_and(|time| time.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.restored_at = Some(Instant::now());
+        for project in definitions {
+            for command in &project.commands {
+                if command.lifecycle == ProjectLifecycle::Persistent
+                    && *execution_target(project, command) == ProjectTarget::Local
+                {
+                    let _ = self.recover_task((project.id, command.id));
+                }
+            }
+        }
+    }
+
+    pub fn forget_persistent_record(&self, key: TaskKey) -> io::Result<()> {
+        if self.active(key) {
+            return Err(io::Error::other(
+                "Stop the background command before deleting its record.",
+            ));
+        }
+        if let Some(root) = &self.log_root {
+            crate::project_runner::forget(root, key)?;
+        }
+        Ok(())
+    }
+
+    fn attach_persistent(&mut self, handle: crate::project_runner::Handle) {
+        let snapshot = &handle.snapshot;
+        self.tasks.insert(
+            snapshot.owner.key,
+            ProjectTask {
+                owner: snapshot.owner.clone(),
+                directory: snapshot.directory.clone(),
+                command: snapshot.command.clone(),
+                status: snapshot.status.clone(),
+                output: snapshot.output.clone(),
+                stdout_log: snapshot.stdout_log.clone(),
+                stderr_log: snapshot.stderr_log.clone(),
+                lifecycle: ProjectLifecycle::Persistent,
+                persistent: Some(handle),
+                child: None,
+                finished: None,
+                receiver: mpsc::channel().1,
+                closed_readers: 2,
+                stop_deadline: None,
+                user_stopped: false,
+                restart: None,
+            },
+        );
+    }
+
     pub fn start(
+        &mut self,
+        project: &ProjectDefinition,
+        command: &ProjectCommand,
+    ) -> io::Result<()> {
+        working_directory(project, command)?;
+        let key = (project.id, command.id);
+        self.recover_task(key)?;
+        if self.active(key) {
+            return Err(io::Error::other("Command is already running"));
+        }
+        if command.lifecycle == ProjectLifecycle::Persistent {
+            if command.command.trim().is_empty() {
+                return Err(io::Error::other("Command is empty"));
+            }
+            let root = self
+                .log_root
+                .as_ref()
+                .ok_or_else(|| io::Error::other("Project log directory is unavailable"))?;
+            let handle = crate::project_runner::start(root, project, command)?;
+            self.attach_persistent(handle);
+            return Ok(());
+        }
+        self.start_app(project, command)
+    }
+
+    pub(crate) fn start_app(
         &mut self,
         project: &ProjectDefinition,
         command: &ProjectCommand,
@@ -301,6 +478,8 @@ impl ProjectService {
                 output: String::new(),
                 stdout_log,
                 stderr_log,
+                lifecycle: ProjectLifecycle::App,
+                persistent: None,
                 child: Some(child),
                 finished: None,
                 receiver,
@@ -341,7 +520,41 @@ impl ProjectService {
 
     pub fn poll(&mut self) {
         let mut restarts = VecDeque::new();
-        for task in self.tasks.values_mut().filter(|task| task.active()) {
+        for task in self
+            .tasks
+            .values_mut()
+            .filter(|task| task.persistent.is_some())
+        {
+            let handle = task.persistent.as_mut().expect("persistent");
+            match handle.refresh() {
+                Ok(()) => {
+                    if task.owner != handle.snapshot.owner {
+                        task.owner = handle.snapshot.owner.clone();
+                        task.directory.clone_from(&handle.snapshot.directory);
+                        task.command.clone_from(&handle.snapshot.command);
+                        task.stdout_log.clone_from(&handle.snapshot.stdout_log);
+                        task.stderr_log.clone_from(&handle.snapshot.stderr_log);
+                        task.restart = None;
+                    }
+                    task.status = handle.snapshot.status.clone();
+                    task.output.clone_from(&handle.snapshot.output);
+                }
+                Err(error) => {
+                    task.status =
+                        TaskStatus::Failed(format!("Background runner unavailable: {error}"));
+                }
+            }
+            if !handle.active()
+                && let Some(restart) = task.restart.take()
+            {
+                restarts.push_back(restart);
+            }
+        }
+        for task in self
+            .tasks
+            .values_mut()
+            .filter(|task| task.persistent.is_none() && task.active())
+        {
             // Bound work per frame even if a command continuously floods output.
             for _ in 0..128 {
                 let Ok(event) = task.receiver.try_recv() else {
@@ -533,6 +746,37 @@ pub(crate) mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
+    #[test]
+    fn web_links_accept_complete_web_urls_and_reject_other_targets() {
+        for value in [
+            "http://localhost:3000/",
+            "https://example.com/admin?tab=users#list",
+            "http://127.0.0.1:4444/",
+            "http://[::1]:3000/",
+            "HTTPS://example.com/docs",
+            "https://example.com/a%20b",
+        ] {
+            assert!(validate_link_url(value).is_ok(), "{value}");
+        }
+        for value in [
+            "",
+            "localhost:3000",
+            "http:example.com",
+            "https://",
+            "https://example.com:invalid/",
+            "file:///tmp/test.html",
+            "javascript:alert(1)",
+            "ssh://example.com",
+            "--help",
+            "https://example.com/a b",
+            "https://example.com/\n",
+            "https://user:secret@example.com/",
+            "https://user@example.com/",
+        ] {
+            assert!(validate_link_url(value).is_err(), "{value}");
+        }
+    }
+
     pub struct Fixture {
         pub root: PathBuf,
         pub project: ProjectDefinition,
@@ -657,6 +901,7 @@ pub(crate) mod tests {
         println!("disposable server ready");
         for connection in listener.incoming() {
             drop(connection.unwrap());
+            println!("connection observed");
         }
     }
 
@@ -789,6 +1034,166 @@ pub(crate) mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    pub(crate) struct PersistentCleanup {
+        root: PathBuf,
+        key: TaskKey,
+    }
+
+    impl PersistentCleanup {
+        pub fn new(fixture: &Fixture, key: TaskKey) -> Self {
+            Self {
+                root: fixture.root.join("logs"),
+                key,
+            }
+        }
+    }
+
+    impl Drop for PersistentCleanup {
+        fn drop(&mut self) {
+            if let Ok(Some(mut handle)) = crate::project_runner::recover(&self.root, self.key) {
+                let _ = handle.stop();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while handle.active() && Instant::now() < deadline {
+                    let _ = handle.refresh();
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_servers_survive_drop_keep_logging_and_restore_stop_and_restart() {
+        let mut fixture = Fixture::new("persistent");
+        let mut command = fixture.listener_command(true);
+        command.lifecycle = ProjectLifecycle::Persistent;
+        fixture.project.commands.push(command.clone());
+        let key = (fixture.project.id, command.id);
+        let _cleanup = PersistentCleanup {
+            root: fixture.root.join("logs"),
+            key,
+        };
+        let mut service = fixture.service();
+        service.start(&fixture.project, &command).unwrap();
+        until(&mut service, |_| fixture.ready().is_some());
+        let (original_pid, original_port) = fixture.ready().unwrap();
+        let owner = service.tasks[&key].owner.clone();
+        let stdout = service.tasks[&key].stdout_log.clone();
+        drop(service);
+        assert!(TcpStream::connect(("127.0.0.1", original_port)).is_ok());
+        // There is no TUI reader now; the independent runner must keep draining logs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string(&stdout)
+            .unwrap()
+            .contains("connection observed")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Background logs stopped after TUI exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut restored = fixture.service();
+        restored.restore(std::slice::from_ref(&fixture.project));
+        assert!(restored.active(key));
+        assert_eq!(restored.owners().as_slice(), std::slice::from_ref(&owner));
+        until(&mut restored, |s| {
+            s.tasks[&key].output.contains("connection observed")
+        });
+        assert!(restored.start(&fixture.project, &command).is_err());
+        let mut second_window = fixture.service();
+        assert!(second_window.start(&fixture.project, &command).is_err());
+        drop(second_window);
+        assert!(TcpStream::connect(("127.0.0.1", original_port)).is_ok());
+        let mut observer = fixture.service();
+        observer.restore(std::slice::from_ref(&fixture.project));
+        restored.restart(&fixture.project, &command).unwrap();
+        until(&mut restored, |s| {
+            s.tasks[&key].owner.run_id != owner.run_id
+                && fixture.ready().is_some_and(|(pid, _)| pid != original_pid)
+        });
+        assert!(TcpStream::connect(("127.0.0.1", original_port)).is_err());
+        let (_, new_port) = fixture.ready().unwrap();
+        assert!(TcpStream::connect(("127.0.0.1", new_port)).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while observer.tasks[&key].owner.run_id != restored.tasks[&key].owner.run_id {
+            observer.restore(std::slice::from_ref(&fixture.project));
+            observer.poll();
+            assert!(
+                Instant::now() < deadline,
+                "Other window did not discover the replacement run"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(observer.active(key));
+        drop(observer);
+        drop(restored);
+        let mut reopened = fixture.service();
+        reopened.restore(std::slice::from_ref(&fixture.project));
+        assert!(reopened.active(key));
+        reopened.stop(key).unwrap();
+        until(&mut reopened, |s| !s.active(key));
+        assert_eq!(reopened.tasks[&key].status, TaskStatus::Stopped);
+        assert!(TcpStream::connect(("127.0.0.1", new_port)).is_err());
+        drop(reopened);
+        let mut history = fixture.service();
+        history.restore(std::slice::from_ref(&fixture.project));
+        assert!(!history.active(key));
+        assert_eq!(history.tasks[&key].status, TaskStatus::Stopped);
+        assert!(
+            history.tasks[&key]
+                .output
+                .contains("disposable server ready")
+        );
+    }
+
+    #[test]
+    fn persistent_tasks_preserve_output_exit_status_and_private_records() {
+        let mut fixture = Fixture::new("persistent-output");
+        let mut command = fixture.command("printf '\\344\\275\\240\\n'; printf 'problem\\n' >&2; i=0; while [ \"$i\" -lt 5000 ]; do printf 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789--\\n'; i=$((i + 1)); done; exit 7");
+        command.lifecycle = ProjectLifecycle::Persistent;
+        fixture.project.commands.push(command.clone());
+        let key = (fixture.project.id, command.id);
+        let _cleanup = PersistentCleanup {
+            root: fixture.root.join("logs"),
+            key,
+        };
+        let mut service = fixture.service();
+        service.start(&fixture.project, &command).unwrap();
+        drop(service);
+        let mut restored = fixture.service();
+        restored.restore(std::slice::from_ref(&fixture.project));
+        until(&mut restored, |s| !s.active(key));
+        let task = &restored.tasks[&key];
+        assert_eq!(task.status, TaskStatus::Exited(7));
+        assert!(task.output.len() <= OUTPUT_LIMIT);
+        let stdout = fs::read_to_string(&task.stdout_log).unwrap();
+        assert!(stdout.starts_with("\u{4f60}\n"));
+        assert!(stdout.len() > OUTPUT_LIMIT);
+        assert_eq!(fs::read_to_string(&task.stderr_log).unwrap(), "problem\n");
+        use std::os::unix::fs::PermissionsExt;
+        let record = fixture
+            .root
+            .join(format!("logs/persistent-{}-{}.json", key.0, key.1));
+        assert_eq!(
+            fs::metadata(record).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(restored);
+        let mut history = fixture.service();
+        history.restore(std::slice::from_ref(&fixture.project));
+        assert_eq!(history.tasks[&key].status, TaskStatus::Exited(7));
+        assert!(!history.tasks[&key].output.is_empty());
+        let stdout_log = history.tasks[&key].stdout_log.clone();
+        history.forget_persistent_record(key).unwrap();
+        let mut removed = fixture.service();
+        removed.restore(std::slice::from_ref(&fixture.project));
+        assert!(!removed.tasks.contains_key(&key));
+        assert!(
+            stdout_log.is_file(),
+            "Deleting a definition must preserve raw logs"
+        );
     }
 
     #[test]

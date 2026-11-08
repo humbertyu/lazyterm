@@ -184,7 +184,18 @@ fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
                 TaskStatus::Exited(0) | TaskStatus::Stopped => MUTED,
                 TaskStatus::Exited(_) | TaskStatus::Failed(_) => Color::Red,
             };
-            (task.status.label(), color)
+            (
+                format!(
+                    "{}{}",
+                    task.status.label(),
+                    if task.lifecycle == crate::projects::ProjectLifecycle::Persistent {
+                        " / background"
+                    } else {
+                        ""
+                    }
+                ),
+                color,
+            )
         },
     )
 }
@@ -283,9 +294,9 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
             " {} / {} ",
             project.name,
             if app.workspace.flat {
-                "All commands"
+                "All items"
             } else {
-                "Commands"
+                "Workspace"
             }
         )
     } else {
@@ -298,6 +309,34 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
             .iter()
             .map(|item| {
                 let command = match item {
+                    crate::project_app::WorkspaceItem::Links => {
+                        return ListItem::new(Line::from(Span::styled(
+                            format!(
+                                "{} Web links  {}",
+                                if app.project_links_collapsed() {
+                                    "▸"
+                                } else {
+                                    "▾"
+                                },
+                                project.links.len()
+                            ),
+                            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    crate::project_app::WorkspaceItem::Link(index) => {
+                        let link = &project.links[*index];
+                        let indent = if app.workspace.flat { "" } else { "  " };
+                        return ListItem::new(vec![
+                            Line::from(Span::styled(
+                                format!("{indent}{}", link.name),
+                                Style::default().fg(TEXT),
+                            )),
+                            Line::from(vec![
+                                Span::styled(format!("{indent}  "), Style::default()),
+                                Span::styled(link.url.as_str(), Style::default().fg(MUTED)),
+                            ]),
+                        ]);
+                    }
                     crate::project_app::WorkspaceItem::Group(group) => {
                         let commands = project
                             .commands
@@ -383,7 +422,11 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                         Style::default().fg(MUTED),
                     )),
                     Line::from(Span::styled(
-                        format!("  {} commands / {running} active", project.commands.len()),
+                        format!(
+                            "  {} commands / {} links / {running} active",
+                            project.commands.len(),
+                            project.links.len()
+                        ),
                         Style::default().fg(MUTED),
                     )),
                 ])
@@ -392,7 +435,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
     };
     if rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("No commands.")
+            Paragraph::new("No commands or links.")
                 .style(Style::default().fg(MUTED))
                 .block(panel(&title)),
             columns[0],
@@ -419,7 +462,34 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
         detail_line("Base directory", &project.base_path.display().to_string()),
         detail_line("Default target", &project.target.label()),
     ];
-    if app.workspace.project_open
+    if app.project_links_header_selected() {
+        lines.push(detail_line("Group", "Web links"));
+        lines.push(detail_line("Links", &project.links.len().to_string()));
+        for link in &project.links {
+            lines.push(detail_line(&link.name, &link.url));
+        }
+    } else if let Some(link) = app.selected_project_link() {
+        lines.extend([
+            detail_line("Link", &link.name),
+            detail_line("URL", &link.url),
+            detail_line(
+                "Username",
+                if link.username.is_empty() {
+                    "(none)"
+                } else {
+                    &link.username
+                },
+            ),
+            detail_line(
+                "Password",
+                if link.password_ref.is_some() {
+                    "******** (keychain)"
+                } else {
+                    "(none)"
+                },
+            ),
+        ]);
+    } else if app.workspace.project_open
         && let Some(command) = app.selected_project_command()
     {
         let key = (project.id, command.id);
@@ -427,6 +497,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
             detail_line("Command name", &command.name),
             detail_line("Group", command.group.as_deref().unwrap_or("Ungrouped")),
             detail_line("Type", command.kind.label()),
+            detail_line("On exit", command.lifecycle.label()),
             detail_line(
                 "Target",
                 &crate::projects::execution_target(project, command).label(),
@@ -493,6 +564,10 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
         ));
     } else {
         lines.push(detail_line("Commands", &project.commands.len().to_string()));
+        lines.push(detail_line("Web links", &project.links.len().to_string()));
+        for link in &project.links {
+            lines.push(detail_line(&link.name, &link.url));
+        }
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -560,6 +635,8 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             },
             if form.group_form {
                 "GROUP"
+            } else if form.link_form {
+                "WEB LINK"
             } else if form.project_id.is_some() {
                 "COMMAND"
             } else {
@@ -606,13 +683,30 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                     frame.render_widget(block, rows[row_index]);
                     inner
                 };
-            let choice = !form.group_form
-                && (if form.project_id.is_some() {
-                    index >= 4
+            let choice = (form.link_form && index == 4)
+                || (!form.group_form
+                    && !form.link_form
+                    && (if form.project_id.is_some() {
+                        index >= 4
+                    } else {
+                        index == 2
+                    }));
+            let value = if form.link_form && index == 3 {
+                let display = if active && !value.is_empty() {
+                    value.as_str()
+                } else if !value.is_empty() {
+                    "********"
+                } else if form.editing_id.is_some()
+                    && app
+                        .selected_project_link()
+                        .is_some_and(|link| link.password_ref.is_some())
+                {
+                    "(saved; blank keeps it)"
                 } else {
-                    index == 2
-                });
-            let value = if choice {
+                    ""
+                };
+                format!("{display}{}", if active { "_" } else { "" })
+            } else if choice {
                 format!("‹ {value} ›")
             } else {
                 format!("{value}{}", if active { "_" } else { "" })
@@ -648,6 +742,9 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             }
             crate::project_app::WorkspaceDelete::Group { name, .. } => {
                 format!("Remove group {name}? Its commands will become ungrouped.")
+            }
+            crate::project_app::WorkspaceDelete::Link { name, .. } => {
+                format!("Delete web link {name}?")
             }
         };
         let area = centered_rect(72, 7, frame.area());
@@ -2690,7 +2787,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "1-6 / F1-F6 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
     };
-    let hint = if app.workspace.form.is_some() {
+    let hint = if app
+        .workspace
+        .form
+        .as_ref()
+        .is_some_and(|form| form.link_form)
+    {
+        "Tab / ↑↓ field  ←→ choice  Enter save  Esc cancel"
+    } else if app.workspace.form.is_some() {
         "Tab / ↑↓ field  ←→ choice  Enter next/save  Esc cancel"
     } else if app.workspace.delete.is_some() || app.workspace.confirmation.is_some() {
         "y / Enter confirm  n / Esc cancel"
@@ -2698,7 +2802,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         if app.workspace.output_open {
             "↑↓ scroll  Home/End  [ ] command  s start  x stop  r restart  Esc back  q quit"
         } else if app.workspace.project_open {
-            "↑↓ select  ←→/Space fold  Enter open  a add  G group  e edit  d delete  v view  s/x/r  A/X services  Esc back"
+            if app.project_links_header_selected() {
+                "↑↓ select  ←→/Space fold  Enter fold  L add link  v view  Esc back"
+            } else if app.selected_project_link().is_some() {
+                "↑↓ select  Enter browser  u username  p password  L add link  e edit  d delete  Esc back"
+            } else {
+                "↑↓ select  ←→/Space fold  Enter open  a command  L link  G group  e edit  d delete  v view  s/x/r  A/X services"
+            }
         } else {
             "↑↓ select  Enter open  a add  e edit  d delete  A/X services  q quit"
         }

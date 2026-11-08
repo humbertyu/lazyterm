@@ -195,7 +195,8 @@ mod tests {
     #[test]
     fn projects_upgrade_additively_persist_backup_and_survive_host_reconciliation() {
         use crate::projects::{
-            CommandKind, ProjectCommand, ProjectDefinition, ProjectTarget, tests::Fixture,
+            CommandKind, ProjectCommand, ProjectDefinition, ProjectLink, ProjectTarget,
+            tests::Fixture,
         };
         let fixture = Fixture::new("metadata");
         let path = fixture.root.join("hosts.json");
@@ -215,9 +216,16 @@ mod tests {
                 group: Some("Development".into()),
                 kind: CommandKind::Service,
                 target: Some(ProjectTarget::Local),
+                lifecycle: crate::projects::ProjectLifecycle::Persistent,
             }],
             groups: vec!["Development".into(), "Empty".into()],
             target: ProjectTarget::Host("fixture".into()),
+            links: vec![ProjectLink {
+                id: 1,
+                name: "Preview".into(),
+                url: "http://localhost:3000/".into(),
+                ..Default::default()
+            }],
         };
         metadata.projects.push(project.clone());
         assert!(metadata.reconcile(&HostCatalog::default()));
