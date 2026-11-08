@@ -142,6 +142,7 @@ Runtime:
 
 - [x] Add a Runtime view for local TCP listeners.
 - [x] Reuse the Hosts catalog to inspect a remote machine over OpenSSH.
+- [x] Add explicit Local/Hosts selectors, independent per-machine browsing state, and machine-labeled termination confirmation.
 - [x] Show protocol, listen address, port, PID, process, user, command, and working directory when available.
 - [x] Refresh inspection results without blocking the TUI.
 - [x] Confirm before sending `TERM` to a selected process.
@@ -159,6 +160,10 @@ Project workspaces:
 
 - [x] Define Projects with a base path, named commands, and optional command working directories.
 - [x] Add/edit/delete Projects and commands with the established a/e/d and Enter semantics.
+- [x] Add optional command groups, group CRUD, default-expanded inline commands, session fold state, and a flat all-commands view.
+- [x] Distinguish Services from Tasks; scope batch start/stop to Services in a group or project.
+- [x] Persist default Project targets and command overrides; block remote execution until its lifecycle is implemented.
+- [ ] Execute remote Project commands through the Hosts catalog with explicit disconnect/exit behavior.
 - [x] Start, stop, and restart project commands with supervised process groups; start/stop all commands.
 - [x] Capture complete stdout/stderr in per-run private logs and show a bounded scrolling output tail and exit status.
 - [x] Clean up owned process groups on normal app exit; escalate stalled stops after two seconds.

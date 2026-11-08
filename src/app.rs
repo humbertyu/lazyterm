@@ -229,6 +229,9 @@ pub struct App {
     pub runtime_entries: Vec<RuntimeEntry>,
     pub runtime_filter: RuntimeFilter,
     pub selected_runtime: usize,
+    pub runtime_list_offset: usize,
+    runtime_views: std::collections::HashMap<RuntimeTarget, runtime::RuntimeView>,
+    runtime_request: u64,
     pub runtime_loading: bool,
     pub runtime_error: Option<String>,
     pub runtime_host_picker_open: bool,
@@ -498,6 +501,9 @@ impl App {
             runtime_target: RuntimeTarget::Local,
             runtime_entries: Vec::new(),
             runtime_filter: RuntimeFilter::Mine,
+            runtime_list_offset: 0,
+            runtime_views: Default::default(),
+            runtime_request: 0,
             selected_runtime: 0,
             runtime_loading: false,
             runtime_error: None,
@@ -1664,9 +1670,18 @@ impl App {
             match event {
                 RuntimeEvent::Listed {
                     target,
+                    request,
                     mut entries,
                 } => {
-                    if target == self.runtime_target {
+                    if target == self.runtime_target && request == self.runtime_request {
+                        let selected = self.selected_runtime_entry().map(|entry| {
+                            (
+                                entry.pid,
+                                entry.address.clone(),
+                                entry.port,
+                                entry.protocol.clone(),
+                            )
+                        });
                         let owners = self.project_service.owners();
                         for entry in &mut entries {
                             if entry.project.as_ref().is_some_and(|owner| {
@@ -1681,15 +1696,31 @@ impl App {
                         }
                         self.runtime_entries = entries;
                         self.update_external_runtime_links();
+                        if let Some((pid, address, port, protocol)) = selected
+                            && let Some(index) =
+                                self.visible_runtime_entries().iter().position(|entry| {
+                                    entry.pid == pid
+                                        && entry.address == address
+                                        && entry.port == port
+                                        && entry.protocol == protocol
+                                })
+                        {
+                            self.selected_runtime = index;
+                        }
                         self.selected_runtime = self
                             .selected_runtime
                             .min(self.visible_runtime_entries().len().saturating_sub(1));
                         self.runtime_loading = false;
                         self.runtime_error = None;
+                        self.runtime_list_offset = self.runtime_scroll_offset(self.viewport_height);
                     }
                 }
-                RuntimeEvent::Failed { target, message } => {
-                    if target == self.runtime_target {
+                RuntimeEvent::Failed {
+                    target,
+                    request,
+                    message,
+                } => {
+                    if target == self.runtime_target && request == self.runtime_request {
                         self.runtime_loading = false;
                         self.runtime_error = Some(message.clone());
                         self.notice = Some(format!("Runtime inspection failed: {message}"));
@@ -1711,13 +1742,74 @@ impl App {
     }
 
     pub fn refresh_runtime(&mut self) {
+        self.runtime_request += 1;
+        if let RuntimeTarget::Host(alias) = &self.runtime_target
+            && !self.hosts.hosts.iter().any(|host| host.alias == *alias)
+        {
+            self.runtime_loading = false;
+            self.runtime_entries.clear();
+            self.runtime_error = Some(format!("Host {alias} is no longer in the Hosts catalog."));
+            return;
+        }
         self.runtime_loading = true;
         self.runtime_error = None;
         runtime::inspect_async(
             self.runtime_sender.clone(),
             self.runtime_target.clone(),
+            self.runtime_request,
             self.project_service.owners(),
         );
+    }
+
+    pub(crate) fn switch_runtime_target(&mut self, target: RuntimeTarget) {
+        if self.runtime_kill_confirmation.is_some() {
+            return;
+        }
+        self.restore_runtime_view(target);
+        self.refresh_runtime();
+    }
+
+    fn restore_runtime_view(&mut self, target: RuntimeTarget) {
+        if self.runtime_target != target {
+            let previous = runtime::RuntimeView {
+                entries: std::mem::take(&mut self.runtime_entries),
+                filter: self.runtime_filter,
+                selected: self.selected_runtime,
+                offset: self.runtime_list_offset,
+                error: self.runtime_error.take(),
+            };
+            self.runtime_views
+                .insert(self.runtime_target.clone(), previous);
+            let next = self.runtime_views.remove(&target).unwrap_or_default();
+            self.runtime_target = target;
+            self.runtime_entries = next.entries;
+            self.runtime_filter = next.filter;
+            self.selected_runtime = next.selected;
+            self.runtime_list_offset = next.offset;
+            self.runtime_error = next.error;
+        }
+    }
+
+    fn open_runtime_host_picker(&mut self) {
+        self.runtime_host_picker_open = true;
+        self.runtime_host_picker_group = None;
+        self.runtime_host_picker_selection = 0;
+    }
+
+    pub(crate) fn runtime_scroll_offset(&self, height: u16) -> usize {
+        let layout = crate::ui::runtime_layout(ratatui::layout::Rect::new(
+            0,
+            0,
+            self.viewport_width,
+            height,
+        ));
+        let capacity = usize::from(layout.listeners.height.saturating_sub(4) / 2).max(1);
+        let count = self.visible_runtime_entries().len();
+        let selected = self.selected_runtime.min(count.saturating_sub(1));
+        self.runtime_list_offset
+            .min(selected)
+            .max(selected.saturating_sub(capacity - 1))
+            .min(count.saturating_sub(capacity))
     }
 
     pub fn visible_runtime_entries(&self) -> Vec<&RuntimeEntry> {
@@ -1785,11 +1877,9 @@ impl App {
                         self.runtime_host_picker_selection = 0;
                     }
                     HostPickerItem::Host(alias) => {
-                        self.runtime_target = RuntimeTarget::Host(alias);
                         self.runtime_host_picker_open = false;
                         self.runtime_host_picker_group = None;
-                        self.selected_runtime = 0;
-                        self.refresh_runtime();
+                        self.switch_runtime_target(RuntimeTarget::Host(alias));
                     }
                 }
             }
@@ -1878,23 +1968,24 @@ impl App {
                 };
                 self.runtime_filter = RuntimeFilter::ALL[next];
                 self.selected_runtime = 0;
+                self.runtime_list_offset = 0;
             }
             KeyCode::Char('r') => self.refresh_runtime(),
             KeyCode::Char('o') => self.open_project_from_runtime(),
             KeyCode::Char('l') => {
-                self.runtime_target = RuntimeTarget::Local;
-                self.selected_runtime = 0;
-                self.refresh_runtime();
+                self.switch_runtime_target(RuntimeTarget::Local);
             }
-            KeyCode::Char('s') => {
-                self.runtime_host_picker_open = true;
-                self.runtime_host_picker_group = None;
-                self.runtime_host_picker_selection = 0;
+            KeyCode::Char('s' | 'h') => {
+                self.open_runtime_host_picker();
             }
             KeyCode::Char('k') => {
-                if !self.runtime_loading
-                    && self.runtime_error.is_none()
-                    && let Some(entry) = self.selected_runtime_entry()
+                if self.runtime_loading {
+                    self.notice = Some("Wait for the current machine inspection to finish.".into());
+                } else if self.runtime_error.is_some() {
+                    self.notice = Some(
+                        "Refresh this machine successfully before terminating a process.".into(),
+                    );
+                } else if let Some(entry) = self.selected_runtime_entry()
                     && entry.pid.is_some()
                 {
                     self.runtime_kill_confirmation = Some(entry.clone());
@@ -1904,6 +1995,7 @@ impl App {
             }
             _ => {}
         }
+        self.runtime_list_offset = self.runtime_scroll_offset(self.viewport_height);
     }
 
     pub fn start_selected_tunnel(&mut self) {
@@ -2193,6 +2285,43 @@ impl App {
             || self.workspace.delete.is_some()
             || self.workspace.confirmation.is_some()
         {
+            return InputAction::None;
+        }
+        if self.section == NavSection::Runtime {
+            if self.runtime_host_picker_open || self.runtime_kill_confirmation.is_some() {
+                return InputAction::None;
+            }
+            self.viewport_width = viewport_width;
+            self.viewport_height = viewport_height;
+            let layout = crate::ui::runtime_layout(ratatui::layout::Rect::new(
+                0,
+                0,
+                viewport_width,
+                viewport_height,
+            ));
+            let position = ratatui::layout::Position::new(column, row);
+            if layout.local.contains(position) {
+                self.switch_runtime_target(RuntimeTarget::Local);
+            } else if layout.hosts.contains(position) {
+                self.open_runtime_host_picker();
+            } else if let Some(index) = crate::ui::runtime_filter_areas(layout.filters, self)
+                .iter()
+                .position(|area| area.contains(position))
+            {
+                self.runtime_filter = RuntimeFilter::ALL[index];
+                self.selected_runtime = 0;
+                self.runtime_list_offset = 0;
+            } else {
+                let list = layout.listeners.inner(ratatui::layout::Margin::new(2, 2));
+                if list.contains(position) {
+                    let index =
+                        self.runtime_scroll_offset(viewport_height) + usize::from(row - list.y) / 2;
+                    if index < self.visible_runtime_entries().len() {
+                        self.selected_runtime = index;
+                    }
+                }
+            }
+            self.runtime_list_offset = self.runtime_scroll_offset(viewport_height);
             return InputAction::None;
         }
         if self.section == NavSection::Snippets {
@@ -4555,6 +4684,7 @@ mod tests {
         app.runtime_sender
             .send(RuntimeEvent::Listed {
                 target: app.runtime_target.clone(),
+                request: app.runtime_request,
                 entries: vec![RuntimeEntry {
                     project: Some(owner),
                     ..entry
@@ -4611,6 +4741,171 @@ mod tests {
         assert!(!app.runtime_host_picker_open);
         press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(app.runtime_host_picker_open);
+    }
+
+    fn runtime_listener(port: u16) -> RuntimeEntry {
+        RuntimeEntry {
+            protocol: "TCP".into(),
+            address: "127.0.0.1".into(),
+            port,
+            pid: Some(u32::from(port)),
+            process: "fixture".into(),
+            user: "501".into(),
+            command: format!("fixture --port {port}"),
+            working_directory: Some("/tmp/project".into()),
+            owned_by_current_user: true,
+            kind: runtime::RuntimeProcessKind::Application,
+            origin: runtime::RuntimeOrigin::CommandLine,
+            origin_reason: "Shell ancestor".into(),
+            project: None,
+            external_project: None,
+        }
+    }
+
+    #[test]
+    fn runtime_project_link_restores_the_commands_group_context() {
+        let fixture = crate::projects::tests::Fixture::new("runtime-group-link");
+        let mut app = app_fixture();
+        let mut project = fixture.project.clone();
+        let mut command = fixture.command("printf check");
+        command.group = Some("Checks".into());
+        project.commands.push(command.clone());
+        project.groups = vec!["Services".into(), "Checks".into()];
+        app.metadata.projects.push(project.clone());
+        let mut entry = runtime_listener(3000);
+        entry.project = Some(crate::projects::ProjectOwner {
+            key: (project.id, command.id),
+            run_id: 1,
+            process_group: 123,
+            project_name: project.name.clone(),
+            command_name: command.name.clone(),
+        });
+        app.runtime_entries.push(entry);
+        app.section = NavSection::Projects;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert!(app.project_group_collapsed("Checks"));
+        app.section = NavSection::Runtime;
+        app.open_project_from_runtime();
+        assert!(!app.project_group_collapsed("Checks"));
+        assert!(app.workspace.output_open);
+        assert_eq!(app.selected_project_key(), Some((project.id, command.id)));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.selected_project_key(), Some((project.id, command.id)));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.workspace.project_open);
+    }
+
+    #[test]
+    fn runtime_keeps_independent_views_for_local_and_each_host() {
+        let mut app = app_fixture();
+        app.runtime_entries = (3000..3020).map(runtime_listener).collect();
+        app.runtime_filter = RuntimeFilter::All;
+        app.selected_runtime = 14;
+        app.runtime_list_offset = app.runtime_scroll_offset(24);
+        let local_offset = app.runtime_list_offset;
+        assert!(local_offset > 0);
+        app.restore_runtime_view(RuntimeTarget::Host("web".into()));
+        assert_eq!(app.runtime_filter, RuntimeFilter::Mine);
+        assert!(app.runtime_entries.is_empty());
+        assert_eq!(app.selected_runtime, 0);
+        app.runtime_entries = vec![runtime_listener(8080), runtime_listener(8081)];
+        app.runtime_filter = RuntimeFilter::Applications;
+        app.selected_runtime = 1;
+        app.restore_runtime_view(RuntimeTarget::Host("db".into()));
+        app.runtime_entries = vec![runtime_listener(5432)];
+        app.runtime_filter = RuntimeFilter::All;
+        app.restore_runtime_view(RuntimeTarget::Local);
+        assert_eq!(app.runtime_filter, RuntimeFilter::All);
+        assert_eq!(app.selected_runtime_entry().unwrap().port, 3014);
+        assert_eq!(app.runtime_scroll_offset(24), local_offset);
+        app.restore_runtime_view(RuntimeTarget::Host("web".into()));
+        assert_eq!(app.runtime_filter, RuntimeFilter::Applications);
+        assert_eq!(app.selected_runtime_entry().unwrap().port, 8081);
+        app.restore_runtime_view(RuntimeTarget::Host("db".into()));
+        assert_eq!(app.selected_runtime_entry().unwrap().port, 5432);
+    }
+
+    #[test]
+    fn runtime_rejects_old_machine_requests_and_preserves_selected_listener_on_refresh() {
+        let mut app = app_fixture();
+        app.runtime_entries = vec![runtime_listener(3000), runtime_listener(3001)];
+        app.selected_runtime = 1;
+        app.runtime_request = 3;
+        app.runtime_loading = true;
+        for (target, request) in [
+            (RuntimeTarget::Host("web".into()), 3),
+            (RuntimeTarget::Local, 1),
+        ] {
+            app.runtime_sender
+                .send(RuntimeEvent::Listed {
+                    target: target.clone(),
+                    request,
+                    entries: vec![runtime_listener(9000)],
+                })
+                .unwrap();
+            app.runtime_sender
+                .send(RuntimeEvent::Failed {
+                    target,
+                    request,
+                    message: "obsolete".into(),
+                })
+                .unwrap();
+        }
+        app.poll_runtime();
+        assert!(app.runtime_loading);
+        assert!(app.runtime_error.is_none());
+        assert_eq!(app.selected_runtime_entry().unwrap().port, 3001);
+        app.runtime_sender
+            .send(RuntimeEvent::Listed {
+                target: RuntimeTarget::Local,
+                request: 3,
+                entries: vec![
+                    runtime_listener(2000),
+                    runtime_listener(3000),
+                    runtime_listener(3001),
+                ],
+            })
+            .unwrap();
+        app.poll_runtime();
+        assert!(!app.runtime_loading);
+        assert_eq!(app.selected_runtime, 2);
+        assert_eq!(app.selected_runtime_entry().unwrap().port, 3001);
+    }
+
+    #[test]
+    fn runtime_mouse_targets_categories_and_scrolled_rows_obey_confirmation() {
+        let mut app = app_fixture();
+        app.section = NavSection::Runtime;
+        app.runtime_entries = (3000..3020).map(runtime_listener).collect();
+        app.selected_runtime = 15;
+        let viewport = ratatui::layout::Rect::new(0, 0, 120, 30);
+        app.viewport_width = viewport.width;
+        app.viewport_height = viewport.height;
+        app.runtime_list_offset = app.runtime_scroll_offset(viewport.height);
+        let layout = crate::ui::runtime_layout(viewport);
+        let expected = app.runtime_list_offset + 1;
+        app.handle_mouse(layout.listeners.x + 3, layout.listeners.y + 4, 120, 30);
+        assert_eq!(app.selected_runtime, expected);
+        let filters = crate::ui::runtime_filter_areas(layout.filters, &app);
+        app.handle_mouse(filters[3].x + 1, filters[3].y, 120, 30);
+        assert_eq!(app.runtime_filter, RuntimeFilter::All);
+        assert_eq!(app.selected_runtime, 0);
+        assert_eq!(app.runtime_list_offset, 0);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(app.runtime_kill_confirmation.is_some());
+        app.handle_mouse(layout.hosts.x + 1, layout.hosts.y, 120, 30);
+        assert!(!app.runtime_host_picker_open);
+        app.switch_runtime_target(RuntimeTarget::Host("other".into()));
+        assert_eq!(app.runtime_target, RuntimeTarget::Local);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_mouse(layout.hosts.x + 1, layout.hosts.y, 120, 30);
+        assert!(app.runtime_host_picker_open);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.runtime_loading = true;
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(app.runtime_kill_confirmation.is_none());
     }
 
     #[test]

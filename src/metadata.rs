@@ -194,7 +194,9 @@ mod tests {
 
     #[test]
     fn projects_upgrade_additively_persist_backup_and_survive_host_reconciliation() {
-        use crate::projects::{ProjectCommand, ProjectDefinition, tests::Fixture};
+        use crate::projects::{
+            CommandKind, ProjectCommand, ProjectDefinition, ProjectTarget, tests::Fixture,
+        };
         let fixture = Fixture::new("metadata");
         let path = fixture.root.join("hosts.json");
         fs::write(&path, r#"{"version":1,"tags":{"gone":["work"]}}"#).unwrap();
@@ -210,7 +212,12 @@ mod tests {
                 name: "Tests".into(),
                 command: "cargo test".into(),
                 working_directory: Some("sub directory".into()),
+                group: Some("Development".into()),
+                kind: CommandKind::Service,
+                target: Some(ProjectTarget::Local),
             }],
+            groups: vec!["Development".into(), "Empty".into()],
+            target: ProjectTarget::Host("fixture".into()),
         };
         metadata.projects.push(project.clone());
         assert!(metadata.reconcile(&HostCatalog::default()));

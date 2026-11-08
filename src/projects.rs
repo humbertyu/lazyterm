@@ -20,6 +20,42 @@ pub struct ProjectDefinition {
     pub base_path: PathBuf,
     #[serde(default)]
     pub commands: Vec<ProjectCommand>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub target: ProjectTarget,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ProjectTarget {
+    #[default]
+    Local,
+    Host(String),
+}
+
+impl ProjectTarget {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Local => "Local".into(),
+            Self::Host(alias) => format!("Host: {alias}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CommandKind {
+    Service,
+    #[default]
+    Task,
+}
+
+impl CommandKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Service => "Service",
+            Self::Task => "Task",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -29,12 +65,30 @@ pub struct ProjectCommand {
     pub command: String,
     #[serde(default)]
     pub working_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub kind: CommandKind,
+    #[serde(default)]
+    pub target: Option<ProjectTarget>,
+}
+
+pub fn execution_target<'a>(
+    project: &'a ProjectDefinition,
+    command: &'a ProjectCommand,
+) -> &'a ProjectTarget {
+    command.target.as_ref().unwrap_or(&project.target)
 }
 
 pub fn working_directory(
     project: &ProjectDefinition,
     command: &ProjectCommand,
 ) -> io::Result<PathBuf> {
+    if *execution_target(project, command) != ProjectTarget::Local {
+        return Err(io::Error::other(
+            "Remote Project execution is not available yet.",
+        ));
+    }
     let base = expand_home(&project.base_path)?;
     if !base.is_absolute() {
         return Err(io::Error::other(
@@ -272,6 +326,7 @@ impl ProjectService {
         project: &ProjectDefinition,
         command: &ProjectCommand,
     ) -> io::Result<()> {
+        working_directory(project, command)?;
         let key = (project.id, command.id);
         if let Some(task) = self.tasks.get_mut(&key)
             && task.active()
@@ -500,6 +555,7 @@ pub(crate) mod tests {
                     name: "Fixture project".into(),
                     base_path: root.clone(),
                     commands: Vec::new(),
+                    ..Default::default()
                 },
                 root,
             }
@@ -515,6 +571,7 @@ pub(crate) mod tests {
                 name: "Fixture command".into(),
                 command: command.into(),
                 working_directory: None,
+                ..Default::default()
             }
         }
 

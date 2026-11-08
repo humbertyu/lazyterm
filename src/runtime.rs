@@ -16,10 +16,19 @@ else
 fi
 "#;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeTarget {
     Local,
     Host(String),
+}
+
+#[derive(Default)]
+pub(crate) struct RuntimeView {
+    pub entries: Vec<RuntimeEntry>,
+    pub filter: RuntimeFilter,
+    pub selected: usize,
+    pub offset: usize,
+    pub error: Option<String>,
 }
 
 impl RuntimeTarget {
@@ -140,10 +149,12 @@ impl RuntimeProcessKind {
 pub enum RuntimeEvent {
     Listed {
         target: RuntimeTarget,
+        request: u64,
         entries: Vec<RuntimeEntry>,
     },
     Failed {
         target: RuntimeTarget,
+        request: u64,
         message: String,
     },
     ActionCompleted {
@@ -159,13 +170,22 @@ pub enum RuntimeEvent {
 pub fn inspect_async(
     sender: Sender<RuntimeEvent>,
     target: RuntimeTarget,
+    request: u64,
     owners: Vec<ProjectOwner>,
 ) {
     std::thread::spawn(move || {
         let result = inspect(&target, &owners);
         let event = match result {
-            Ok(entries) => RuntimeEvent::Listed { target, entries },
-            Err(message) => RuntimeEvent::Failed { target, message },
+            Ok(entries) => RuntimeEvent::Listed {
+                target,
+                request,
+                entries,
+            },
+            Err(message) => RuntimeEvent::Failed {
+                target,
+                request,
+                message,
+            },
         };
         let _ = sender.send(event);
     });

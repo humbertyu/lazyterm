@@ -49,7 +49,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         NavSection::Files => render_files(frame, page[2], app),
         NavSection::Tunnels => render_tunnels(frame, page[2], app),
         NavSection::Snippets => render_snippets(frame, page[2], app),
-        NavSection::Runtime => render_runtime(frame, page[2], app),
+        NavSection::Runtime => render_runtime(frame, app),
         NavSection::Projects => render_projects(frame, page[2], app),
     }
     render_footer(frame, page[3], app);
@@ -102,7 +102,7 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
         render_runtime_host_picker(frame, app);
     }
     if let Some(entry) = &app.runtime_kill_confirmation {
-        render_runtime_kill_confirmation(frame, entry);
+        render_runtime_kill_confirmation(frame, entry, &app.runtime_target);
     }
     if let Some((alias, tags)) = &app.tags_dialog {
         let area = centered_rect(68, 7, frame.area());
@@ -130,6 +130,17 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
 
 fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
     use crate::projects::TaskStatus;
+    if let Some(project) = app
+        .metadata
+        .projects
+        .iter()
+        .find(|project| project.id == key.0)
+        && let Some(command) = project.commands.iter().find(|command| command.id == key.1)
+        && *crate::projects::execution_target(project, command)
+            != crate::projects::ProjectTarget::Local
+    {
+        return ("remote execution pending".into(), Color::Yellow);
+    }
     if !app.project_service.active(key) {
         let external = app.external_project_runs(key);
         if let Some(run) = external.first() {
@@ -268,37 +279,83 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area);
     let title = if app.workspace.project_open {
-        format!(" PROJECT / {} ", project.name)
+        format!(
+            " {} / {} ",
+            project.name,
+            if app.workspace.flat {
+                "All commands"
+            } else {
+                "Commands"
+            }
+        )
     } else {
         " PROJECTS ".into()
     };
     let mut state = ListState::default();
     let rows: Vec<ListItem> = if app.workspace.project_open {
-        state.select(Some(app.workspace.selected_command));
-        project
-            .commands
+        state.select(Some(app.workspace.selected_item));
+        app.project_items()
             .iter()
-            .map(|command| {
+            .map(|item| {
+                let command = match item {
+                    crate::project_app::WorkspaceItem::Group(group) => {
+                        let commands = project
+                            .commands
+                            .iter()
+                            .filter(|command| command.group.as_ref() == Some(group))
+                            .collect::<Vec<_>>();
+                        let running = commands
+                            .iter()
+                            .filter(|command| app.project_is_running((project.id, command.id)))
+                            .count();
+                        return ListItem::new(Line::from(Span::styled(
+                            format!(
+                                "{} {group}  {} / {running} active",
+                                if app.project_group_collapsed(group) {
+                                    "▸"
+                                } else {
+                                    "▾"
+                                },
+                                commands.len()
+                            ),
+                            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    crate::project_app::WorkspaceItem::Command(index) => &project.commands[*index],
+                };
+                let indent = if !app.workspace.flat && command.group.is_some() {
+                    "  "
+                } else {
+                    ""
+                };
                 let (status, color) = project_status(app, (project.id, command.id));
                 let mut lines = vec![
                     Line::from(Span::styled(
-                        command.name.as_str(),
+                        format!("{indent}{}", command.name),
                         Style::default().fg(TEXT),
                     )),
                     Line::from(Span::styled(
-                        format!("  {status}"),
+                        format!(
+                            "{indent}  {} / {}",
+                            command.kind.label(),
+                            crate::projects::execution_target(project, command).label()
+                        ),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(Span::styled(
+                        format!("{indent}  {status}"),
                         Style::default().fg(color),
                     )),
                 ];
                 if let Some(result) = project_last_result(app, (project.id, command.id)) {
                     lines.push(Line::from(Span::styled(
-                        format!("  last run: {result}"),
+                        format!("{indent}  last run: {result}"),
                         Style::default().fg(MUTED),
                     )));
                 }
                 if !wide {
                     lines.push(Line::from(Span::styled(
-                        format!("  {}", command.command),
+                        format!("{indent}  {}", command.command),
                         Style::default().fg(MUTED),
                     )));
                 }
@@ -360,6 +417,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         detail_line("Project", &project.name),
         detail_line("Base directory", &project.base_path.display().to_string()),
+        detail_line("Default target", &project.target.label()),
     ];
     if app.workspace.project_open
         && let Some(command) = app.selected_project_command()
@@ -367,6 +425,12 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
         let key = (project.id, command.id);
         lines.extend([
             detail_line("Command name", &command.name),
+            detail_line("Group", command.group.as_deref().unwrap_or("Ungrouped")),
+            detail_line("Type", command.kind.label()),
+            detail_line(
+                "Target",
+                &crate::projects::execution_target(project, command).label(),
+            ),
             detail_line("Command", &command.command),
             detail_line(
                 "Working directory",
@@ -408,6 +472,25 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                 detail_line("Stderr log", &task.stderr_log.display().to_string()),
             ]);
         }
+    } else if app.workspace.project_open
+        && let Some(crate::project_app::WorkspaceItem::Group(group)) =
+            app.project_items().get(app.workspace.selected_item)
+    {
+        let commands = project
+            .commands
+            .iter()
+            .filter(|command| command.group.as_ref() == Some(group))
+            .collect::<Vec<_>>();
+        lines.push(detail_line("Group", group));
+        lines.push(detail_line("Commands", &commands.len().to_string()));
+        lines.push(detail_line(
+            "Services",
+            &commands
+                .iter()
+                .filter(|command| command.kind == crate::projects::CommandKind::Service)
+                .count()
+                .to_string(),
+        ));
     } else {
         lines.push(detail_line("Commands", &project.commands.len().to_string()));
     }
@@ -470,12 +553,14 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
         frame.render_widget(Clear, area);
         let title = format!(
             " {} {} ",
-            if form.editing_id.is_some() {
+            if form.editing_id.is_some() || form.original_group.is_some() {
                 "EDIT"
             } else {
                 "ADD"
             },
-            if form.project_id.is_some() {
+            if form.group_form {
+                "GROUP"
+            } else if form.project_id.is_some() {
                 "COMMAND"
             } else {
                 "PROJECT"
@@ -485,15 +570,27 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let compact = area.height < (form.fields.len() * 3 + 4) as u16;
-        let mut fields = vec![Constraint::Length(if compact { 2 } else { 3 }); form.fields.len()];
+        let field_height = if compact { 2 } else { 3 };
+        let visible_count = (usize::from(inner.height.saturating_sub(2)) / field_height)
+            .max(1)
+            .min(form.fields.len());
+        let start = form.selected.saturating_sub(visible_count - 1);
+        let mut fields = vec![Constraint::Length(field_height as u16); visible_count];
         fields.push(Constraint::Min(1));
         let rows = Layout::vertical(fields).split(inner);
-        for (index, value) in form.fields.iter().enumerate() {
+        for (row_index, (index, value)) in form
+            .fields
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_count)
+            .enumerate()
+        {
             let active = index == form.selected;
             let inner =
                 if compact {
                     let fields = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
-                        .split(rows[index]);
+                        .split(rows[row_index]);
                     frame.render_widget(
                         Paragraph::new(form.labels()[index])
                             .style(Style::default().fg(if active { GREEN } else { MUTED })),
@@ -505,11 +602,21 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                         .borders(Borders::ALL)
                         .title(form.labels()[index])
                         .border_style(Style::default().fg(if active { GREEN } else { BORDER }));
-                    let inner = block.inner(rows[index]);
-                    frame.render_widget(block, rows[index]);
+                    let inner = block.inner(rows[row_index]);
+                    frame.render_widget(block, rows[row_index]);
                     inner
                 };
-            let value = format!("{value}{}", if active { "_" } else { "" });
+            let choice = !form.group_form
+                && (if form.project_id.is_some() {
+                    index >= 4
+                } else {
+                    index == 2
+                });
+            let value = if choice {
+                format!("‹ {value} ›")
+            } else {
+                format!("{value}{}", if active { "_" } else { "" })
+            };
             let width = Line::from(value.as_str()).width();
             frame.render_widget(
                 Paragraph::new(value)
@@ -528,7 +635,7 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                 Paragraph::new(error.as_str())
                     .style(Style::default().fg(Color::Red))
                     .wrap(Wrap { trim: false }),
-                rows[form.fields.len()],
+                rows[visible_count],
             );
         }
     } else if let Some(target) = &app.workspace.delete {
@@ -538,6 +645,9 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             }
             crate::project_app::WorkspaceDelete::Command { name, .. } => {
                 format!("Delete command {name}?")
+            }
+            crate::project_app::WorkspaceDelete::Group { name, .. } => {
+                format!("Remove group {name}? Its commands will become ungrouped.")
             }
         };
         let area = centered_rect(72, 7, frame.area());
@@ -728,36 +838,105 @@ fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
-    let sections = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
-    let selected_filter = crate::runtime::RuntimeFilter::ALL
+pub(crate) struct RuntimeLayout {
+    pub local: Rect,
+    pub hosts: Rect,
+    pub target: Rect,
+    pub filters: Rect,
+    pub listeners: Rect,
+    pub details: Rect,
+}
+
+pub(crate) fn runtime_layout(viewport: Rect) -> RuntimeLayout {
+    let area = page_layout().split(viewport)[2];
+    let sections = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .split(area);
+    let targets = Layout::horizontal([
+        Constraint::Length(9),
+        Constraint::Length(11),
+        Constraint::Min(0),
+    ])
+    .split(sections[0]);
+    let columns = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(sections[2]);
+    RuntimeLayout {
+        local: targets[0],
+        hosts: targets[1],
+        target: targets[2],
+        filters: sections[1],
+        listeners: columns[0],
+        details: columns[1],
+    }
+}
+
+pub(crate) fn runtime_filter_areas(area: Rect, app: &App) -> Vec<Rect> {
+    let mut x = area.x;
+    let mut y = area.y;
+    crate::runtime::RuntimeFilter::ALL
         .iter()
-        .position(|filter| *filter == app.runtime_filter)
-        .unwrap_or(0);
-    let filter_titles = crate::runtime::RuntimeFilter::ALL.iter().map(|filter| {
+        .map(|filter| {
+            let count = app
+                .runtime_entries
+                .iter()
+                .filter(|entry| filter.matches(entry))
+                .count();
+            let width = (filter.title().len() + count.to_string().len() + 3) as u16;
+            if x > area.x && x.saturating_add(width) > area.right() && y + 1 < area.bottom() {
+                x = area.x;
+                y += 1;
+            }
+            let rect = Rect::new(x, y, width.min(area.right().saturating_sub(x)), 1);
+            x = x.saturating_add(width + 1).min(area.right());
+            rect
+        })
+        .collect()
+}
+
+fn render_runtime(frame: &mut Frame, app: &App) {
+    let layout = runtime_layout(frame.area());
+    let active = Style::default()
+        .fg(GREEN)
+        .bg(Color::Rgb(47, 78, 61))
+        .add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(MUTED);
+    let local = app.runtime_target == crate::runtime::RuntimeTarget::Local;
+    frame.render_widget(
+        Paragraph::new(" Local ").style(if local { active } else { inactive }),
+        layout.local,
+    );
+    frame.render_widget(
+        Paragraph::new(" Hosts ▾ ").style(if local { inactive } else { active }),
+        layout.hosts,
+    );
+    frame.render_widget(
+        Paragraph::new(app.runtime_target.label()).style(Style::default().fg(TEXT)),
+        layout.target,
+    );
+    for (filter, area) in crate::runtime::RuntimeFilter::ALL
+        .iter()
+        .zip(runtime_filter_areas(layout.filters, app))
+    {
         let count = app
             .runtime_entries
             .iter()
             .filter(|entry| filter.matches(entry))
             .count();
-        Line::from(format!("{} {count}", filter.title()))
-    });
-    frame.render_widget(
-        Tabs::new(filter_titles)
-            .select(selected_filter)
-            .style(Style::default().fg(MUTED))
-            .highlight_style(
-                Style::default()
-                    .fg(GREEN)
-                    .bg(Color::Rgb(47, 78, 61))
-                    .add_modifier(Modifier::BOLD),
+        frame.render_widget(
+            Paragraph::new(format!(" {} {count} ", filter.title())).style(
+                if *filter == app.runtime_filter {
+                    active
+                } else {
+                    inactive
+                },
             ),
-        sections[0],
-    );
-    let area = sections[1];
+            area,
+        );
+    }
     let entries = app.visible_runtime_entries();
-    let columns =
-        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).split(area);
     let target = app.runtime_target.label();
     let title = if app.runtime_loading {
         format!(" RUNTIME / {target}  loading... ")
@@ -765,8 +944,8 @@ fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
         format!(" RUNTIME / {target} ")
     };
     let block = panel(&title);
-    let inner = block.inner(columns[0]);
-    frame.render_widget(block, columns[0]);
+    let inner = block.inner(layout.listeners);
+    frame.render_widget(block, layout.listeners);
 
     if let Some(error) = &app.runtime_error {
         frame.render_widget(
@@ -851,7 +1030,8 @@ fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
             ])
             .style(row_style)
         });
-        let mut state = ListState::default();
+        let mut state =
+            ListState::default().with_offset(app.runtime_scroll_offset(frame.area().height));
         if !entries.is_empty() {
             state.select(Some(app.selected_runtime));
         }
@@ -872,6 +1052,7 @@ fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
         },
         |entry| {
             let mut lines = vec![
+                detail_line("Machine", &app.runtime_target.label()),
                 detail_line("Protocol", &entry.protocol),
                 detail_line("Address", &entry.address),
                 detail_line("Port", &entry.port.to_string()),
@@ -921,7 +1102,7 @@ fn render_runtime(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(detail_lines)
             .block(panel(" PROCESS "))
             .wrap(Wrap { trim: false }),
-        columns[1],
+        layout.details,
     );
 }
 
@@ -960,8 +1141,12 @@ fn render_runtime_host_picker(frame: &mut Frame, app: &App) {
     );
 }
 
-fn render_runtime_kill_confirmation(frame: &mut Frame, entry: &crate::runtime::RuntimeEntry) {
-    let area = centered_rect(76, 9, frame.area());
+fn render_runtime_kill_confirmation(
+    frame: &mut Frame,
+    entry: &crate::runtime::RuntimeEntry,
+    target: &crate::runtime::RuntimeTarget,
+) {
+    let area = centered_rect(76, 12, frame.area());
     frame.render_widget(Clear, area);
     let pid = entry
         .pid
@@ -971,6 +1156,16 @@ fn render_runtime_kill_confirmation(frame: &mut Frame, entry: &crate::runtime::R
     frame.render_widget(block, area);
     frame.render_widget(
         Paragraph::new(vec![
+            Line::from(Span::styled(
+                match target {
+                    crate::runtime::RuntimeTarget::Local => "Machine: Local".to_string(),
+                    crate::runtime::RuntimeTarget::Host(alias) => {
+                        format!("Machine: Host / {alias}")
+                    }
+                },
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
             Line::from(entry.project.as_ref().map_or_else(
                 || {
                     if let Some(run) = &entry.external_project {
@@ -2496,16 +2691,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "1-6 / F1-F6 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last"
     };
     let hint = if app.workspace.form.is_some() {
-        "Tab / ↑↓ field  Enter next/save  Esc cancel"
+        "Tab / ↑↓ field  ←→ choice  Enter next/save  Esc cancel"
     } else if app.workspace.delete.is_some() || app.workspace.confirmation.is_some() {
         "y / Enter confirm  n / Esc cancel"
     } else if app.section == NavSection::Projects {
         if app.workspace.output_open {
             "↑↓ scroll  Home/End  [ ] command  s start  x stop  r restart  Esc back  q quit"
         } else if app.workspace.project_open {
-            "↑↓ select  Enter output  a add  e edit  d delete  s start  x stop  r restart  A/X all  Esc back"
+            "↑↓ select  ←→/Space fold  Enter open  a add  G group  e edit  d delete  v view  s/x/r  A/X services  Esc back"
         } else {
-            "↑↓ select  Enter open  a add  e edit  d delete  A start all  X stop all  q quit"
+            "↑↓ select  Enter open  a add  e edit  d delete  A/X services  q quit"
         }
     } else if app.snippet_execution_view {
         "↑↓ scroll output  [ ] select Host  c cancel  C clear  Esc back  q quit"
@@ -2596,7 +2791,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else if app.runtime_kill_confirmation.is_some() {
             "y / Enter confirm  n / Esc cancel"
         } else {
-            "Left/Right category  ↑↓ select  s Host  l Local  r refresh  k terminate  o project  q quit"
+            "l Local  h/s Hosts  Left/Right category  ↑↓ select  r refresh  k terminate  o project  q quit"
         }
     } else {
         "q quit"
@@ -3163,6 +3358,25 @@ mod tests {
             app.runtime_filter = RuntimeFilter::System;
             terminal.draw(|frame| render(frame, &app)).unwrap();
             assert!(!format!("{}", terminal.backend()).contains("node"));
+            app.runtime_filter = RuntimeFilter::Mine;
+            app.runtime_target = crate::runtime::RuntimeTarget::Host("prod-web".into());
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Local"));
+            assert!(text.contains("Hosts ▾"));
+            assert!(text.contains("prod-web"));
+            let layout = runtime_layout(terminal.get_frame().area());
+            assert_eq!(
+                terminal.backend().buffer()[(layout.hosts.x + 1, layout.hosts.y)].fg,
+                GREEN
+            );
+            assert_eq!(
+                terminal.backend().buffer()[(layout.local.x + 1, layout.local.y)].fg,
+                MUTED
+            );
+            app.runtime_kill_confirmation = app.selected_runtime_entry().cloned();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("Machine: Host / prod-web"));
         }
     }
 
@@ -3181,6 +3395,12 @@ mod tests {
                 terminal
                     .draw(|frame| render(frame, &app))
                     .expect("render section");
+                if section == NavSection::Runtime {
+                    let text = format!("{}", terminal.backend());
+                    for label in ["Local", "Hosts ▾", "Mine 0", "Apps 0", "System 0", "All 0"] {
+                        assert!(text.contains(label), "{width}x{height}: missing {label}");
+                    }
+                }
             }
         }
     }
