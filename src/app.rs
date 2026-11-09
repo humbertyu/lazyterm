@@ -3498,7 +3498,12 @@ impl App {
             KeyCode::Char('a') if self.section == NavSection::Hosts => self.open_host_form(None),
             KeyCode::Char('k') if self.section == NavSection::Hosts => {
                 if let Some(host) = self.selected_host() {
-                    self.open_credentials(Some(host.alias.clone()), false);
+                    self.open_host_ssh_key_selector(host.alias.clone());
+                }
+            }
+            KeyCode::Char('x') if self.section == NavSection::Hosts => {
+                if let Some(alias) = self.selected_host().map(|host| host.alias.clone()) {
+                    self.unlink_host_password(&alias);
                 }
             }
             KeyCode::Char('U') if self.section == NavSection::Hosts => {

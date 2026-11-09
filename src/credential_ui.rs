@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, HostPickerItem},
+    app::App,
     credential_app::FormKind,
     credentials::{CredentialKind, CredentialSource},
 };
@@ -159,7 +159,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
         details.push(Line::from(""));
         let hosts = app.credential_item_hosts(&item);
         details.push(Line::from(format!(
-            "Used by Hosts ({}): {}",
+            "Related Hosts ({}): {}",
             hosts.len(),
             if hosts.is_empty() {
                 "None".into()
@@ -188,10 +188,23 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
             .style(Style::default().fg(ACCENT)),
         rows[1],
     );
-    let help = if state.target.is_some() && !state.upload_only {
-        "Enter assign to Host  u upload public key  x unlink password\na password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back"
+    let help = if state.ssh_key_only {
+        format!(
+            "Host: {}  Enter set SSH key  u upload public key\nEsc back",
+            state.target.as_deref().unwrap_or_default()
+        )
+    } else if state.target.is_some() && !state.upload_only {
+        format!(
+            "Host: {}  Enter set SSH key  u upload public key  x unlink password\na password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back",
+            state.target.as_deref().unwrap_or_default()
+        )
+    } else if state.target.is_some() && state.upload_only {
+        format!(
+            "Host: {}  Enter upload public key  p copy  r refresh\nEsc back",
+            state.target.as_deref().unwrap_or_default()
+        )
     } else {
-        "a password  g generate key  i import  e edit  d remove  r refresh\nEnter assign to Host  u upload key  p copy  Esc back"
+        "a password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back".into()
     };
     frame.render_widget(
         Paragraph::new(help)
@@ -210,19 +223,34 @@ fn render_overlays(frame: &mut Frame, app: &App) {
             FormKind::Password => " PASSWORD / SYSTEM KEYCHAIN ",
             FormKind::Generate => " GENERATE ED25519 SSH KEY ",
             FormKind::Import => " IMPORT SSH KEY ",
+            FormKind::RenameKey => " RENAME SSH KEY ",
         };
         let block = panel(title);
         let inner = block.inner(form_area);
         frame.render_widget(block, form_area);
         let note = match form.kind {
             FormKind::Password => {
-                "Saved in the OS credential store. Configuration contains only a reference."
+                "Saved in the OS credential store. Configuration contains only a reference.".into()
             }
             FormKind::Generate => {
-                "Creates id_ed25519 + id_ed25519.pub in a NEW directory. This key has no passphrase; keep its private file protected."
+                "Creates id_ed25519 + id_ed25519.pub in a NEW directory. This key has no passphrase; keep its private file protected.".into()
             }
             FormKind::Import => {
-                "References the existing private key file. Requires a matching .pub file; private keys are never copied into configuration."
+                "References the existing private key file. Requires a matching .pub file; private keys are never copied into configuration.".into()
+            }
+            FormKind::RenameKey => {
+                let path = form
+                    .id
+                    .and_then(|id| {
+                        app.metadata
+                            .credentials
+                            .iter()
+                            .find(|credential| credential.id == id)
+                    })
+                    .and_then(|credential| credential.private_key_path.as_deref())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                format!("Display name only. Key file path is unchanged:\n{path}")
             }
         };
         let rows = Layout::vertical([
@@ -287,35 +315,6 @@ fn render_overlays(frame: &mut Frame, app: &App) {
             Paragraph::new("Tab / Up / Down field   Enter next/save   Esc cancel")
                 .style(Style::default().fg(MUTED)),
             rows[3],
-        );
-    }
-    if state.picker {
-        let area = centered(frame.area(), 64, 20);
-        frame.render_widget(Clear, area);
-        let title = state.picker_group.as_ref().map_or_else(
-            || {
-                if state.picker_upload {
-                    " UPLOAD PUBLIC KEY / SELECT HOST ".into()
-                } else {
-                    " ASSIGN CREDENTIAL / SELECT HOST ".into()
-                }
-            },
-            |group| format!(" SELECT HOST / {} ", group.title()),
-        );
-        let items = app.credential_picker_items().into_iter().map(|item| {
-            ListItem::new(match item {
-                HostPickerItem::Group(group) => format!("[Group] {}", group.title()),
-                HostPickerItem::Host(alias) => format!("  {alias}"),
-            })
-        });
-        let mut selection = ListState::default().with_selected(Some(state.picker_selected));
-        frame.render_stateful_widget(
-            List::new(items)
-                .highlight_symbol("> ")
-                .highlight_style(Style::default().fg(ACCENT))
-                .block(panel(&title)),
-            area,
-            &mut selection,
         );
     }
     if let Some(alias) = &state.confirm_upload {
@@ -438,6 +437,16 @@ mod tests {
         });
         let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
         app.open_credentials(None, false);
+        app.hosts.hosts.push(crate::hosts::Host {
+            alias: "build-prod".into(),
+            hostname: Some("build.example".into()),
+            user: Some("deploy".into()),
+            port: None,
+            identity_file: Some("/tmp/id_ed25519".into()),
+            proxy_jump: None,
+            managed: false,
+        });
+        app.credential_manager.discovered_keys.clear();
         app.credential_manager.discovered_keys.push(Credential {
             id: 0,
             name: "id_ed25519".into(),
@@ -448,6 +457,7 @@ mod tests {
             public_key: "ssh-ed25519 AAAA".into(),
             fingerprint: "SHA256:test".into(),
         });
+        app.credential_manager.selected = 1;
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
@@ -464,6 +474,9 @@ mod tests {
         assert!(text.contains("SSH KEYS"));
         assert!(text.contains("Saved password"));
         assert!(text.contains("id_ed25519"));
+        assert!(text.contains("Related Hosts (1): build-prod"), "{text:?}");
+        assert!(!text.contains("IdentityFile Hosts"));
+        assert!(!text.contains("Default-key candidates"));
     }
 
     #[test]

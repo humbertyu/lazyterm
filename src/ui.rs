@@ -2952,11 +2952,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else if area.width < 75 {
             "↑↓ select  Enter SSH  g tags  Left/Esc back"
         } else if app.showing_groups() {
-            "Arrows select  Enter open/SSH  k credentials  U upload key  g tags  / find  a add  r reload  q quit"
+            "Arrows select  Enter open/SSH  k set SSH key  U upload key  x unlink password  g tags  / find  a add  r reload  q quit"
         } else if area.width < 95 {
             "↑↓ move  Enter SSH  v view  g tags  / find  Esc back  q quit"
         } else {
-            "↑↓ select  Enter SSH  k credentials  U upload key  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
+            "↑↓ select  Enter SSH  k set SSH key  U upload key  x unlink password  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
         }
     } else if app.section == NavSection::Files {
         if app.host_picker_open {

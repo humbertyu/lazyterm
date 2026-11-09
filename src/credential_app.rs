@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, HostGroup, HostPickerItem, NavSection},
+    app::{App, NavSection},
     credentials::{self, Credential, CredentialItem, CredentialKind, CredentialSource},
     project_credentials::PreparedPassword,
 };
@@ -17,12 +17,9 @@ pub struct CredentialState {
     pub selected: usize,
     pub target: Option<String>,
     pub upload_only: bool,
+    pub ssh_key_only: bool,
     pub form: Option<CredentialForm>,
     pub deleting: bool,
-    pub picker: bool,
-    pub picker_upload: bool,
-    pub picker_group: Option<HostGroup>,
-    pub picker_selected: usize,
     pub confirm_upload: Option<String>,
     pub message: Option<String>,
     pending: Option<Receiver<Result<CredentialJob, String>>>,
@@ -90,11 +87,10 @@ mod tests {
     }
 
     #[test]
-    fn password_creation_assignment_replacement_unlink_and_cleanup() {
+    fn password_creation_replacement_and_cleanup() {
         let fixture = Fixture::new("credentials");
         let mut app = app(&fixture);
         save_password(&mut app, "first secret");
-        let id = app.metadata.credentials[0].id;
         let old_ref = app.metadata.credentials[0].password_ref.clone().unwrap();
         assert!(old_ref.starts_with("credential-"));
         assert!(
@@ -103,15 +99,7 @@ mod tests {
                 .contains("first secret")
         );
         app.handle_credentials_key(KeyCode::Enter);
-        assert!(app.credential_manager.picker);
-        app.handle_credentials_key(KeyCode::Enter);
-        assert!(app.credential_manager.picker_group.is_some());
-        app.handle_credentials_key(KeyCode::Enter);
-        assert_eq!(app.metadata.host_passwords.get("web"), Some(&id));
-        assert_eq!(
-            app.credential_hosts(&app.metadata.credentials[0]),
-            vec!["web"]
-        );
+        assert!(app.metadata.host_passwords.is_empty());
         app.handle_credentials_key(KeyCode::Char('e'));
         let form = app.credential_manager.form.as_mut().unwrap();
         form.fields[2] = "replacement".into();
@@ -121,20 +109,15 @@ mod tests {
         assert!(!crate::project_credentials::tests::password_exists(
             &old_ref
         ));
-        let replacement = app.host_password_reference("web").unwrap().to_string();
+        let replacement = app.metadata.credentials[0].password_ref.clone().unwrap();
         assert_eq!(
             &**crate::project_credentials::read_password(&replacement).unwrap(),
             "replacement"
         );
         app.handle_credentials_key(KeyCode::Char('d'));
         app.handle_credentials_key(KeyCode::Enter);
-        assert_eq!(app.metadata.credentials.len(), 1);
-        app.open_credentials(Some("web".into()), false);
-        app.handle_credentials_key(KeyCode::Char('x'));
-        app.handle_credentials_key(KeyCode::Char('d'));
-        app.handle_credentials_key(KeyCode::Enter);
-        finish(&mut app);
         assert!(app.metadata.credentials.is_empty());
+        finish(&mut app);
         assert!(!crate::project_credentials::tests::password_exists(
             &replacement
         ));
@@ -173,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn project_keychain_credentials_are_listed_deduplicated_and_assignable() {
+    fn project_keychain_credentials_are_listed_and_deduplicated() {
         let fixture = Fixture::new("project-keychain-list");
         let mut app = app(&fixture);
         let mut project = crate::projects::ProjectDefinition {
@@ -221,21 +204,8 @@ mod tests {
             Some("project-password-ref")
         );
 
-        app.metadata_save_path = Some(fixture.root.clone());
-        app.assign_credential("web".into());
         assert!(app.metadata.credentials.is_empty());
         assert!(app.metadata.host_passwords.is_empty());
-        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
-        app.assign_credential("web".into());
-        let host_credential_id = app.metadata.host_passwords["web"];
-        assert_eq!(
-            app.host_password_reference("web"),
-            Some("project-password-ref")
-        );
-        assert!(app.metadata.credentials.iter().any(|credential| {
-            credential.id == host_credential_id
-                && credential.password_ref.as_deref() == Some("project-password-ref")
-        }));
     }
 
     #[test]
@@ -269,6 +239,116 @@ mod tests {
             app.credential_manager.discovered_keys,
             credentials::discover_local_keys()
         );
+    }
+
+    #[test]
+    fn credentials_tab_enter_does_not_open_a_host_selector() {
+        let fixture = Fixture::new("credentials-resource-only");
+        let mut app = app(&fixture);
+        app.handle_credentials_key(KeyCode::Enter);
+        assert!(!app.credential_manager.ssh_key_only);
+        assert!(app.credential_manager.target.is_none());
+    }
+
+    #[test]
+    fn default_ssh_key_detection_only_matches_openssh_default_names() {
+        let fixture = Fixture::new("default-ssh-key-detection");
+        let ssh_dir = fixture.root.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        assert!(is_default_ssh_identity(
+            &ssh_dir,
+            &ssh_dir.join("id_ed25519")
+        ));
+        assert!(!is_default_ssh_identity(
+            &ssh_dir,
+            &ssh_dir.join("dogfooding_deploy")
+        ));
+    }
+
+    #[test]
+    fn editing_ssh_key_changes_name_without_reimporting_its_file() {
+        let fixture = Fixture::new("edit-key-name");
+        let mut app = app(&fixture);
+        let key_path = fixture.root.join("managed-key");
+        let key = credentials::generate_key(&key_path, 12, "Original name".into()).unwrap();
+        app.metadata.credentials.push(key);
+        app.credential_manager.selected = 0;
+
+        app.handle_credentials_key(KeyCode::Char('e'));
+        let form = app.credential_manager.form.as_ref().unwrap();
+        assert!(form.kind == FormKind::RenameKey);
+        assert_eq!(form.fields, ["Original name"]);
+        assert!(credentials::same_path(
+            app.metadata.credentials[0]
+                .private_key_path
+                .as_deref()
+                .unwrap(),
+            &key_path.join("id_ed25519")
+        ));
+    }
+
+    #[test]
+    fn ssh_key_host_scan_lists_aliases_for_explicit_and_default_identities() {
+        let fixture = Fixture::new("ssh-key-host-scan");
+        let ssh_dir = fixture.root.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let key_path = ssh_dir.join("id_ed25519");
+        let hosts = vec![
+            crate::hosts::Host {
+                alias: "explicit-host".into(),
+                hostname: None,
+                user: None,
+                port: None,
+                identity_file: Some(key_path.display().to_string()),
+                proxy_jump: None,
+                managed: false,
+            },
+            crate::hosts::Host {
+                alias: "default-host".into(),
+                hostname: None,
+                user: None,
+                port: None,
+                identity_file: None,
+                proxy_jump: None,
+                managed: false,
+            },
+        ];
+        assert_eq!(
+            App::key_host_matches(&hosts, &key_path, Some(&ssh_dir)),
+            (
+                vec!["explicit-host".to_string()],
+                vec!["default-host".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn host_ssh_key_selector_is_host_scoped_and_filters_out_passwords() {
+        let fixture = Fixture::new("host-ssh-key-selector");
+        let mut app = app(&fixture);
+        save_password(&mut app, "server password");
+        let key =
+            credentials::generate_key(&fixture.root.join("ssh-key"), 12, "Fixture key".into())
+                .unwrap();
+        app.metadata.credentials.push(key);
+
+        app.open_host_ssh_key_selector("web".into());
+        assert!(app.credential_manager.ssh_key_only);
+        assert_eq!(app.credential_manager.target.as_deref(), Some("web"));
+        let visible = app.visible_credentials();
+        assert!(!visible.is_empty());
+        assert!(
+            visible
+                .iter()
+                .all(|item| item.credential.kind == CredentialKind::SshKey)
+        );
+        assert!(
+            visible
+                .iter()
+                .any(|item| item.credential.name == "Fixture key")
+        );
+        app.handle_credentials_key(KeyCode::Esc);
+        assert!(!app.credential_manager.open);
     }
 
     #[test]
@@ -343,6 +423,7 @@ pub enum FormKind {
     Password,
     Generate,
     Import,
+    RenameKey,
 }
 
 pub struct CredentialForm {
@@ -371,6 +452,7 @@ impl CredentialForm {
             ],
             FormKind::Generate => &["Name", "New directory (parent must exist)"],
             FormKind::Import => &["Name", "Private key path (.pub required)"],
+            FormKind::RenameKey => &["Name"],
         }
     }
 }
@@ -380,19 +462,22 @@ impl App {
         let state = &self.credential_manager;
         state.open
             || (self.section == NavSection::Credentials
-                && (state.form.is_some()
-                    || state.picker
-                    || state.deleting
-                    || state.confirm_upload.is_some()))
+                && (state.form.is_some() || state.deleting || state.confirm_upload.is_some()))
     }
 
     pub fn open_credentials(&mut self, target: Option<String>, upload_only: bool) {
         self.credential_manager.open = true;
         self.credential_manager.target = target;
         self.credential_manager.upload_only = upload_only;
+        self.credential_manager.ssh_key_only = false;
         self.credential_manager.selected = 0;
         self.credential_manager.message = None;
         self.refresh_discovered_keys();
+    }
+
+    pub fn open_host_ssh_key_selector(&mut self, alias: String) {
+        self.open_credentials(Some(alias), false);
+        self.credential_manager.ssh_key_only = true;
     }
 
     pub fn visible_credentials(&self) -> Vec<CredentialItem> {
@@ -483,7 +568,8 @@ impl App {
             CredentialKind::SshKey => 1,
         });
         credentials.retain(|item| {
-            !self.credential_manager.upload_only || item.credential.kind == CredentialKind::SshKey
+            !(self.credential_manager.upload_only || self.credential_manager.ssh_key_only)
+                || item.credential.kind == CredentialKind::SshKey
         });
         credentials
     }
@@ -504,27 +590,79 @@ impl App {
             .as_deref()
     }
 
+    pub(crate) fn unlink_host_password(&mut self, alias: &str) {
+        let previous = self.metadata.host_passwords.clone();
+        if self.metadata.host_passwords.remove(alias).is_none() {
+            self.notice = Some(format!("No saved password is configured for {alias}."));
+            return;
+        }
+        if self.save_metadata() {
+            self.notice = Some(format!("Removed the saved password reference for {alias}."));
+        } else {
+            self.metadata.host_passwords = previous;
+        }
+    }
+
     pub fn credential_hosts(&self, credential: &Credential) -> Vec<String> {
-        self.hosts
-            .hosts
-            .iter()
-            .filter(|host| match credential.kind {
-                CredentialKind::Password => {
+        match credential.kind {
+            CredentialKind::Password => self
+                .hosts
+                .hosts
+                .iter()
+                .filter(|host| {
                     self.metadata.host_passwords.get(&host.alias) == Some(&credential.id)
+                })
+                .map(|host| host.alias.clone())
+                .collect(),
+            CredentialKind::SshKey => {
+                let (configured, candidates) = self.credential_key_hosts(credential);
+                configured.into_iter().chain(candidates).collect()
+            }
+        }
+    }
+
+    pub fn credential_key_hosts(&self, credential: &Credential) -> (Vec<String>, Vec<String>) {
+        let Some(key_path) = credential.private_key_path.as_deref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let ssh_dir = crate::hosts::HostCatalog::config_path()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+        Self::key_host_matches(&self.hosts.hosts, key_path, ssh_dir.as_deref())
+    }
+
+    fn key_host_matches(
+        hosts: &[crate::hosts::Host],
+        key_path: &std::path::Path,
+        ssh_dir: Option<&std::path::Path>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut configured = Vec::new();
+        let mut candidates = Vec::new();
+        for host in hosts {
+            let mut explicitly_configured = false;
+            let mut excludes_default_identities = false;
+            if let Some(identity_file) = &host.identity_file {
+                excludes_default_identities = identity_file.eq_ignore_ascii_case("none");
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let expanded = identity_file.replace("%%", "%").replace(
+                    "%d",
+                    home.as_deref()
+                        .unwrap_or_else(|| std::path::Path::new(""))
+                        .to_string_lossy()
+                        .as_ref(),
+                );
+                if credentials::same_path(&credentials::expand_path(&expanded), key_path) {
+                    configured.push(host.alias.clone());
+                    explicitly_configured = true;
                 }
-                CredentialKind::SshKey => host
-                    .identity_file
-                    .as_deref()
-                    .zip(credential.private_key_path.as_deref())
-                    .is_some_and(|(value, path)| {
-                        credentials::same_path(
-                            &credentials::expand_path(&value.replace("%%", "%")),
-                            path,
-                        )
-                    }),
-            })
-            .map(|host| host.alias.clone())
-            .collect()
+            }
+            if !explicitly_configured
+                && !excludes_default_identities
+                && ssh_dir.is_some_and(|directory| is_default_ssh_identity(directory, key_path))
+            {
+                candidates.push(host.alias.clone());
+            }
+        }
+        (configured, candidates)
     }
 
     pub fn credential_item_hosts(&self, item: &CredentialItem) -> Vec<String> {
@@ -549,26 +687,6 @@ impl App {
             .credential_manager
             .selected
             .min(self.visible_credentials().len().saturating_sub(1));
-    }
-
-    pub fn credential_picker_items(&self) -> Vec<HostPickerItem> {
-        if let Some(group) = &self.credential_manager.picker_group {
-            self.group_hosts(group)
-                .into_iter()
-                .map(|host| HostPickerItem::Host(host.alias.clone()))
-                .collect()
-        } else {
-            self.visible_groups()
-                .into_iter()
-                .map(HostPickerItem::Group)
-                .chain(
-                    self.hosts
-                        .hosts
-                        .iter()
-                        .map(|host| HostPickerItem::Host(host.alias.clone())),
-                )
-                .collect()
-        }
     }
 
     pub fn credentials_busy(&self) -> bool {
@@ -697,6 +815,8 @@ impl App {
         let fields = if let Some(item) = &editing {
             if kind == FormKind::Password {
                 vec![item.name.clone(), item.username.clone(), String::new()]
+            } else if kind == FormKind::RenameKey {
+                vec![item.name.clone()]
             } else {
                 vec![
                     item.name.clone(),
@@ -755,8 +875,16 @@ impl App {
         });
         let name = form.fields[0].trim().to_string();
         let kind = form.kind;
-        let path = credentials::expand_path(&form.fields[1]);
-        let username = form.fields[1].trim().to_string();
+        let path = form
+            .fields
+            .get(1)
+            .map(|value| credentials::expand_path(value))
+            .unwrap_or_default();
+        let username = form
+            .fields
+            .get(1)
+            .map_or("", |value| value.trim())
+            .to_string();
         let password = if kind == FormKind::Password {
             Zeroizing::new(std::mem::take(&mut form.fields[2]))
         } else {
@@ -803,6 +931,11 @@ impl App {
                             })
                     }
                 }
+                FormKind::RenameKey => {
+                    let mut value = existing.expect("renaming requires an existing SSH key");
+                    value.name = name;
+                    Ok(CredentialJob::Key(value))
+                }
                 FormKind::Generate => {
                     credentials::generate_key(&path, id, name).map(CredentialJob::Key)
                 }
@@ -819,57 +952,25 @@ impl App {
             return;
         };
         let credential = item.credential;
-        if credential.kind == CredentialKind::SshKey {
-            let Some(path) = &credential.private_key_path else {
-                return;
-            };
-            if !path.is_file() {
-                self.credential_manager.message = Some("Private key no longer exists.".into());
-                return;
-            }
-            match self.hosts.set_identity(&alias, path) {
-                Ok(()) => {
-                    self.credential_manager.message = Some(format!(
-                        "{} now uses {} (IdentityFile saved to SSH config).",
-                        alias, credential.name
-                    ))
-                }
-                Err(error) => {
-                    self.credential_manager.message =
-                        Some(format!("Could not assign SSH key: {error}"))
-                }
-            }
-        } else {
-            let previous_credentials = self.metadata.credentials.clone();
-            let id = match item.source {
-                CredentialSource::Managed => credential.id,
-                CredentialSource::ProjectLink { .. } => {
-                    let id = self
-                        .metadata
-                        .credentials
-                        .iter()
-                        .map(|item| item.id)
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    let mut linked = credential.clone();
-                    linked.id = id;
-                    self.metadata.credentials.push(linked);
-                    id
-                }
-                CredentialSource::DiscoveredKey => return,
-            };
-            let previous = self.metadata.host_passwords.clone();
-            self.metadata.host_passwords.insert(alias.clone(), id);
-            if self.save_metadata() {
+        if credential.kind != CredentialKind::SshKey {
+            return;
+        }
+        let Some(path) = &credential.private_key_path else {
+            return;
+        };
+        if !path.is_file() {
+            self.credential_manager.message = Some("Private key no longer exists.".into());
+            return;
+        }
+        match self.hosts.set_identity(&alias, path) {
+            Ok(()) => {
                 self.credential_manager.message = Some(format!(
-                    "{} uses password {}. SSH username remains configured in ~/.ssh/config.",
+                    "{} now uses {} (IdentityFile saved to SSH config).",
                     alias, credential.name
-                ));
-            } else {
-                self.metadata.host_passwords = previous;
-                self.metadata.credentials = previous_credentials;
-                self.credential_manager.message = self.notice.clone();
+                ))
+            }
+            Err(error) => {
+                self.credential_manager.message = Some(format!("Could not assign SSH key: {error}"))
             }
         }
     }
@@ -988,40 +1089,30 @@ impl App {
             }
             return;
         }
-        if self.credential_manager.picker {
-            let items = self.credential_picker_items();
+        if self.credential_manager.ssh_key_only {
             match key {
-                KeyCode::Esc | KeyCode::Backspace => {
-                    if self.credential_manager.picker_group.take().is_none() {
-                        self.credential_manager.picker = false;
-                    }
-                    self.credential_manager.picker_selected = 0;
-                }
-                KeyCode::Down => {
-                    self.credential_manager.picker_selected =
-                        (self.credential_manager.picker_selected + 1)
-                            .min(items.len().saturating_sub(1))
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.credential_manager.open = false;
+                    self.credential_manager.ssh_key_only = false;
                 }
                 KeyCode::Up => {
-                    self.credential_manager.picker_selected =
-                        self.credential_manager.picker_selected.saturating_sub(1)
+                    self.credential_manager.selected =
+                        self.credential_manager.selected.saturating_sub(1);
                 }
-                KeyCode::Enter => match items.get(self.credential_manager.picker_selected).cloned()
-                {
-                    Some(HostPickerItem::Group(group)) => {
-                        self.credential_manager.picker_group = Some(group);
-                        self.credential_manager.picker_selected = 0;
+                KeyCode::Down => {
+                    self.credential_manager.selected = (self.credential_manager.selected + 1)
+                        .min(self.visible_credentials().len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(alias) = self.credential_manager.target.clone() {
+                        self.assign_credential(alias);
+                        self.credential_manager.open = false;
+                        self.credential_manager.ssh_key_only = false;
                     }
-                    Some(HostPickerItem::Host(alias)) => {
-                        self.credential_manager.picker = false;
-                        if self.credential_manager.picker_upload {
-                            self.credential_manager.confirm_upload = Some(alias);
-                        } else {
-                            self.assign_credential(alias);
-                        }
-                    }
-                    None => {}
-                },
+                }
+                KeyCode::Char('u') => {
+                    self.credential_manager.confirm_upload = self.credential_manager.target.clone();
+                }
                 _ => {}
             }
             return;
@@ -1067,11 +1158,13 @@ impl App {
                     let item = item.credential;
                     if item.kind == CredentialKind::Password {
                         self.credential_form(FormKind::Password, Some(item));
+                    } else if discovered {
+                        self.credential_manager.message = Some(
+                            "Discovered keys are read-only; import the key to manage its name."
+                                .into(),
+                        );
                     } else {
-                        self.credential_form(FormKind::Import, Some(item));
-                        if discovered && let Some(form) = &mut self.credential_manager.form {
-                            form.id = None;
-                        }
+                        self.credential_form(FormKind::RenameKey, Some(item));
                     }
                 }
             }
@@ -1093,19 +1186,15 @@ impl App {
             }
             KeyCode::Enter
                 if self.credential_manager.target.is_some()
-                    && !self.credential_manager.upload_only =>
+                    && !self.credential_manager.upload_only
+                    && self.credential_manager.ssh_key_only
+                    && self
+                        .selected_credential()
+                        .is_some_and(|item| item.credential.kind == CredentialKind::SshKey) =>
             {
                 self.assign_credential(self.credential_manager.target.clone().unwrap())
             }
-            KeyCode::Enter
-                if !self.credential_manager.upload_only && self.selected_credential().is_some() =>
-            {
-                self.credential_manager.picker = true;
-                self.credential_manager.picker_upload = false;
-                self.credential_manager.picker_group = None;
-                self.credential_manager.picker_selected = 0;
-            }
-            KeyCode::Enter | KeyCode::Char('u')
+            KeyCode::Char('u')
                 if self
                     .selected_credential()
                     .is_some_and(|item| item.credential.kind == CredentialKind::SshKey) =>
@@ -1113,11 +1202,15 @@ impl App {
                 if let Some(alias) = self.credential_manager.target.clone() {
                     self.credential_manager.confirm_upload = Some(alias);
                 } else {
-                    self.credential_manager.picker = true;
-                    self.credential_manager.picker_upload = true;
-                    self.credential_manager.picker_group = None;
-                    self.credential_manager.picker_selected = 0;
+                    self.credential_manager.message =
+                        Some("Select a Host first, then use U to upload its public key.".into());
                 }
+            }
+            KeyCode::Enter
+                if self.credential_manager.upload_only
+                    && self.credential_manager.target.is_some() =>
+            {
+                self.credential_manager.confirm_upload = self.credential_manager.target.clone();
             }
             KeyCode::Char('p') => {
                 if let Some(item) = self.selected_credential() {
@@ -1135,4 +1228,26 @@ impl App {
             _ => {}
         }
     }
+}
+
+fn is_default_ssh_identity(ssh_dir: &std::path::Path, key_path: &std::path::Path) -> bool {
+    const DEFAULT_IDENTITIES: [&str; 7] = [
+        "id_dsa",
+        "id_ecdsa",
+        "id_ecdsa_sk",
+        "id_ed25519",
+        "id_ed25519_sk",
+        "id_rsa",
+        "id_xmss",
+    ];
+    key_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| DEFAULT_IDENTITIES.contains(&name))
+        && credentials::same_path(
+            key_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("")),
+            ssh_dir,
+        )
 }
