@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, NavSection},
+    app::{App, HostPasswordPurpose, NavSection, SubmittedHostPassword},
     credentials::{self, Credential, CredentialItem, CredentialKind, CredentialSource},
     project_credentials::PreparedPassword,
 };
@@ -288,6 +288,208 @@ mod tests {
     }
 
     #[test]
+    fn successful_key_upload_is_recorded_once_for_the_host() {
+        let fixture = Fixture::new("record-key-upload");
+        let mut app = app(&fixture);
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(CredentialJob::UploadedKey {
+                alias: "web".into(),
+                fingerprint: "SHA256:test".into(),
+                message: "Public key installed on web.".into(),
+                prepared_password: None,
+                save_password: false,
+                identity_configured: false,
+            }))
+            .unwrap();
+        app.credential_manager.pending = Some(receiver);
+
+        app.poll_credentials();
+
+        assert_eq!(app.metadata.uploaded_keys["web"], ["SHA256:test"]);
+        let saved = Metadata::read_from(&fixture.root.join("hosts.json")).unwrap();
+        assert_eq!(saved.uploaded_keys["web"], ["SHA256:test"]);
+    }
+
+    fn upload_test_key() -> Credential {
+        Credential {
+            id: 12,
+            name: "Fixture key".into(),
+            kind: CredentialKind::SshKey,
+            username: String::new(),
+            password_ref: None,
+            private_key_path: Some("/fixture/private-key".into()),
+            public_key: "ssh-ed25519 AAAA fixture".into(),
+            fingerprint: "SHA256:fixture".into(),
+        }
+    }
+
+    fn complete_upload_job(app: &mut App, job: CredentialJob) {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Ok(job)).ok().unwrap();
+        app.credential_manager.pending = Some(receiver);
+        app.poll_credentials();
+    }
+
+    #[test]
+    fn host_key_configuration_retries_password_with_the_same_key_and_partial_status() {
+        use crate::app::InputAction;
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        let fixture = Fixture::new("host-key-password-retry");
+        let mut app = app(&fixture);
+        save_password(&mut app, "outdated password");
+        app.metadata
+            .host_passwords
+            .insert("web".into(), app.metadata.credentials[0].id);
+        let key = upload_test_key();
+        complete_upload_job(
+            &mut app,
+            CredentialJob::UploadFailed {
+                alias: "web".into(),
+                credential: key.clone(),
+                error: "Permission denied (publickey,password).".into(),
+                save_password: true,
+                authentication_failed: true,
+                identity_configured: true,
+            },
+        );
+        assert!(app.host_password_reference("web").is_none());
+        let dialog = app.host_password_dialog.as_ref().unwrap();
+        assert!(
+            dialog
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("IdentityFile is saved")
+        );
+        for character in "new password".chars() {
+            app.handle_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::RetryPublicKeyUpload
+        );
+        let submitted = app.take_pending_host_password().unwrap();
+        assert_eq!(submitted.alias, "web");
+        assert!(submitted.save_in_keychain);
+        assert_eq!(submitted.password.as_str(), "new password");
+        match &submitted.purpose {
+            HostPasswordPurpose::UploadKey {
+                credential,
+                identity_configured,
+            } => {
+                assert_eq!(credential, &key);
+                assert!(*identity_configured);
+            }
+            _ => panic!("expected key installation retry"),
+        }
+    }
+
+    #[test]
+    fn host_key_configuration_network_failure_reports_partial_status_without_password_prompt() {
+        let fixture = Fixture::new("host-key-network-failure");
+        let mut app = app(&fixture);
+        complete_upload_job(
+            &mut app,
+            CredentialJob::UploadFailed {
+                alias: "web".into(),
+                credential: upload_test_key(),
+                error: "Connection timed out".into(),
+                save_password: false,
+                authentication_failed: false,
+                identity_configured: true,
+            },
+        );
+        assert!(app.host_password_dialog.is_none());
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.contains("IdentityFile is saved"));
+        assert!(notice.contains("Connection timed out"));
+        assert!(!app.metadata.uploaded_keys.contains_key("web"));
+    }
+
+    #[test]
+    fn host_key_configuration_saves_password_only_when_selected_and_rolls_back_failed_save() {
+        for save in [false, true] {
+            let fixture = Fixture::new("host-key-password-save");
+            let mut app = app(&fixture);
+            let prepared = crate::project_credentials::prepare_credential(Zeroizing::new(
+                "new server secret".into(),
+            ))
+            .recv()
+            .unwrap()
+            .unwrap();
+            let reference = prepared.reference.clone();
+            complete_upload_job(
+                &mut app,
+                CredentialJob::UploadedKey {
+                    alias: "web".into(),
+                    fingerprint: "SHA256:fixture".into(),
+                    message: "Public key installed.".into(),
+                    prepared_password: Some(prepared),
+                    save_password: save,
+                    identity_configured: true,
+                },
+            );
+            assert_eq!(
+                app.host_password_reference("web"),
+                save.then_some(reference.as_str())
+            );
+            assert_eq!(app.metadata.uploaded_keys["web"], ["SHA256:fixture"]);
+            let saved = std::fs::read_to_string(fixture.root.join("hosts.json")).unwrap();
+            assert!(!saved.contains("new server secret"));
+            assert!(
+                app.credential_manager
+                    .message
+                    .as_ref()
+                    .unwrap()
+                    .contains("SSH key configured")
+            );
+        }
+        let fixture = Fixture::new("host-key-password-rollback");
+        let mut app = app(&fixture);
+        save_password(&mut app, "old server secret");
+        let old = app.metadata.credentials[0].clone();
+        app.metadata.host_passwords.insert("web".into(), old.id);
+        app.metadata_save_path = Some(fixture.root.clone());
+        let prepared = crate::project_credentials::prepare_credential(Zeroizing::new(
+            "new server secret".into(),
+        ))
+        .recv()
+        .unwrap()
+        .unwrap();
+        complete_upload_job(
+            &mut app,
+            CredentialJob::UploadedKey {
+                alias: "web".into(),
+                fingerprint: "SHA256:fixture".into(),
+                message: "Public key installed.".into(),
+                prepared_password: Some(prepared),
+                save_password: true,
+                identity_configured: true,
+            },
+        );
+        assert_eq!(
+            app.host_password_reference("web"),
+            old.password_ref.as_deref()
+        );
+        assert_eq!(
+            crate::project_credentials::read_password(old.password_ref.as_ref().unwrap())
+                .unwrap()
+                .as_str(),
+            "old server secret"
+        );
+        assert!(
+            app.credential_manager
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Password was not saved")
+        );
+    }
+
+    #[test]
     fn ssh_key_host_scan_lists_aliases_for_explicit_and_default_identities() {
         let fixture = Fixture::new("ssh-key-host-scan");
         let ssh_dir = fixture.root.join(".ssh");
@@ -385,7 +587,7 @@ mod tests {
         let mut app = app(&fixture);
         app.handle_credentials_key(KeyCode::Esc);
         let press = |app: &mut App, code| app.handle_event(KeyEvent::new(code, KeyModifiers::NONE));
-        press(&mut app, KeyCode::F(7));
+        press(&mut app, KeyCode::Char('7'));
         assert_eq!(app.section, NavSection::Credentials);
         assert!(!app.credentials_modal());
         press(&mut app, KeyCode::Tab);
@@ -415,7 +617,22 @@ mod tests {
 pub enum CredentialJob {
     Password(Credential, PreparedPassword),
     Key(Credential),
-    Message(String),
+    UploadedKey {
+        alias: String,
+        fingerprint: String,
+        message: String,
+        prepared_password: Option<PreparedPassword>,
+        save_password: bool,
+        identity_configured: bool,
+    },
+    UploadFailed {
+        alias: String,
+        credential: Credential,
+        error: String,
+        save_password: bool,
+        authentication_failed: bool,
+        identity_configured: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -424,6 +641,14 @@ pub enum FormKind {
     Generate,
     Import,
     RenameKey,
+}
+
+fn upload_authentication_failed(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("permission denied")
+        || error.contains("authentication failed")
+        || error.contains("no supported authentication methods")
+        || error.contains("too many authentication failures")
 }
 
 pub struct CredentialForm {
@@ -603,6 +828,80 @@ impl App {
         }
     }
 
+    pub(crate) fn save_host_password_prepared(
+        &mut self,
+        alias: &str,
+        prepared: &mut PreparedPassword,
+        uploaded_fingerprint: Option<&str>,
+    ) -> bool {
+        let previous_credentials = self.metadata.credentials.clone();
+        let previous_passwords = self.metadata.host_passwords.clone();
+        let previous_uploads = self.metadata.uploaded_keys.clone();
+        let old_id = self.metadata.host_passwords.get(alias).copied();
+        let old_reference = old_id.and_then(|id| {
+            self.metadata
+                .credentials
+                .iter()
+                .find(|credential| credential.id == id)
+                .and_then(|credential| credential.password_ref.clone())
+        });
+        let old_is_shared = old_id.is_some_and(|id| {
+            self.metadata
+                .host_passwords
+                .iter()
+                .any(|(host, credential_id)| host != alias && *credential_id == id)
+        });
+        if let Some(id) = old_id
+            && !old_is_shared
+        {
+            self.metadata
+                .credentials
+                .retain(|credential| credential.id != id);
+        }
+        let id = self
+            .metadata
+            .credentials
+            .iter()
+            .map(|credential| credential.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.metadata.credentials.push(Credential {
+            id,
+            name: format!("{alias} password"),
+            kind: CredentialKind::Password,
+            username: String::new(),
+            password_ref: Some(prepared.reference.clone()),
+            private_key_path: None,
+            public_key: String::new(),
+            fingerprint: String::new(),
+        });
+        self.metadata.host_passwords.insert(alias.to_string(), id);
+        if let Some(fingerprint) = uploaded_fingerprint {
+            let fingerprints = self
+                .metadata
+                .uploaded_keys
+                .entry(alias.to_string())
+                .or_default();
+            if !fingerprints.iter().any(|existing| existing == fingerprint) {
+                fingerprints.push(fingerprint.to_string());
+                fingerprints.sort();
+            }
+        }
+        if self.save_metadata() {
+            prepared.commit();
+            if let Some(reference) = old_reference {
+                self.cleanup_credential_reference(reference);
+            }
+            true
+        } else {
+            self.metadata.credentials = previous_credentials;
+            self.metadata.host_passwords = previous_passwords;
+            self.metadata.uploaded_keys = previous_uploads;
+            false
+        }
+    }
+
     pub fn credential_hosts(&self, credential: &Credential) -> Vec<String> {
         match credential.kind {
             CredentialKind::Password => self
@@ -722,8 +1021,93 @@ impl App {
         self.credential_manager.pending = None;
         self.credential_manager.upload_cancel = None;
         match result {
-            Ok(CredentialJob::Message(message)) => {
-                self.credential_manager.message = Some(message);
+            Ok(CredentialJob::UploadedKey {
+                alias,
+                fingerprint,
+                message,
+                mut prepared_password,
+                save_password,
+                identity_configured,
+            }) => {
+                let message = if identity_configured {
+                    format!(
+                        "SSH key configured for {alias}: IdentityFile saved and public key installed."
+                    )
+                } else {
+                    message
+                };
+                if let Some(prepared) = &mut prepared_password
+                    && save_password
+                {
+                    if self.save_host_password_prepared(&alias, prepared, Some(&fingerprint)) {
+                        self.credential_manager.message =
+                            Some(format!("{message} Password saved in the system Keychain."));
+                    } else {
+                        self.credential_manager.message = Some(format!(
+                            "{message} Password was not saved: {}",
+                            self.notice.as_deref().unwrap_or("metadata save failed.")
+                        ));
+                    }
+                } else {
+                    let previous = self.metadata.uploaded_keys.clone();
+                    let fingerprints = self
+                        .metadata
+                        .uploaded_keys
+                        .entry(alias.clone())
+                        .or_default();
+                    if !fingerprints.contains(&fingerprint) {
+                        fingerprints.push(fingerprint);
+                        fingerprints.sort();
+                    }
+                    if self.save_metadata() {
+                        self.credential_manager.message = Some(message.clone());
+                    } else {
+                        self.metadata.uploaded_keys = previous;
+                        self.credential_manager.message = Some(format!(
+                            "{message} Could not save its Host status; {}",
+                            self.notice.as_deref().unwrap_or("save metadata to retry.")
+                        ));
+                    }
+                    drop(prepared_password);
+                }
+                if self.credential_manager.target.is_some() {
+                    self.credential_manager.open = false;
+                    self.credential_manager.ssh_key_only = false;
+                    self.notice = self.credential_manager.message.clone();
+                }
+            }
+            Ok(CredentialJob::UploadFailed {
+                alias,
+                credential,
+                error,
+                save_password,
+                authentication_failed,
+                identity_configured,
+            }) => {
+                let partial = if identity_configured {
+                    format!(
+                        "IdentityFile is saved for {alias}, but the remote public key is not installed. {error}"
+                    )
+                } else {
+                    error.clone()
+                };
+                self.credential_manager.message = Some(partial.clone());
+                if authentication_failed {
+                    if self.host_password_reference(&alias).is_some() {
+                        self.unlink_host_password(&alias);
+                    }
+                    self.prompt_host_password(
+                        alias,
+                        Some(format!("{partial} Enter the Host password to retry.")),
+                        save_password,
+                        HostPasswordPurpose::UploadKey {
+                            credential,
+                            identity_configured,
+                        },
+                    );
+                } else {
+                    self.notice = Some(partial);
+                }
             }
             Ok(job) => {
                 let (credential, mut prepared) = match job {
@@ -947,56 +1331,117 @@ impl App {
         });
     }
 
-    fn assign_credential(&mut self, alias: String) {
+    fn assign_credential(&mut self, alias: String) -> bool {
         let Some(item) = self.selected_credential() else {
-            return;
+            return false;
         };
         let credential = item.credential;
         if credential.kind != CredentialKind::SshKey {
-            return;
+            return false;
         }
         let Some(path) = &credential.private_key_path else {
-            return;
+            return false;
         };
         if !path.is_file() {
             self.credential_manager.message = Some("Private key no longer exists.".into());
-            return;
+            return false;
         }
         match self.hosts.set_identity(&alias, path) {
             Ok(()) => {
                 self.credential_manager.message = Some(format!(
-                    "{} now uses {} (IdentityFile saved to SSH config).",
+                    "{} now uses {}. Installing its public key...",
                     alias, credential.name
-                ))
+                ));
+                self.start_public_key_upload(alias, None, true);
+                true
             }
             Err(error) => {
-                self.credential_manager.message = Some(format!("Could not assign SSH key: {error}"))
+                self.credential_manager.message =
+                    Some(format!("Could not configure SSH key: {error}"));
+                false
             }
         }
     }
 
-    fn start_public_key_upload(&mut self, alias: String) {
-        let Some(item) = self.selected_credential() else {
-            return;
+    pub(crate) fn start_public_key_upload(
+        &mut self,
+        alias: String,
+        submitted: Option<SubmittedHostPassword>,
+        identity_configured: bool,
+    ) {
+        let (credential, identity_configured) = if let Some(submitted) = &submitted {
+            match &submitted.purpose {
+                HostPasswordPurpose::UploadKey {
+                    credential,
+                    identity_configured,
+                } => (credential.clone(), *identity_configured),
+                HostPasswordPurpose::Connect => return,
+            }
+        } else {
+            let Some(item) = self.selected_credential() else {
+                return;
+            };
+            (item.credential, identity_configured)
         };
-        let credential = item.credential;
-        let password_ref = self.host_password_reference(&alias).map(str::to_string);
+        let fingerprint = credential.fingerprint.clone();
+        let saved_reference = self.host_password_reference(&alias).map(str::to_string);
+        let prepared = if let Some(value) = &submitted {
+            match crate::project_credentials::prepare_credential(value.password.clone()).recv() {
+                Ok(Ok(prepared)) => Some(prepared),
+                Ok(Err(error)) => {
+                    self.notice = Some(format!(
+                        "Could not prepare password in system Keychain: {error}"
+                    ));
+                    return;
+                }
+                Err(_) => {
+                    self.notice = Some("Password Keychain worker stopped.".into());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let had_saved_password = saved_reference.is_some();
+        let password_ref = prepared
+            .as_ref()
+            .map(|value| value.reference.clone())
+            .or(saved_reference);
+        let save_password = submitted
+            .as_ref()
+            .map_or(had_saved_password, |value| value.save_in_keychain);
         let (sender, receiver) = mpsc::channel();
         self.credential_manager.pending = Some(receiver);
         self.credential_manager.message = Some(format!("Uploading public key to {alias}..."));
         let cancelled = Arc::new(AtomicBool::new(false));
         self.credential_manager.upload_cancel = Some(cancelled.clone());
         std::thread::spawn(move || {
-            let _ = sender.send(
-                credentials::upload(
-                    &credential.public_key,
-                    &alias,
-                    password_ref.as_deref(),
-                    None,
-                    &cancelled,
-                )
-                .map(CredentialJob::Message),
+            let result = credentials::upload(
+                &credential.public_key,
+                &alias,
+                password_ref.as_deref(),
+                None,
+                &cancelled,
             );
+            let result = match result {
+                Ok(message) => Ok(CredentialJob::UploadedKey {
+                    alias,
+                    fingerprint,
+                    message,
+                    prepared_password: prepared,
+                    save_password,
+                    identity_configured,
+                }),
+                Err(error) => Ok(CredentialJob::UploadFailed {
+                    alias,
+                    credential,
+                    authentication_failed: upload_authentication_failed(&error),
+                    error,
+                    save_password,
+                    identity_configured,
+                }),
+            };
+            let _ = sender.send(result);
         });
     }
 
@@ -1041,7 +1486,7 @@ impl App {
             match key {
                 KeyCode::Enter | KeyCode::Char('y') => {
                     self.credential_manager.confirm_upload = None;
-                    self.start_public_key_upload(alias);
+                    self.start_public_key_upload(alias, None, false);
                 }
                 KeyCode::Esc | KeyCode::Char('n') => self.credential_manager.confirm_upload = None,
                 _ => {}
@@ -1104,8 +1549,9 @@ impl App {
                         .min(self.visible_credentials().len().saturating_sub(1));
                 }
                 KeyCode::Enter => {
-                    if let Some(alias) = self.credential_manager.target.clone() {
-                        self.assign_credential(alias);
+                    if let Some(alias) = self.credential_manager.target.clone()
+                        && self.assign_credential(alias)
+                    {
                         self.credential_manager.open = false;
                         self.credential_manager.ssh_key_only = false;
                     }
@@ -1192,7 +1638,7 @@ impl App {
                         .selected_credential()
                         .is_some_and(|item| item.credential.kind == CredentialKind::SshKey) =>
             {
-                self.assign_credential(self.credential_manager.target.clone().unwrap())
+                self.assign_credential(self.credential_manager.target.clone().unwrap());
             }
             KeyCode::Char('u')
                 if self
@@ -1203,7 +1649,7 @@ impl App {
                     self.credential_manager.confirm_upload = Some(alias);
                 } else {
                     self.credential_manager.message =
-                        Some("Select a Host first, then use U to upload its public key.".into());
+                        Some("Select a Host in Hosts and press k to configure its SSH key.".into());
                 }
             }
             KeyCode::Enter

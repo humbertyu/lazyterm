@@ -94,6 +94,16 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
             };
             match action {
                 InputAction::Connect => connect_selected(terminal, &mut app)?,
+                InputAction::RetryPublicKeyUpload => {
+                    let submitted = app.take_pending_host_password();
+                    if let Some(submitted) = submitted {
+                        app.start_public_key_upload(
+                            submitted.alias.clone(),
+                            Some(submitted),
+                            false,
+                        );
+                    }
+                }
                 InputAction::LoadFiles { host_alias, path } => {
                     app.start_sftp_listing(host_alias, path)
                 }
@@ -195,23 +205,58 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     let Some(host) = app.selected_host().cloned() else {
         return Ok(());
     };
+    let submitted = app.take_pending_host_password();
+    let saved_reference = app.host_password_reference(&host.alias).map(str::to_string);
+    let mut prepared = if let Some(value) = &submitted {
+        match crate::project_credentials::prepare_credential(value.password.clone()).recv() {
+            Ok(Ok(prepared)) => Some(prepared),
+            Ok(Err(error)) => {
+                app.notice = Some(format!(
+                    "Could not prepare password in system Keychain: {error}"
+                ));
+                return Ok(());
+            }
+            Err(_) => {
+                app.notice = Some("Password Keychain worker stopped.".into());
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let password_reference = prepared
+        .as_ref()
+        .map(|value| value.reference.clone())
+        .or(saved_reference.clone());
 
     app.connection_dialog = Some(ConnectionDialog {
         title: format!("Connecting to {}", host.alias),
-        message: "Checking SSH connection...".to_string(),
+        message: "Checking SSH authentication...".to_string(),
         pending: true,
     });
     terminal.draw(|frame| ui::render(frame, app))?;
-
-    let preflight = match Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "RequestTTY=no",
-            "-o",
-            "ConnectTimeout=5",
-        ])
+    let mut preflight_command = Command::new("ssh");
+    preflight_command.args([
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+    ]);
+    if let Some(reference) = password_reference.as_deref() {
+        preflight_command.args(["-o", "BatchMode=no"]);
+        if let Err(error) =
+            crate::credentials::configure_password(&mut preflight_command, reference, &host.alias)
+        {
+            app.connection_dialog = None;
+            app.notice = Some(format!("Could not prepare Host password: {error}"));
+            return Ok(());
+        }
+    } else {
+        preflight_command.args(["-o", "BatchMode=yes"]);
+    }
+    let preflight = match preflight_command
         .arg(&host.alias)
         .arg("true")
         .stdin(Stdio::null())
@@ -227,20 +272,50 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
             return Ok(());
         }
     };
-
-    let preflight_detail = String::from_utf8_lossy(&preflight.stderr);
-    if !preflight.status.success() && !needs_interactive_auth(&preflight_detail) {
-        app.connection_dialog = Some(ConnectionDialog {
-            title: format!("Connection to {} failed", host.alias),
-            message: ssh_error_detail(&preflight_detail, preflight.status),
-            pending: false,
-        });
+    let detail = String::from_utf8_lossy(&preflight.stderr);
+    if !preflight.status.success() {
+        app.connection_dialog = None;
+        if needs_interactive_auth(&detail) {
+            if submitted.is_none() && saved_reference.is_some() {
+                app.unlink_host_password(&host.alias);
+            }
+            let save = submitted
+                .as_ref()
+                .map_or(saved_reference.is_some(), |value| value.save_in_keychain);
+            app.prompt_host_password(
+                host.alias,
+                Some(if submitted.is_some() {
+                    "Authentication failed. Check the password and try again.".into()
+                } else if saved_reference.is_some() {
+                    "Saved password was rejected. Enter the current Host password.".into()
+                } else {
+                    "SSH requires a password. Enter the Host password.".into()
+                }),
+                save,
+                crate::app::HostPasswordPurpose::Connect,
+            );
+        } else {
+            app.connection_dialog = Some(ConnectionDialog {
+                title: format!("Connection to {} failed", host.alias),
+                message: ssh_error_detail(&detail, preflight.status),
+                pending: false,
+            });
+        }
+        return Ok(());
+    }
+    if let (Some(value), Some(prepared)) = (&submitted, &mut prepared)
+        && value.save_in_keychain
+        && !app.save_host_password_prepared(&host.alias, prepared, None)
+    {
+        app.connection_dialog = None;
+        app.notice =
+            Some("Authenticated, but could not save the Host password in Keychain.".into());
         return Ok(());
     }
     app.connection_dialog = None;
 
     let mut command = Command::new("ssh");
-    if let Some(reference) = app.host_password_reference(&host.alias) {
+    if let Some(reference) = password_reference.as_deref() {
         command.args(["-o", "BatchMode=no"]);
         if let Err(error) =
             crate::credentials::configure_password(&mut command, reference, &host.alias)

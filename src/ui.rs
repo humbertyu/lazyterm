@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap},
@@ -8,9 +8,9 @@ use ratatui::{
 
 use crate::{
     app::{
-        App, ConnectionDialog, FileDialog, FilePane, FilesState, HostPickerItem,
-        LOCAL_BREADCRUMB_SEPARATOR, LocalEntryKind, NavSection, TransferStatus, TunnelStatus,
-        group_columns, host_browser_width,
+        App, ConnectionDialog, FileDialog, FilePane, FilesState, HostPasswordPurpose,
+        HostPickerItem, LOCAL_BREADCRUMB_SEPARATOR, LocalEntryKind, NavSection, TransferStatus,
+        TunnelStatus, group_columns, host_browser_width,
     },
     sftp::SftpEntryKind,
 };
@@ -143,6 +143,9 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
     }
     render_workspace_dialog(frame, app);
     crate::credential_ui::render(frame, app);
+    if let Some(dialog) = &app.host_password_dialog {
+        render_host_password_dialog(frame, dialog);
+    }
 }
 
 fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
@@ -2104,26 +2107,21 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_hosts(frame: &mut Frame, area: Rect, app: &App) {
-    let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
     let path = app.active_group.as_ref().map_or_else(
         || "All hosts".to_string(),
         |group| format!("All hosts  /  {}", group.title()),
     );
+    let title = if app.search_query.is_empty() {
+        path
+    } else {
+        format!("{path}  /  Filter: {}", app.search_query)
+    };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                path,
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                if app.search_query.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Filter: {}", app.search_query)
-                },
-                Style::default().fg(MUTED),
-            )),
-        ]),
+        Paragraph::new(Span::styled(
+            title,
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        )),
         rows[0],
     );
     let area = rows[1];
@@ -2190,7 +2188,9 @@ fn render_group_cards(frame: &mut Frame, area: Rect, app: &App) {
         if y.saturating_add(4) > area.bottom() {
             break;
         }
-        let cells = Layout::horizontal(vec![Constraint::Ratio(1, columns as u32); columns])
+        let card_width = (area.width.saturating_sub(columns as u16 - 1) / columns as u16).min(24);
+        let cells = Layout::horizontal(vec![Constraint::Length(card_width); columns])
+            .flex(Flex::Start)
             .spacing(1)
             .split(Rect::new(area.x, y, area.width, 4));
         for column in 0..columns {
@@ -2243,10 +2243,7 @@ fn render_host_list(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|host| {
             ListItem::new(vec![
-                Line::from(Span::styled(
-                    format!("  {}", host.alias),
-                    Style::default().fg(TEXT),
-                )),
+                host_alias_line(app, host, "  "),
                 Line::from(Span::styled(
                     format!("  {}", host.destination()),
                     Style::default().fg(MUTED),
@@ -2326,7 +2323,7 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
         );
         let items = hosts.iter().map(|host| {
             ListItem::new(vec![
-                Line::from(Span::styled(host.alias.as_str(), Style::default().fg(TEXT))),
+                host_alias_line(app, host, ""),
                 Line::from(Span::styled(host.destination(), Style::default().fg(MUTED))),
             ])
         });
@@ -2372,7 +2369,27 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
                     .as_deref()
                     .unwrap_or("IdentityFile / ssh-agent"),
             ),
-            detail_line("Credentials", "k select / manage    U upload public key"),
+            detail_line(
+                "Public key upload",
+                if app
+                    .metadata
+                    .uploaded_keys
+                    .get(&host.alias)
+                    .is_some_and(|keys| !keys.is_empty())
+                {
+                    "Success recorded by LazyTerm"
+                } else {
+                    "No upload record"
+                },
+            ),
+            detail_line(
+                "Saved password",
+                if app.host_password_reference(&host.alias).is_some() {
+                    "Configured"
+                } else {
+                    "Not configured"
+                },
+            ),
             detail_line("Source", "~/.ssh/config"),
         ];
         frame.render_widget(
@@ -2412,6 +2429,28 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
             area,
         );
     }
+}
+
+fn host_alias_line(app: &App, host: &crate::hosts::Host, indent: &str) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{indent}{}", host.alias),
+        Style::default().fg(TEXT),
+    )];
+    if app
+        .metadata
+        .uploaded_keys
+        .get(&host.alias)
+        .is_some_and(|keys| !keys.is_empty())
+    {
+        spans.push(Span::styled("  UP", Style::default().fg(GREEN)));
+    }
+    if app.host_password_reference(&host.alias).is_some() {
+        spans.push(Span::styled(
+            "  PW",
+            Style::default().fg(Color::Rgb(103, 211, 211)),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn detail_line(label: &str, value: &str) -> Line<'static> {
@@ -2884,7 +2923,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let navigation = if area.width < 75 {
         "1-7 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
-        "1-7 / F1-F7 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
+        "1-7 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
     };
     let hint = if app
         .workspace
@@ -2952,11 +2991,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else if area.width < 75 {
             "↑↓ select  Enter SSH  g tags  Left/Esc back"
         } else if app.showing_groups() {
-            "Arrows select  Enter open/SSH  k set SSH key  U upload key  x unlink password  g tags  / find  a add  r reload  q quit"
+            "Arrows select  Enter open/SSH  k configure SSH key  x unlink password  g tags  / find  a add  r reload  q quit"
         } else if area.width < 95 {
             "↑↓ move  Enter SSH  v view  g tags  / find  Esc back  q quit"
         } else {
-            "↑↓ select  Enter SSH  k set SSH key  U upload key  x unlink password  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
+            "↑↓ select  Enter SSH  k configure SSH key  x unlink password  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
         }
     } else if app.section == NavSection::Files {
         if app.host_picker_open {
@@ -3030,7 +3069,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 {
                     ""
                 } else if app.searching {
-                    "F1-F7 / Ctrl+Left/Right tabs  [,] settings"
+                    "Ctrl+Left/Right tabs  [,] settings"
                 } else {
                     navigation
                 },
@@ -3376,6 +3415,74 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
     );
 }
 
+fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPasswordDialog) {
+    let area = centered_rect(68, 13, frame.area());
+    let purpose = match &dialog.purpose {
+        HostPasswordPurpose::Connect => "Connect to Host",
+        HostPasswordPurpose::UploadKey { .. } => "Install SSH public key",
+    };
+    let mut lines = vec![
+        Line::from(format!("Host: {}", dialog.alias)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                if dialog.selected_field == 0 {
+                    "> "
+                } else {
+                    "  "
+                },
+                Style::default().fg(GREEN),
+            ),
+            Span::styled(
+                format!("Password: {}", "*".repeat(dialog.password.chars().count())),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                if dialog.selected_field == 1 {
+                    "> "
+                } else {
+                    "  "
+                },
+                Style::default().fg(GREEN),
+            ),
+            Span::styled(
+                format!(
+                    "[{}] Save password in system Keychain",
+                    if dialog.save_in_keychain { "x" } else { " " }
+                ),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+    ];
+    if let Some(error) = &dialog.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.as_str(),
+            Style::default().fg(Color::Rgb(221, 132, 112)),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter: next/submit   Space: toggle   Esc: cancel",
+        Style::default().fg(MUTED),
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" {purpose} "))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GREEN))
+                    .style(Style::default().bg(PANEL)),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::CredentialExportDialog) {
     let area = centered_rect(76, 18, frame.area());
     let mask = |value: &str| "*".repeat(value.chars().count());
@@ -3477,6 +3584,34 @@ mod tests {
         app::{App, TransferStatus, TransferTask},
         hosts::{Host, HostCatalog},
     };
+
+    #[test]
+    fn host_key_password_dialog_is_above_selector_and_masks_the_password() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.open_host_ssh_key_selector("web".into());
+        app.prompt_host_password(
+            "web".into(),
+            Some("Password authentication required.".into()),
+            true,
+            HostPasswordPurpose::Connect,
+        );
+        app.host_password_dialog
+            .as_mut()
+            .unwrap()
+            .password
+            .push_str("fixture-secret");
+        for (width, height) in [(80, 24), (60, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Password: **************"));
+            assert!(text.contains("Save password in system Keychain"));
+            assert!(!text.contains("fixture-secret"));
+        }
+    }
 
     #[test]
     fn file_sizes_use_readable_units() {
@@ -3904,6 +4039,20 @@ mod tests {
             };
             let mut metadata = Metadata::default();
             metadata.tags.insert("web".into(), parse_tags("prod,work"));
+            metadata.credentials.push(crate::credentials::Credential {
+                id: 9,
+                name: "web password".into(),
+                kind: crate::credentials::CredentialKind::Password,
+                username: "deploy".into(),
+                password_ref: Some("web-password".into()),
+                private_key_path: None,
+                public_key: String::new(),
+                fingerprint: String::new(),
+            });
+            metadata.host_passwords.insert("web".into(), 9);
+            metadata
+                .uploaded_keys
+                .insert("web".into(), vec!["SHA256:fixture".into()]);
             let mut app = App::with_catalog(catalog, Ok(metadata));
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let text = format!("{}", terminal.backend());
@@ -3915,6 +4064,9 @@ mod tests {
             let text = format!("{}", terminal.backend());
             assert!(text.contains("web"));
             assert!(text.contains("HOSTS"));
+            assert!(text.contains("UP"));
+            assert!(text.contains("PW"));
+            assert!(!text.contains("UP upload recorded"));
             app.active_group = None;
             terminal.draw(|frame| render(frame, &app)).unwrap();
             if width >= 80 {
@@ -3929,7 +4081,15 @@ mod tests {
     #[test]
     fn group_cards_reflow_and_scroll_to_the_selected_group() {
         use crate::{hosts::Host, metadata::Metadata};
-        for (width, height) in [(120, 40), (80, 24), (54, 18), (32, 18)] {
+        for (width, height) in [
+            (300, 40),
+            (200, 40),
+            (160, 40),
+            (120, 40),
+            (80, 24),
+            (54, 18),
+            (32, 18),
+        ] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut metadata = Metadata::default();
             metadata.tags.insert(
@@ -3951,21 +4111,24 @@ mod tests {
             let mut app = App::with_catalog(catalog, Ok(metadata));
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(0, 6)].symbol(), "┌");
-            assert_eq!(buffer[(0, 6)].fg, GREEN);
+            assert_eq!(buffer[(0, 5)].symbol(), "┌");
+            assert_eq!(buffer[(0, 5)].fg, GREEN);
             let text = format!("{}", terminal.backend());
             assert!(text.contains("group-00"));
             assert!(text.contains("1 host"));
             if width >= 70 {
                 let sidebar = host_browser_width(width);
-                assert_eq!(buffer[(sidebar - 1, 6)].symbol(), "┐");
-                assert_eq!(buffer[(sidebar, 5)].symbol(), "┌");
-                assert_eq!(buffer[(sidebar, 6)].symbol(), "│");
-                assert_eq!(buffer[(0, 9)].symbol(), "└");
+                assert_eq!(buffer[(sidebar, 4)].symbol(), "┌");
+                assert_eq!(buffer[(sidebar, 5)].symbol(), "│");
+                assert_eq!(buffer[(0, 8)].symbol(), "└");
             }
-            if width >= 54 {
+            let first_card_end = (0..host_browser_width(width))
+                .find(|x| buffer[(*x, 5)].symbol() == "┐")
+                .unwrap();
+            assert!(first_card_end < 24);
+            if group_columns(host_browser_width(width)) >= 2 {
                 let row = (0..width)
-                    .map(|x| buffer[(x, 7)].symbol())
+                    .map(|x| buffer[(x, 6)].symbol())
                     .collect::<String>();
                 assert!(row.contains("group-00") && row.contains("group-01"));
             }
@@ -3976,7 +4139,7 @@ mod tests {
             terminal.draw(|frame| render(frame, &app)).unwrap();
             assert_eq!(app.selected_host().unwrap().alias, "web");
             assert!(format!("{}", terminal.backend()).contains("web"));
-            assert_eq!(terminal.backend().buffer()[(0, 6)].fg, BORDER);
+            assert_eq!(terminal.backend().buffer()[(0, 5)].fg, BORDER);
             app.selected_browse_item = 0;
             app.enter_group();
             terminal.draw(|frame| render(frame, &app)).unwrap();

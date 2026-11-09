@@ -34,6 +34,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
     let state = &app.credential_manager;
+    if state.ssh_key_only {
+        render_host_key_selector(frame, app);
+        return;
+    }
     frame.render_widget(Clear, area);
     let inner = if state.open {
         let title = state.target.as_ref().map_or_else(
@@ -190,12 +194,12 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
     );
     let help = if state.ssh_key_only {
         format!(
-            "Host: {}  Enter set SSH key  u upload public key\nEsc back",
+            "Host: {}  Enter configure SSH key  u upload public key\nEsc back",
             state.target.as_deref().unwrap_or_default()
         )
     } else if state.target.is_some() && !state.upload_only {
         format!(
-            "Host: {}  Enter set SSH key  u upload public key  x unlink password\na password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back",
+            "Host: {}  Enter configure SSH key  u upload public key  x unlink password\na password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back",
             state.target.as_deref().unwrap_or_default()
         )
     } else if state.target.is_some() && state.upload_only {
@@ -211,6 +215,59 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
             .style(Style::default().fg(MUTED))
             .wrap(Wrap { trim: false }),
         rows[2],
+    );
+}
+
+fn render_host_key_selector(frame: &mut Frame, app: &App) {
+    let state = &app.credential_manager;
+    let area = centered(frame.area(), 76, 20);
+    frame.render_widget(Clear, area);
+    let title = format!(
+        " SET SSH KEY / {} ",
+        state.target.as_deref().unwrap_or_default()
+    );
+    let block = panel(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    let items = app.visible_credentials();
+    let rows_content = items.iter().map(|item| {
+        ListItem::new(vec![
+            Line::from(Span::styled(
+                item.credential.name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                item.credential
+                    .private_key_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                Style::default().fg(MUTED),
+            )),
+        ])
+    });
+    let mut selection = ListState::default().with_selected(
+        (!items.is_empty()).then_some(state.selected.min(items.len().saturating_sub(1))),
+    );
+    frame.render_stateful_widget(
+        List::new(rows_content)
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        rows[0],
+        &mut selection,
+    );
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No SSH keys found. Generate or import a key from Credentials.")
+                .wrap(Wrap { trim: false }),
+            rows[0],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("↑↓ select  Enter set IdentityFile  Esc cancel")
+            .style(Style::default().fg(MUTED)),
+        rows[1],
     );
 }
 
@@ -477,6 +534,43 @@ mod tests {
         assert!(text.contains("Related Hosts (1): build-prod"), "{text:?}");
         assert!(!text.contains("IdentityFile Hosts"));
         assert!(!text.contains("Default-key candidates"));
+    }
+
+    #[test]
+    fn host_ssh_key_selector_renders_as_a_single_panel() {
+        let mut metadata = Metadata::default();
+        metadata.credentials.push(Credential {
+            id: 1,
+            name: "Deploy key".into(),
+            kind: CredentialKind::SshKey,
+            username: String::new(),
+            password_ref: None,
+            private_key_path: Some("/home/test/.ssh/deploy".into()),
+            public_key: "ssh-ed25519 AAAA".into(),
+            fingerprint: "SHA256:test".into(),
+        });
+        let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
+        app.credential_manager.open = true;
+        app.credential_manager.ssh_key_only = true;
+        app.credential_manager.target = Some("build-prod".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| render_page(frame, frame.area(), &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("SET SSH KEY / build-prod"));
+        assert!(text.contains("Deploy key"));
+        assert!(text.contains("/home/test/.ssh/deploy"));
+        assert!(!text.contains("CREDENTIALS /"));
+        assert!(!text.contains("KEYCHAIN & SSH KEYS"));
+        assert!(!text.contains("DETAILS"));
     }
 
     #[test]

@@ -146,12 +146,12 @@ pub fn host_browser_width(width: u16) -> u16 {
     if width < 70 {
         width
     } else {
-        (width / 5 * 2).clamp(38, 48)
+        ((u32::from(width) * 2 + 2) / 5) as u16
     }
 }
 
 pub fn group_columns(width: u16) -> usize {
-    usize::from(width / 18).clamp(1, 2)
+    usize::from(width.saturating_add(1) / 19).max(1)
 }
 
 impl HostGroup {
@@ -217,6 +217,8 @@ pub struct App {
     pub should_quit: bool,
     pub notice: Option<String>,
     pub connection_dialog: Option<ConnectionDialog>,
+    pub host_password_dialog: Option<HostPasswordDialog>,
+    pending_host_password: Option<SubmittedHostPassword>,
     pub host_dialog: Option<HostDialog>,
     pub tunnel_dialog: Option<TunnelDialog>,
     pub snippet_dialog: Option<SnippetDialog>,
@@ -452,10 +454,48 @@ pub struct ConnectionDialog {
     pub pending: bool,
 }
 
+#[derive(Clone)]
+pub enum HostPasswordPurpose {
+    Connect,
+    UploadKey {
+        credential: crate::credentials::Credential,
+        identity_configured: bool,
+    },
+}
+
+pub struct HostPasswordDialog {
+    pub alias: String,
+    pub password: Zeroizing<String>,
+    pub save_in_keychain: bool,
+    pub selected_field: usize,
+    pub error: Option<String>,
+    pub purpose: HostPasswordPurpose,
+}
+
+impl Drop for HostPasswordDialog {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+pub struct SubmittedHostPassword {
+    pub alias: String,
+    pub password: Zeroizing<String>,
+    pub save_in_keychain: bool,
+    pub purpose: HostPasswordPurpose,
+}
+
+impl Drop for SubmittedHostPassword {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum InputAction {
     None,
     Connect,
+    RetryPublicKeyUpload,
     LoadFiles {
         host_alias: String,
         path: String,
@@ -519,6 +559,8 @@ impl App {
             should_quit: false,
             notice,
             connection_dialog: None,
+            host_password_dialog: None,
+            pending_host_password: None,
             host_dialog: None,
             tunnel_dialog: None,
             snippet_dialog: None,
@@ -2885,7 +2927,104 @@ impl App {
         InputAction::None
     }
 
+    pub fn prompt_host_password(
+        &mut self,
+        alias: String,
+        error: Option<String>,
+        save_in_keychain: bool,
+        purpose: HostPasswordPurpose,
+    ) {
+        self.connection_dialog = None;
+        self.host_password_dialog = Some(HostPasswordDialog {
+            alias,
+            password: Zeroizing::new(String::new()),
+            save_in_keychain,
+            selected_field: 0,
+            error,
+            purpose,
+        });
+    }
+
+    pub fn take_pending_host_password(&mut self) -> Option<SubmittedHostPassword> {
+        self.pending_host_password.take()
+    }
+
+    fn handle_host_password_key(&mut self, key: KeyCode) -> InputAction {
+        let Some(dialog) = self.host_password_dialog.as_mut() else {
+            return InputAction::None;
+        };
+        match key {
+            KeyCode::Esc => {
+                self.host_password_dialog = None;
+                self.pending_host_password = None;
+            }
+            KeyCode::Tab | KeyCode::Down | KeyCode::Up | KeyCode::BackTab => {
+                dialog.selected_field = 1 - dialog.selected_field;
+            }
+            KeyCode::Char(' ') if dialog.selected_field == 1 => {
+                dialog.save_in_keychain = !dialog.save_in_keychain;
+            }
+            KeyCode::Char('y') if dialog.selected_field == 1 => {
+                dialog.save_in_keychain = true;
+            }
+            KeyCode::Char(' ') if dialog.selected_field == 0 => {
+                dialog.password.push(' ');
+                dialog.error = None;
+            }
+            KeyCode::Char('n') if dialog.selected_field == 1 => {
+                dialog.save_in_keychain = false;
+            }
+            KeyCode::Backspace if dialog.selected_field == 0 => {
+                dialog.password.pop();
+                dialog.error = None;
+            }
+            KeyCode::Char(value) if dialog.selected_field == 0 && !value.is_control() => {
+                dialog.password.push(value);
+                dialog.error = None;
+            }
+            KeyCode::Enter if dialog.selected_field == 0 => {
+                if dialog.password.is_empty() {
+                    dialog.error = Some("Enter the Host password.".into());
+                } else {
+                    dialog.selected_field = 1;
+                }
+            }
+            KeyCode::Enter if dialog.selected_field == 1 => {
+                if dialog.password.is_empty() {
+                    dialog.error = Some("Enter the Host password.".into());
+                    dialog.selected_field = 0;
+                    return InputAction::None;
+                }
+                let Some(dialog) = self.host_password_dialog.take() else {
+                    return InputAction::None;
+                };
+                let action = match &dialog.purpose {
+                    HostPasswordPurpose::Connect => InputAction::Connect,
+                    HostPasswordPurpose::UploadKey { .. } => InputAction::RetryPublicKeyUpload,
+                };
+                self.pending_host_password = Some(SubmittedHostPassword {
+                    alias: dialog.alias.clone(),
+                    password: Zeroizing::new(dialog.password.to_string()),
+                    save_in_keychain: dialog.save_in_keychain,
+                    purpose: dialog.purpose.clone(),
+                });
+                return action;
+            }
+            _ => {}
+        }
+        InputAction::None
+    }
+
     pub fn handle_event(&mut self, key: KeyEvent) -> InputAction {
+        if self.host_password_dialog.is_some() {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                return self.handle_host_password_key(key.code);
+            }
+            return InputAction::None;
+        }
         if self.credentials_modal() {
             if !key
                 .modifiers
@@ -2910,16 +3049,10 @@ impl App {
             || self.workspace.confirmation.is_some()
             || self.tags_dialog.is_some()
             || self.connection_dialog.is_some()
+            || self.host_password_dialog.is_some()
             || self.file_dialog.is_some();
         if !modal {
             match (key.code, key.modifiers) {
-                (KeyCode::F(number @ 1..=7), KeyModifiers::NONE) => {
-                    let visible = self.visible_sections();
-                    if let Some(section) = visible.get(usize::from(number - 1)) {
-                        self.switch_section(*section);
-                    }
-                    return InputAction::None;
-                }
                 (KeyCode::Char(number @ '1'..='7'), KeyModifiers::NONE)
                     if !self.searching
                         && !self.file_filtering
@@ -3506,11 +3639,6 @@ impl App {
                     self.unlink_host_password(&alias);
                 }
             }
-            KeyCode::Char('U') if self.section == NavSection::Hosts => {
-                if let Some(host) = self.selected_host() {
-                    self.open_credentials(Some(host.alias.clone()), true);
-                }
-            }
             KeyCode::Char('e') if self.section == NavSection::Hosts => {
                 if let Some(host) = self.selected_host().filter(|host| host.managed).cloned() {
                     self.open_host_form(Some(host));
@@ -3556,10 +3684,10 @@ impl App {
                 self.open_tunnel_delete();
             }
             KeyCode::Char('1') => self.switch_section(NavSection::Hosts),
-            KeyCode::Char('2') | KeyCode::Char('f') => self.switch_section(NavSection::Files),
-            KeyCode::Char('3') | KeyCode::Char('t') => self.switch_section(NavSection::Tunnels),
-            KeyCode::Char('4') | KeyCode::Char('s') => self.switch_section(NavSection::Snippets),
-            KeyCode::Char('5') | KeyCode::Char('p') => self.switch_section(NavSection::Runtime),
+            KeyCode::Char('2') => self.switch_section(NavSection::Files),
+            KeyCode::Char('3') => self.switch_section(NavSection::Tunnels),
+            KeyCode::Char('4') => self.switch_section(NavSection::Snippets),
+            KeyCode::Char('5') => self.switch_section(NavSection::Runtime),
             KeyCode::Char('6') => self.switch_section(NavSection::Projects),
             KeyCode::Char('7') => self.switch_section(NavSection::Credentials),
             KeyCode::Char(',') => self.switch_section(NavSection::Settings),
@@ -4442,6 +4570,7 @@ impl App {
                             self.metadata.tags.remove(&alias);
                             self.metadata.remote_paths.remove(&alias);
                             self.metadata.host_passwords.remove(&alias);
+                            self.metadata.uploaded_keys.remove(&alias);
                             self.metadata
                                 .tunnels
                                 .retain(|tunnel| tunnel.custom_host || tunnel.host_alias != alias);
@@ -4526,6 +4655,9 @@ impl App {
                             }
                             if let Some(id) = self.metadata.host_passwords.remove(original) {
                                 self.metadata.host_passwords.insert(host.alias.clone(), id);
+                            }
+                            if let Some(keys) = self.metadata.uploaded_keys.remove(original) {
+                                self.metadata.uploaded_keys.insert(host.alias.clone(), keys);
                             }
                             for tunnel in &mut self.metadata.tunnels {
                                 if !tunnel.custom_host && tunnel.host_alias == *original {
@@ -4866,6 +4998,62 @@ mod tests {
                 .unwrap()
                 .contains("isolated metadata_save_path")
         );
+    }
+
+    #[test]
+    fn host_password_dialog_masks_flow_and_returns_connect_action() {
+        let mut app = app_fixture();
+        app.prompt_host_password("web".into(), None, false, HostPasswordPurpose::Connect);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(
+            app.host_password_dialog.as_ref().unwrap().password.as_str(),
+            "s"
+        );
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.host_password_dialog.as_ref().unwrap().save_in_keychain);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Connect
+        );
+        let submitted = app.take_pending_host_password().unwrap();
+        assert_eq!(submitted.password.as_str(), "s");
+        assert!(submitted.save_in_keychain);
+        assert_eq!(submitted.alias, "web");
+    }
+
+    #[test]
+    fn host_password_requires_input_and_space_toggles_keychain_choice() {
+        let mut app = app_fixture();
+        app.prompt_host_password("web".into(), None, false, HostPasswordPurpose::Connect);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        );
+        assert!(app.take_pending_host_password().is_none());
+        assert!(app.host_password_dialog.as_ref().unwrap().error.is_some());
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.host_password_dialog.as_ref().unwrap().save_in_keychain);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(!app.host_password_dialog.as_ref().unwrap().save_in_keychain);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.host_password_dialog.is_none());
+        assert!(app.take_pending_host_password().is_none());
+    }
+
+    #[test]
+    fn hosts_uses_one_key_configuration_entry_point() {
+        let mut app = grouped_fixture();
+        app.enter_group();
+        assert!(app.selected_host().is_some());
+        press(&mut app, KeyCode::Char('U'), KeyModifiers::NONE);
+        assert!(!app.credential_manager.open);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(app.credential_manager.open);
+        assert!(app.credential_manager.ssh_key_only);
     }
 
     #[test]
@@ -5667,11 +5855,6 @@ mod tests {
         for section in NavSection::ALL {
             app.section = section;
             for number in 1..=7 {
-                assert_eq!(
-                    press(&mut app, KeyCode::F(number), KeyModifiers::NONE),
-                    InputAction::None
-                );
-                assert_eq!(app.section, NavSection::ALL[usize::from(number - 1)]);
                 press(
                     &mut app,
                     KeyCode::Char(char::from(b'0' + number)),
@@ -5687,6 +5870,20 @@ mod tests {
             assert_eq!(app.section, NavSection::Hosts);
             press(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
             assert_eq!(app.section, NavSection::Credentials);
+        }
+    }
+
+    #[test]
+    fn letters_and_function_keys_do_not_switch_tabs() {
+        let mut app = app_fixture();
+        app.section = NavSection::Hosts;
+        for key in ['f', 't', 's', 'p', 'S'] {
+            press(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+            assert_eq!(app.section, NavSection::Hosts);
+        }
+        for number in 1..=7 {
+            press(&mut app, KeyCode::F(number), KeyModifiers::NONE);
+            assert_eq!(app.section, NavSection::Hosts);
         }
     }
 
@@ -5717,7 +5914,7 @@ mod tests {
     }
 
     #[test]
-    fn search_owns_characters_but_explicit_tab_shortcuts_still_work() {
+    fn search_owns_characters_and_numeric_tab_shortcuts_still_work() {
         let mut app = grouped_fixture();
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
         for character in ['2', 'f', 't', '`', 'S'] {
@@ -5726,14 +5923,15 @@ mod tests {
         assert_eq!(app.search_query, "2ft`S");
         assert_eq!(app.section, NavSection::Hosts);
         press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
-        assert_eq!(app.section, NavSection::Files);
-        assert!(!app.searching);
-        press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Hosts);
         assert_eq!(app.search_query, "2ft`S");
-        app.searching = true;
-        press(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.searching);
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
         assert_eq!(app.section, NavSection::Files);
         assert!(!app.searching);
+        press(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(app.section, NavSection::Tunnels);
     }
 
     #[test]

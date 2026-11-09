@@ -98,6 +98,8 @@ pub struct Metadata {
     pub hidden_tabs: Vec<String>,
     pub credentials: Vec<crate::credentials::Credential>,
     pub host_passwords: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub uploaded_keys: BTreeMap<String, Vec<String>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
@@ -164,6 +166,7 @@ impl Default for Metadata {
             hidden_tabs: Vec::new(),
             credentials: Vec::new(),
             host_passwords: BTreeMap::new(),
+            uploaded_keys: BTreeMap::new(),
             extra: BTreeMap::new(),
             snapshot: RefCell::new(None),
         }
@@ -295,7 +298,8 @@ impl Metadata {
         let previous_len = self.tags.len()
             + self.remote_paths.len()
             + self.tunnels.len()
-            + self.host_passwords.len();
+            + self.host_passwords.len()
+            + self.uploaded_keys.len();
         self.host_passwords.retain(|alias, id| {
             aliases.contains(alias.as_str())
                 && self.credentials.iter().any(|credential| {
@@ -309,7 +313,14 @@ impl Metadata {
             .retain(|alias, _| aliases.contains(alias.as_str()));
         self.tunnels
             .retain(|tunnel| tunnel.custom_host || aliases.contains(tunnel.host_alias.as_str()));
-        self.tags.len() + self.remote_paths.len() + self.tunnels.len() + self.host_passwords.len()
+        self.uploaded_keys.retain(|alias, fingerprints| {
+            aliases.contains(alias.as_str()) && !fingerprints.is_empty()
+        });
+        self.tags.len()
+            + self.remote_paths.len()
+            + self.tunnels.len()
+            + self.host_passwords.len()
+            + self.uploaded_keys.len()
             != previous_len
     }
 
@@ -557,6 +568,9 @@ mod tests {
         metadata
             .remote_paths
             .insert("web".into(), "projects".into());
+        metadata
+            .uploaded_keys
+            .insert("web".into(), vec!["SHA256:fixture".into()]);
         metadata.show_hidden_files = true;
         metadata.tunnels.push(TunnelDefinition {
             id: 7,
@@ -579,6 +593,7 @@ mod tests {
         assert_eq!(restored.tags["web"], ["prod", "work"]);
         assert_eq!(restored.local_path, Some(PathBuf::from("/tmp/lazyterm")));
         assert_eq!(restored.remote_paths["web"], "projects");
+        assert_eq!(restored.uploaded_keys["web"], ["SHA256:fixture"]);
         assert!(restored.show_hidden_files);
         assert_eq!(restored.tunnels[0].label, "web-db");
         assert_eq!(restored.tunnels[0].local_port, 5432);
@@ -636,6 +651,33 @@ mod tests {
 
         assert!(!metadata.reconcile(&catalog));
         assert_eq!(metadata.tunnels.len(), 2);
+    }
+
+    #[test]
+    fn reconcile_removes_uploaded_key_history_for_deleted_hosts() {
+        let catalog = HostCatalog {
+            hosts: vec![crate::hosts::Host {
+                alias: "web".into(),
+                hostname: None,
+                user: None,
+                port: None,
+                identity_file: None,
+                proxy_jump: None,
+                managed: false,
+            }],
+            error: None,
+        };
+        let mut metadata = Metadata::default();
+        metadata
+            .uploaded_keys
+            .insert("web".into(), vec!["SHA256:still-here".into()]);
+        metadata
+            .uploaded_keys
+            .insert("deleted".into(), vec!["SHA256:stale".into()]);
+
+        assert!(metadata.reconcile(&catalog));
+        assert!(metadata.uploaded_keys.contains_key("web"));
+        assert!(!metadata.uploaded_keys.contains_key("deleted"));
     }
 
     #[test]

@@ -347,9 +347,12 @@ fn run_upload(
         .map_err(|_| "Could not start OpenSSH.".to_string())?;
     // Drain diagnostics while waiting; a noisy remote cannot block the worker on a full pipe.
     let stderr = child.stderr.take();
+    let (diagnostic_sender, diagnostic_receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         if let Some(mut stderr) = stderr {
-            let _ = io::copy(&mut stderr, &mut io::sink());
+            let mut diagnostic = Vec::new();
+            let _ = io::Read::read_to_end(&mut stderr, &mut diagnostic);
+            let _ = diagnostic_sender.send(String::from_utf8_lossy(&diagnostic).trim().to_string());
         }
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(45);
@@ -365,8 +368,13 @@ fn run_upload(
                 ));
             }
             Ok(Some(status)) => {
-                break Err(format!(
-                    "Public key upload failed ({status}); check authentication, known_hosts and remote ~/.ssh permissions. Connect to this Host first if its host key is new."
+                let detail = diagnostic_receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                break Err(detail.map_or_else(
+                    || format!("Public key upload failed ({status}); check SSH authentication, known_hosts and remote ~/.ssh permissions."),
+                    |detail| format!("Public key upload failed: {detail}"),
                 ));
             }
             Ok(None) if std::time::Instant::now() < deadline => {
