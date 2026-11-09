@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, fs, io, path::PathBuf};
+use std::{cell::RefCell, collections::BTreeMap, env, fs, io, io::Write, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -76,7 +76,7 @@ pub enum HostView {
     Hosts,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Metadata {
     pub version: u32,
@@ -96,6 +96,12 @@ pub struct Metadata {
     pub language: Language,
     #[serde(default)]
     pub hidden_tabs: Vec<String>,
+    pub credentials: Vec<crate::credentials::Credential>,
+    pub host_passwords: BTreeMap<String, u64>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+    #[serde(skip)]
+    snapshot: RefCell<Option<Vec<u8>>>,
 }
 
 #[derive(Serialize)]
@@ -156,6 +162,10 @@ impl Default for Metadata {
             theme: Theme::Dark,
             language: Language::English,
             hidden_tabs: Vec::new(),
+            credentials: Vec::new(),
+            host_passwords: BTreeMap::new(),
+            extra: BTreeMap::new(),
+            snapshot: RefCell::new(None),
         }
     }
 }
@@ -165,13 +175,14 @@ impl Metadata {
         Self::read_from(&Self::path()?)
     }
 
-    fn read_from(path: &std::path::Path) -> io::Result<Self> {
+    pub(crate) fn read_from(path: &std::path::Path) -> io::Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
                 let metadata: Self = serde_json::from_slice(&bytes)?;
                 if metadata.version != 1 {
                     return Err(io::Error::other("Unsupported host metadata version"));
                 }
+                *metadata.snapshot.borrow_mut() = Some(bytes);
                 Ok(metadata)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
@@ -179,12 +190,96 @@ impl Metadata {
         }
     }
 
+    #[cfg(not(test))]
+    #[track_caller]
     pub fn save(&self) -> io::Result<()> {
         self.save_to(&Self::path()?)
     }
 
+    #[track_caller]
     pub(crate) fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
-        crate::hosts::safe_write(path, &serde_json::to_vec_pretty(self)?)
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        fs::create_dir_all(parent)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("Missing metadata filename"))?
+            .to_string_lossy();
+        let open_private = |destination: &std::path::Path, append: bool| {
+            let mut options = fs::OpenOptions::new();
+            options.create(true).read(true).write(true).append(append);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(destination)
+        };
+        let lock = open_private(&parent.join(format!("{name}.lock")), false)?;
+        lock.lock()?;
+        let current = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let caller = std::panic::Location::caller();
+        let mut journal = open_private(&parent.join(format!("{name}.writes.jsonl")), true)?;
+        let mut log = |outcome: &str| -> io::Result<()> {
+            serde_json::to_writer(
+                &mut journal,
+                &serde_json::json!({
+                    "unix_nanos": timestamp.to_string(),
+                    "pid": std::process::id(),
+                    "outcome": outcome,
+                    "caller": format!("{}:{}", caller.file(), caller.line()),
+                    "projects": self.projects.len(),
+                    "project_commands": self.projects.iter().map(|project| project.commands.len()).sum::<usize>(),
+                    "project_links": self.projects.iter().map(|project| project.links.len()).sum::<usize>(),
+                    "credentials": self.credentials.len(),
+                }),
+            )?;
+            journal.write_all(b"\n")?;
+            journal.sync_all()
+        };
+        if current.as_ref() != self.snapshot.borrow().as_ref() {
+            log("conflict")?;
+            return Err(io::Error::other(
+                "Configuration changed on disk; save blocked to preserve other changes. Close older LazyTerm instances, then press r in Hosts to reload before retrying.",
+            ));
+        }
+        if let Some(bytes) = &current {
+            let backups = parent.join(format!("{name}.backups"));
+            fs::create_dir_all(&backups)?;
+            let backup = backups.join(format!("{timestamp:020}-{}.json", std::process::id()));
+            let mut file = open_private(&backup, false)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            let mut entries = fs::read_dir(&backups)?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            let expired = entries.len().saturating_sub(30);
+            for entry in entries.into_iter().take(expired) {
+                fs::remove_file(entry)?;
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(self)?;
+        log("attempt")?;
+        if let Err(error) = crate::hosts::safe_write(path, &bytes) {
+            let _ = log("failed");
+            return Err(error);
+        }
+        *self.snapshot.borrow_mut() = Some(bytes);
+        let _ = log("saved");
+        Ok(())
     }
 
     pub fn reconcile(&mut self, catalog: &HostCatalog) -> bool {
@@ -197,14 +292,25 @@ impl Metadata {
             .iter()
             .map(|host| host.alias.as_str())
             .collect::<std::collections::HashSet<_>>();
-        let previous_len = self.tags.len() + self.remote_paths.len() + self.tunnels.len();
+        let previous_len = self.tags.len()
+            + self.remote_paths.len()
+            + self.tunnels.len()
+            + self.host_passwords.len();
+        self.host_passwords.retain(|alias, id| {
+            aliases.contains(alias.as_str())
+                && self.credentials.iter().any(|credential| {
+                    credential.id == *id
+                        && credential.kind == crate::credentials::CredentialKind::Password
+                })
+        });
         self.tags
             .retain(|alias, _| aliases.contains(alias.as_str()));
         self.remote_paths
             .retain(|alias, _| aliases.contains(alias.as_str()));
         self.tunnels
             .retain(|tunnel| tunnel.custom_host || aliases.contains(tunnel.host_alias.as_str()));
-        self.tags.len() + self.remote_paths.len() + self.tunnels.len() != previous_len
+        self.tags.len() + self.remote_paths.len() + self.tunnels.len() + self.host_passwords.len()
+            != previous_len
     }
 
     pub(crate) fn data_dir() -> io::Result<PathBuf> {
@@ -243,6 +349,144 @@ pub fn parse_tags(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_writer_cannot_erase_projects_credentials_or_unknown_fields() {
+        let fixture = crate::projects::tests::Fixture::new("stale-metadata-writer");
+        let path = fixture.root.join("hosts.json");
+        let initial = Metadata::default();
+        initial.save_to(&path).unwrap();
+        let mut stale = Metadata::read_from(&path).unwrap();
+        let mut current = Metadata::read_from(&path).unwrap();
+        let mut project = fixture.project.clone();
+        project.commands.push(fixture.command("printf ready"));
+        project.links.push(crate::projects::ProjectLink {
+            id: 1,
+            name: "Home".into(),
+            url: "http://localhost:3000/".into(),
+            password_storage: crate::projects::PasswordStorage::Config,
+            password: Some("sensitive-fixture-value".into()),
+            ..Default::default()
+        });
+        current.projects.push(project);
+        current.credentials.push(crate::credentials::Credential {
+            id: 1,
+            name: "Fixture password".into(),
+            kind: crate::credentials::CredentialKind::Password,
+            username: String::new(),
+            password_ref: Some("credential-reference".into()),
+            private_key_path: None,
+            public_key: String::new(),
+            fingerprint: String::new(),
+        });
+        current
+            .extra
+            .insert("future_field".into(), serde_json::json!({"keep": true}));
+        current.save_to(&path).unwrap();
+        let saved = fs::read(&path).unwrap();
+        stale.theme = Theme::Light;
+        let error = stale.save_to(&path).unwrap_err();
+        assert!(error.to_string().contains("Configuration changed on disk"));
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert!(Metadata::default().save_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), saved);
+
+        let mut reloaded = Metadata::read_from(&path).unwrap();
+        reloaded.theme = Theme::Light;
+        reloaded.save_to(&path).unwrap();
+        reloaded.language = Language::Chinese;
+        reloaded.save_to(&path).unwrap();
+        let restored = Metadata::read_from(&path).unwrap();
+        assert_eq!(restored.projects, current.projects);
+        assert_eq!(restored.credentials, current.credentials);
+        assert_eq!(restored.extra, current.extra);
+        let journal = fs::read_to_string(fixture.root.join("hosts.json.writes.jsonl")).unwrap();
+        assert!(journal.contains("\"outcome\":\"conflict\""));
+        assert!(journal.contains("\"caller\":"));
+        assert!(!journal.contains("sensitive-fixture-value"));
+        assert!(!journal.contains("credential-reference"));
+        assert!(
+            fs::read_dir(fixture.root.join("hosts.json.backups"))
+                .unwrap()
+                .count()
+                >= 3
+        );
+    }
+
+    #[test]
+    fn legacy_unconditional_save_reproduces_project_loss_in_a_temporary_file() {
+        let fixture = crate::projects::tests::Fixture::new("legacy-overwrite-reproduction");
+        let path = fixture.root.join("hosts.json");
+        let stale = Metadata::default();
+        let mut updated = stale.clone();
+        updated.projects.push(fixture.project.clone());
+        updated.save_to(&path).unwrap();
+        assert_eq!(Metadata::read_from(&path).unwrap().projects.len(), 1);
+
+        // This is the previous save implementation, exercised only against a fixture.
+        crate::hosts::safe_write(&path, &serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        assert!(Metadata::read_from(&path).unwrap().projects.is_empty());
+        assert_eq!(
+            Metadata::read_from(&path.with_extension("config.lazyterm.bak"))
+                .unwrap()
+                .projects
+                .len(),
+            1
+        );
+        crate::hosts::safe_write(&path, &serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        assert!(
+            Metadata::read_from(&path.with_extension("config.lazyterm.bak"))
+                .unwrap()
+                .projects
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn simultaneous_metadata_writers_allow_only_one_snapshot_to_commit() {
+        let fixture = crate::projects::tests::Fixture::new("concurrent-metadata");
+        let path = fixture.root.join("hosts.json");
+        Metadata::default().save_to(&path).unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writers = (0..2)
+            .map(|index| {
+                let path = path.clone();
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    let mut metadata = Metadata::read_from(&path).unwrap();
+                    metadata.extra.insert("writer".into(), index.into());
+                    gate.wait();
+                    metadata.save_to(&path).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let saved = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .filter(|saved| *saved)
+            .count();
+        assert_eq!(saved, 1);
+        assert!(
+            Metadata::read_from(&path)
+                .unwrap()
+                .extra
+                .contains_key("writer")
+        );
+    }
+
+    #[test]
+    fn deleted_or_corrupt_metadata_is_never_overwritten_by_an_existing_reader() {
+        let fixture = crate::projects::tests::Fixture::new("external-metadata-removal");
+        let path = fixture.root.join("hosts.json");
+        Metadata::default().save_to(&path).unwrap();
+        let metadata = Metadata::read_from(&path).unwrap();
+        fs::write(&path, "{broken").unwrap();
+        assert!(metadata.save_to(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+        fs::remove_file(&path).unwrap();
+        assert!(metadata.save_to(&path).is_err());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn projects_upgrade_additively_persist_backup_and_survive_host_reconciliation() {

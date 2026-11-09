@@ -1,5 +1,9 @@
 mod app;
+mod credential_app;
+mod credential_ui;
+mod credentials;
 mod hosts;
+mod instance;
 mod metadata;
 mod project_app;
 mod project_credentials;
@@ -32,6 +36,12 @@ use ratatui::DefaultTerminal;
 use crate::app::{App, ConnectionDialog, InputAction};
 
 fn main() -> Result<()> {
+    if std::env::var_os("LAZYTERM_ASKPASS_REFERENCE").is_some() {
+        if crate::credentials::askpass().is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let mut arguments = std::env::args_os().skip(1);
     if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--project-runner")) {
         let spec = arguments
@@ -41,6 +51,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
     color_eyre::install()?;
+    let _instance = match instance::InstanceGuard::acquire(&metadata::Metadata::data_dir()?) {
+        Ok(instance) => instance,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
     let result = run(&mut terminal, App::new());
@@ -59,6 +77,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         app.poll_snippet_runs();
         app.poll_projects();
         app.poll_runtime();
+        app.poll_credentials();
         let size = terminal.size()?;
         app.viewport_width = size.width;
         app.viewport_height = size.height;
@@ -135,11 +154,22 @@ fn open_files(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         return Ok(());
     };
 
+    let mut command = Command::new("sftp");
+    if let Some(reference) = app.host_password_reference(&host.alias) {
+        command.args(["-o", "BatchMode=no"]);
+        if let Err(error) =
+            crate::credentials::configure_password(&mut command, reference, &host.alias)
+        {
+            app.notice = Some(format!("Could not prepare saved password: {error}"));
+            return Ok(());
+        }
+    }
+
     terminal.show_cursor()?;
     execute!(io::stdout(), DisableMouseCapture)?;
     ratatui::restore();
     execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show)?;
-    let result = Command::new("sftp")
+    let result = command
         .arg(&host.alias)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -209,6 +239,17 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     }
     app.connection_dialog = None;
 
+    let mut command = Command::new("ssh");
+    if let Some(reference) = app.host_password_reference(&host.alias) {
+        command.args(["-o", "BatchMode=no"]);
+        if let Err(error) =
+            crate::credentials::configure_password(&mut command, reference, &host.alias)
+        {
+            app.notice = Some(format!("Could not prepare saved password: {error}"));
+            return Ok(());
+        }
+    }
+
     // Leave Ratatui's alternate screen completely before handing the terminal
     // to OpenSSH. The preflight above guarantees that failures stay in the TUI.
     terminal.show_cursor()?;
@@ -216,7 +257,7 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     ratatui::restore();
     execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show)?;
 
-    let result = Command::new("ssh")
+    let result = command
         .arg(&host.alias)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

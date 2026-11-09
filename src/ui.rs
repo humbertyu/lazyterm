@@ -59,6 +59,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         NavSection::Snippets => render_snippets(frame, page[2], app),
         NavSection::Runtime => render_runtime(frame, app),
         NavSection::Projects => render_projects(frame, page[2], app),
+        NavSection::Credentials => crate::credential_ui::render_page(frame, page[2], app),
         NavSection::Settings => render_settings(frame, page[2], app),
     }
     render_footer(frame, page[3], app);
@@ -141,6 +142,7 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
         render_file_dialog(frame, dialog);
     }
     render_workspace_dialog(frame, app);
+    crate::credential_ui::render(frame, app);
 }
 
 fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
@@ -488,6 +490,8 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                 "Password",
                 if link.password_ref.is_some() {
                     "******** (keychain)"
+                } else if link.password.is_some() {
+                    "******** (config file)"
                 } else {
                     "(none)"
                 },
@@ -687,7 +691,7 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                     frame.render_widget(block, rows[row_index]);
                     inner
                 };
-            let choice = (form.link_form && index == 4)
+            let choice = (form.link_form && (index == 4 || index == 5))
                 || (!form.group_form
                     && !form.link_form
                     && (if form.project_id.is_some() {
@@ -703,7 +707,7 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                 } else if form.editing_id.is_some()
                     && app
                         .selected_project_link()
-                        .is_some_and(|link| link.password_ref.is_some())
+                        .is_some_and(|link| link.password_ref.is_some() || link.password.is_some())
                 {
                     "(saved; blank keeps it)"
                 } else {
@@ -2001,9 +2005,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_sections();
     let titles = visible.iter().enumerate().map(|(index, section)| {
-        let title = if area.width < 55 {
+        let title = if area.width < 70 {
             format!("{} {}", index + 1, &section.title()[..1])
-        } else if area.width < 75 {
+        } else if area.width < 100 {
             section.title().to_string()
         } else {
             format!("{} {}", index + 1, section.title())
@@ -2018,7 +2022,7 @@ fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
         Tabs::new(titles)
             .select(selected)
             .padding("", "")
-            .divider(if area.width < 35 { " " } else { " | " })
+            .divider(if area.width < 70 { " " } else { " | " })
             .style(Style::default().fg(MUTED))
             .highlight_style(
                 Style::default()
@@ -2063,6 +2067,15 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             "Show Projects tab",
             (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Projects")).to_string(),
         ),
+        (
+            "Show Credentials tab",
+            (!app
+                .metadata
+                .hidden_tabs
+                .iter()
+                .any(|tab| tab == "Credentials"))
+            .to_string(),
+        ),
         ("Export configuration", "Press Enter".into()),
         ("Export credentials", "Encrypted .age file".into()),
     ];
@@ -2082,7 +2095,12 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]))
     });
-    frame.render_widget(List::new(items).block(panel(" SETTINGS ")), area);
+    let mut state = ListState::default().with_selected(Some(app.selected_setting));
+    frame.render_stateful_widget(
+        List::new(items).block(panel(" SETTINGS ")),
+        area,
+        &mut state,
+    );
 }
 
 fn render_hosts(frame: &mut Frame, area: Rect, app: &App) {
@@ -2329,7 +2347,14 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
             detail_line("Alias", &host.alias),
             detail_line("Target", host.destination()),
             detail_line("User / port", "Resolved by OpenSSH"),
-            detail_line("Auth", "ssh-agent, key, or password prompt"),
+            detail_line(
+                "Auth",
+                if app.host_password_reference(&host.alias).is_some() {
+                    "Saved password / Keychain"
+                } else {
+                    "ssh-agent, key, or password prompt"
+                },
+            ),
             detail_line("Tags", &app.tags(host).join(", ")),
         ];
         frame.render_widget(
@@ -2341,7 +2366,13 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
 
         let routing = vec![
             detail_line("Routing", "ProxyJump / ProxyCommand"),
-            detail_line("Identity", "IdentityFile / ssh-agent"),
+            detail_line(
+                "Identity",
+                host.identity_file
+                    .as_deref()
+                    .unwrap_or("IdentityFile / ssh-agent"),
+            ),
+            detail_line("Credentials", "k select / manage    U upload public key"),
             detail_line("Source", "~/.ssh/config"),
         ];
         frame.render_widget(
@@ -2851,9 +2882,9 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let navigation = if area.width < 75 {
-        "1-6 tabs  Tab next  Shift+Tab prev  ` last"
+        "1-7 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
-        "1-6 / F1-F6 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
+        "1-7 / F1-F7 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
     };
     let hint = if app
         .workspace
@@ -2921,11 +2952,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else if area.width < 75 {
             "↑↓ select  Enter SSH  g tags  Left/Esc back"
         } else if app.showing_groups() {
-            "Arrows select  Enter open/SSH  g tags  / find  a add  r reload  q quit"
+            "Arrows select  Enter open/SSH  k credentials  U upload key  g tags  / find  a add  r reload  q quit"
         } else if area.width < 95 {
             "↑↓ move  Enter SSH  v view  g tags  / find  Esc back  q quit"
         } else {
-            "↑↓ select  Enter SSH  v view  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
+            "↑↓ select  Enter SSH  k credentials  U upload key  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
         }
     } else if app.section == NavSection::Files {
         if app.host_picker_open {
@@ -2975,6 +3006,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
     } else if app.section == NavSection::Settings {
         "↑↓ select  Enter / Space change  Tab switch tab  q quit"
+    } else if app.section == NavSection::Credentials {
+        "↑↓ select  a password  g generate key  i import  Enter assign  u upload key  q quit"
     } else {
         "q quit"
     };
@@ -2997,7 +3030,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 {
                     ""
                 } else if app.searching {
-                    "F1-F6 / Ctrl+Left/Right tabs  [,] settings"
+                    "F1-F7 / Ctrl+Left/Right tabs  [,] settings"
                 } else {
                     navigation
                 },
@@ -3344,51 +3377,83 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
 }
 
 fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::CredentialExportDialog) {
-    let area = centered_rect(68, 12, frame.area());
+    let area = centered_rect(76, 18, frame.area());
     let mask = |value: &str| "*".repeat(value.chars().count());
-    let rows = [
-        ("Export password", mask(&dialog.fields[0])),
-        ("Confirm password", mask(&dialog.fields[1])),
-    ];
-    let items = rows.iter().enumerate().map(|(index, (label, value))| {
-        let selected = index == dialog.selected_field;
-        let style = if selected {
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TEXT)
-        };
-        ListItem::new(Line::from(vec![
-            Span::styled(if selected { "▸ " } else { "  " }, style),
-            Span::styled(format!("{label:<18}"), style),
-            Span::styled(
-                value,
-                Style::default().fg(if selected { GREEN } else { TEXT }),
-            ),
-        ]))
-    });
     frame.render_widget(Clear, area);
     frame.render_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .title(" EXPORT ENCRYPTED CREDENTIALS ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(GREEN))
-                    .style(Style::default().bg(PANEL)),
-            )
-            .highlight_style(Style::default().fg(GREEN)),
+        Block::default()
+            .title(" EXPORT ENCRYPTED CREDENTIALS ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(GREEN))
+            .style(Style::default().bg(PANEL)),
         area,
     );
-    let hint = Rect {
-        x: area.x + 2,
-        y: area.bottom().saturating_sub(2),
-        width: area.width.saturating_sub(4),
-        height: 1,
-    };
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(GREEN))
+        .inner(area);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
     frame.render_widget(
-        Paragraph::new("Tab/↑↓ switch  Enter continue/export  Esc cancel")
+        Paragraph::new("Set a password to protect the exported .age file.")
+            .style(Style::default().fg(TEXT)),
+        rows[0],
+    );
+    for (index, label) in ["Export password", "Confirm password"].iter().enumerate() {
+        let label_area = Rect {
+            x: rows[index + 2].x,
+            y: rows[index + 2].y,
+            width: rows[index + 2].width,
+            height: 1,
+        };
+        let input_area = Rect {
+            x: rows[index + 2].x,
+            y: rows[index + 2].y + 1,
+            width: rows[index + 2].width,
+            height: 3,
+        };
+        let focused = dialog.selected_field == index;
+        frame.render_widget(
+            Paragraph::new(*label).style(
+                Style::default()
+                    .fg(if focused { GREEN } else { TEXT })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            label_area,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}{}",
+                mask(&dialog.fields[index]),
+                if focused { "_" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if focused { GREEN } else { BORDER })),
+            )
+            .style(Style::default().fg(if focused { GREEN } else { TEXT })),
+            input_area,
+        );
+    }
+    if let Some(message) = dialog.error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(Color::Rgb(221, 132, 112))),
+            rows[5],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("Tab/↑↓ switch field   Enter export   Esc cancel")
             .style(Style::default().fg(MUTED)),
-        hint,
+        rows[6],
     );
 }
 
@@ -3426,6 +3491,24 @@ mod tests {
     fn remote_times_use_readable_utc_values() {
         assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00 UTC");
         assert_eq!(format_unix_timestamp(1_704_067_200), "2024-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn credential_export_fields_render_masked_input_and_cursor() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.credential_export_dialog = Some(crate::app::CredentialExportDialog {
+            fields: ["secret".into(), "confirmed".into()],
+            selected_field: 0,
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("******_"), "{text}");
+        assert!(text.contains("*********"), "{text}");
     }
 
     #[test]
@@ -3771,18 +3854,18 @@ mod tests {
                 let row = &buffer.content[usize::from(width)..usize::from(width) * 2];
                 let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
                 for (number, tab) in NavSection::ALL.iter().enumerate() {
-                    let label = if width < 55 {
+                    let label = if width < 70 {
                         format!("{} {}", number + 1, &tab.title()[..1])
-                    } else if width < 75 {
+                    } else if width < 100 {
                         tab.title().to_string()
                     } else {
                         format!("{} {}", number + 1, tab.title())
                     };
                     assert!(text.contains(&label));
                 }
-                let selected_label = if width < 55 {
+                let selected_label = if width < 70 {
                     format!("{} {}", index + 1, &section.title()[..1])
-                } else if width < 75 {
+                } else if width < 100 {
                     section.title().to_string()
                 } else {
                     format!("{} {}", index + 1, section.title())

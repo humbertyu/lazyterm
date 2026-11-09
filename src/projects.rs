@@ -37,6 +37,34 @@ pub struct ProjectLink {
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_ref: Option<String>,
+    #[serde(default)]
+    pub password_storage: PasswordStorage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PasswordStorage {
+    #[default]
+    Keychain,
+    Config,
+}
+
+impl PasswordStorage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Keychain => "Keychain",
+            Self::Config => "Config file (plaintext)",
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "Keychain" => Some(Self::Keychain),
+            "Config file (plaintext)" => Some(Self::Config),
+            _ => None,
+        }
+    }
 }
 
 pub fn validate_link_url(value: &str) -> Result<(), String> {

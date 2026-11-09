@@ -182,10 +182,11 @@ Project limits: app-scoped commands may run through the Hosts catalog, but persi
 
 Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, and ready for user acceptance.
 
-- [ ] Add a cross-platform Host credential store for usernames and passwords.
+- [x] Add a cross-platform Host credential store for usernames and passwords, with a dedicated Credentials tab and reusable Host associations.
+- [x] Manage OpenSSH key references and fingerprints, generate Ed25519 key pairs without overwriting existing files, and upload public keys through the existing Groups/Hosts catalog.
 - [ ] Reuse Host credentials from SSH, SFTP, Tunnel, and Project connections without writing passwords to OpenSSH config, LazyTerm metadata, arguments, environment, or logs.
 - [ ] Add credential prompts for password authentication and first-use credential setup, with explicit errors for unavailable or rejected platform stores.
-- [x] Configuration export and documented data locations. Credential export uses a user-selected, password-protected age file; Host credential import/export remains pending with the Host credential model.
+- [x] Configuration export and documented data locations. Credential export includes saved manager/Host passwords and Project Web Link passwords in a user-selected, password-protected age file; credential import and private-key export remain pending.
 - [ ] Schema migrations and backup behavior.
 - [ ] Better diagnostics with secret redaction.
 - [ ] Recovery behavior for killed TUI and tunnel processes.
@@ -194,7 +195,7 @@ Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, 
 - [ ] User testing of SSH, SFTP, credentials, tunnels, snippets, Runtime, and Projects.
 - [x] Add the first Settings surface for theme, language, tab visibility, and metadata-only export.
 
-0.6 implementation order: Host credentials first, then configuration import and schema migration. The current credential export covers Project Web Link passwords in a user-selected, password-protected age file; ordinary configuration archives never include password material.
+0.6 implementation order: Host credentials first, then configuration import and schema migration. The credential manager supports password CRUD, Host association/unlinking, key generation/import, direct association display, and confirmed public-key installation. Native SSH/SFTP and public-key upload use scoped askpass for saved target passwords; embedded SFTP, Tunnel, remote Project, jump-host passwords and private-key passphrase storage remain open. An opt-in disposable SSH fixture verifies generation, idempotent installation, and authentication with the newly installed key. Ordinary configuration archives omit saved password fields and private key files.
 
 ## v0.7.0 - Stable Core
 

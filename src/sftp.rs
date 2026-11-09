@@ -1045,6 +1045,44 @@ mod tests {
         };
 
         let fixture = create_fixture(&sshd, &ssh_keygen, &ssh_keyscan, &sftp_server);
+        let new_key = crate::credentials::generate_key(
+            &fixture.root.join("generated-key"),
+            1,
+            "fixture".into(),
+        )
+        .expect("generate upload key");
+        for _ in 0..2 {
+            crate::credentials::upload_fixture(
+                &new_key.public_key,
+                &fixture.root.join("ssh_config"),
+                &fixture.root.join("remote-home"),
+            )
+            .expect("install public key through real SSH");
+        }
+        let installed =
+            fs::read_to_string(fixture.root.join("remote-home/.ssh/authorized_keys")).unwrap();
+        assert_eq!(
+            installed
+                .matches(new_key.public_key.split_whitespace().nth(1).unwrap())
+                .count(),
+            1
+        );
+        let new_config = fs::read_to_string(fixture.root.join("ssh_config"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("IdentityFile "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(fixture.root.join("new_key_config"), new_config).unwrap();
+        run(
+            Command::new("ssh")
+                .arg("-F")
+                .arg(fixture.root.join("new_key_config"))
+                .arg("-i")
+                .arg(new_key.private_key_path.as_ref().unwrap())
+                .args(["lazyterm-fixture", "true"]),
+            "authenticate using uploaded key",
+        );
         let _ = TEST_CONNECTION_CONFIG.set((
             fixture.root.join("ssh_config"),
             fixture.root.join("known_hosts"),
@@ -1173,6 +1211,7 @@ mod tests {
             },
             Ok(crate::metadata::Metadata::default()),
         );
+        app.metadata_save_path = Some(fixture.root.join("app-hosts.json"));
         app.set_host_context(Some("lazyterm-fixture".into()));
         app.handle_event(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('f'),
@@ -1258,9 +1297,10 @@ mod tests {
                 .arg(&host_key),
             "generate host key",
         );
+        fs::create_dir_all(root.join("remote-home/.ssh")).unwrap();
         fs::copy(
             client_key.with_extension("pub"),
-            root.join("authorized_keys"),
+            root.join("remote-home/.ssh/authorized_keys"),
         )
         .expect("install authorized key");
 
@@ -1281,7 +1321,7 @@ mod tests {
              LogLevel ERROR\n",
             host_key.display(),
             root.join("sshd.pid").display(),
-            root.join("authorized_keys").display(),
+            root.join("remote-home/.ssh/authorized_keys").display(),
             sftp_server.display(),
         );
         fs::write(root.join("sshd_config"), config).expect("write sshd config");

@@ -151,6 +151,93 @@ impl HostCatalog {
         *self = Self::load();
         Ok(())
     }
+
+    pub fn set_identity(&mut self, alias: &str, path: &Path) -> io::Result<()> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| io::Error::other("Key path is not valid UTF-8"))?;
+        if path_text.chars().any(char::is_control) {
+            return Err(io::Error::other("Invalid key path"));
+        }
+        let mut changes = Vec::new();
+        for (file, contents) in Self::config_snapshot()? {
+            if let Some(updated) = replace_identity(&contents, alias, path_text)? {
+                changes.push((file, updated));
+            }
+        }
+        if changes.len() > 1 {
+            return Err(io::Error::other(
+                "Multiple Host blocks define this alias; edit its IdentityFile in SSH config explicitly.",
+            ));
+        }
+        if let Some((file, updated)) = changes.pop() {
+            safe_write(Path::new(&file), updated.as_bytes())?;
+            *self = Self::load();
+            return Ok(());
+        }
+        Err(io::Error::other("Host was not found in SSH config"))
+    }
+}
+
+fn replace_identity(contents: &str, alias: &str, path: &str) -> io::Result<Option<String>> {
+    let lines = contents.split_inclusive('\n').collect::<Vec<_>>();
+    let mut start = None;
+    let mut end = lines.len();
+    for (index, line) in lines.iter().enumerate() {
+        let line = strip_comment(line).trim();
+        let boundary = line
+            .find(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or(line.len());
+        let keyword = &line[..boundary];
+        let values = line[boundary..]
+            .trim_start()
+            .strip_prefix('=')
+            .unwrap_or(line[boundary..].trim_start())
+            .trim_start();
+        let tokens = shell_words::split(values).map_err(io::Error::other)?;
+        if keyword.eq_ignore_ascii_case("Host") || keyword.eq_ignore_ascii_case("Match") {
+            if start.is_some() && end == lines.len() {
+                end = index;
+            }
+            if keyword.eq_ignore_ascii_case("Host") && tokens.iter().any(|value| value == alias) {
+                if start.is_some() {
+                    return Err(io::Error::other(
+                        "Multiple Host blocks define this alias; edit its IdentityFile in SSH config explicitly.",
+                    ));
+                }
+                if tokens.len() != 1 {
+                    return Err(io::Error::other(
+                        "This Host block shares multiple aliases; split it into individual blocks before assigning a key.",
+                    ));
+                }
+                start = Some(index);
+            }
+        }
+    }
+    let Some(start) = start else {
+        return Ok(None);
+    };
+    let escaped = path
+        .replace('%', "%%")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let mut result = lines[..=start].concat();
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&format!("    IdentityFile \"{escaped}\"\n"));
+    for line in &lines[start + 1..end] {
+        let keyword = line
+            .trim_start()
+            .split([' ', '\t', '='])
+            .next()
+            .unwrap_or("");
+        if !keyword.eq_ignore_ascii_case("IdentityFile") {
+            result.push_str(line);
+        }
+    }
+    result.push_str(&lines[end..].concat());
+    Ok(Some(result))
 }
 
 fn snapshot_file(
@@ -510,6 +597,31 @@ fn is_concrete_alias(alias: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assigning_identity_preserves_routing_comments_and_neighboring_blocks() {
+        let contents = "# keep\nHost=web # comment\n  HostName example.com\n  IdentityFile old\n  ProxyJump bastion\n  # custom\n  ServerAliveInterval 30\nHost next\n  IdentityFile next-key\n";
+        let updated = replace_identity(contents, "web", "/keys/a b%key")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("Host=web # comment\n    IdentityFile \"/keys/a b%%key\"\n"));
+        assert!(!updated.contains("IdentityFile old"));
+        assert!(updated.contains("  ProxyJump bastion\n  # custom\n  ServerAliveInterval 30\nHost next\n  IdentityFile next-key\n"));
+        assert!(replace_identity("Host one two\n  User deploy\n", "one", "/key").is_err());
+        assert!(
+            replace_identity(
+                "Host one\n  User deploy\nHost one\n  User root\n",
+                "one",
+                "/key"
+            )
+            .is_err()
+        );
+        assert!(
+            replace_identity(contents, "missing", "/key")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn managed_block_changes_preserve_the_next_marker_and_case_insensitive_boundary() {

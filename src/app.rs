@@ -171,17 +171,19 @@ pub enum NavSection {
     Snippets,
     Runtime,
     Projects,
+    Credentials,
     Settings,
 }
 
 impl NavSection {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Hosts,
         Self::Files,
         Self::Tunnels,
         Self::Snippets,
         Self::Runtime,
         Self::Projects,
+        Self::Credentials,
     ];
 
     pub fn title(self) -> &'static str {
@@ -192,12 +194,14 @@ impl NavSection {
             Self::Snippets => "Snippets",
             Self::Runtime => "Runtime",
             Self::Projects => "Projects",
+            Self::Credentials => "Credentials",
             Self::Settings => "Settings",
         }
     }
 }
 
 pub struct App {
+    pub credential_manager: crate::credential_app::CredentialState,
     pub workspace: crate::project_app::WorkspaceState,
     pub project_service: crate::projects::ProjectService,
     pub section: NavSection,
@@ -343,6 +347,7 @@ pub struct PackageDialog {
 pub struct CredentialExportDialog {
     pub fields: [String; 2],
     pub selected_field: usize,
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -355,6 +360,12 @@ struct CredentialExport {
 struct CredentialRecord {
     reference: String,
     password: String,
+}
+
+impl Drop for CredentialRecord {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -488,6 +499,7 @@ impl App {
         let (tunnel_sender, tunnel_receiver) = std::sync::mpsc::channel();
         let (runtime_sender, runtime_receiver) = std::sync::mpsc::channel();
         Self {
+            credential_manager: Default::default(),
             workspace: crate::project_app::WorkspaceState::default(),
             project_service: crate::projects::ProjectService::new(
                 Metadata::data_dir()
@@ -2344,6 +2356,9 @@ impl App {
         viewport_width: u16,
         viewport_height: u16,
     ) -> InputAction {
+        if self.credentials_modal() {
+            return InputAction::None;
+        }
         if self.workspace.form.is_some()
             || self.workspace.delete.is_some()
             || self.workspace.confirmation.is_some()
@@ -2871,6 +2886,15 @@ impl App {
     }
 
     pub fn handle_event(&mut self, key: KeyEvent) -> InputAction {
+        if self.credentials_modal() {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                self.handle_credentials_key(key.code);
+            }
+            return InputAction::None;
+        }
         let modal = self.host_dialog.is_some()
             || self.tunnel_dialog.is_some()
             || self.snippet_dialog.is_some()
@@ -2974,6 +2998,8 @@ impl App {
             self.handle_settings_key(key.code);
         } else if self.section == NavSection::Projects {
             self.handle_projects_key(key.code);
+        } else if self.section == NavSection::Credentials {
+            self.handle_credentials_key(key.code);
         } else {
             self.handle_key(key.code);
         }
@@ -3000,6 +3026,12 @@ impl App {
             }
             if section == NavSection::Projects {
                 self.refresh_projects();
+            }
+            if section == NavSection::Credentials {
+                self.credential_manager.open = false;
+                self.credential_manager.target = None;
+                self.credential_manager.upload_only = false;
+                self.refresh_discovered_keys();
             }
         }
     }
@@ -3040,13 +3072,19 @@ impl App {
                 return;
             }
         };
+        let mut metadata = self.metadata.clone();
+        for project in &mut metadata.projects {
+            for link in &mut project.links {
+                link.password = None;
+            }
+        }
         let bundle = ExportBundle {
             format_version: 1,
             ssh_config_path,
             ssh_config,
             ssh_config_files,
             hosts: &self.hosts.hosts,
-            metadata: &self.metadata,
+            metadata: &metadata,
             passwords_included: false,
         };
         let result = serde_json::to_vec_pretty(&bundle)
@@ -3074,7 +3112,7 @@ impl App {
                 };
                 self.save_metadata();
             }
-            2..=7 => {
+            2..=8 => {
                 let section = NavSection::ALL[self.selected_setting - 2];
                 let title = section.title().to_string();
                 if self
@@ -3089,11 +3127,12 @@ impl App {
                 }
                 self.save_metadata();
             }
-            8 => self.export_metadata(),
-            9 => {
+            9 => self.export_metadata(),
+            10 => {
                 self.credential_export_dialog = Some(CredentialExportDialog {
                     fields: [String::new(), String::new()],
                     selected_field: 0,
+                    error: None,
                 })
             }
             _ => {}
@@ -3111,17 +3150,21 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Down => {
                 dialog.selected_field = (dialog.selected_field + 1) % dialog.fields.len();
+                dialog.error = None;
             }
             KeyCode::BackTab | KeyCode::Up => {
                 dialog.selected_field =
                     (dialog.selected_field + dialog.fields.len() - 1) % dialog.fields.len();
+                dialog.error = None;
             }
             KeyCode::Backspace => {
                 dialog.fields[dialog.selected_field].pop();
+                dialog.error = None;
             }
             KeyCode::Enter => {
                 if dialog.selected_field == 0 {
                     dialog.selected_field = 1;
+                    dialog.error = None;
                 } else {
                     let Some(mut dialog) = self.credential_export_dialog.take() else {
                         return;
@@ -3129,16 +3172,16 @@ impl App {
                     let password = Zeroizing::new(std::mem::take(&mut dialog.fields[0]));
                     let confirmation = Zeroizing::new(std::mem::take(&mut dialog.fields[1]));
                     if password.len() < 8 {
-                        self.notice = Some("Export password must be at least 8 characters.".into());
                         self.credential_export_dialog = Some(CredentialExportDialog {
                             fields: [password.to_string(), confirmation.to_string()],
                             selected_field: 0,
+                            error: Some("Use at least 8 characters.".into()),
                         });
                     } else if password.as_str() != confirmation.as_str() {
-                        self.notice = Some("Export passwords do not match.".into());
                         self.credential_export_dialog = Some(CredentialExportDialog {
                             fields: [password.to_string(), confirmation.to_string()],
                             selected_field: 1,
+                            error: Some("The two passwords do not match.".into()),
                         });
                     } else {
                         self.export_credentials(password);
@@ -3148,6 +3191,7 @@ impl App {
             KeyCode::Char(value) => {
                 if !value.is_control() {
                     dialog.fields[dialog.selected_field].push(value);
+                    dialog.error = None;
                 }
             }
             _ => {}
@@ -3155,15 +3199,26 @@ impl App {
     }
 
     fn export_credentials(&mut self, password: Zeroizing<String>) {
-        let references = self
+        let links = self
             .metadata
             .projects
             .iter()
-            .flat_map(|project| project.links.iter())
-            .filter_map(|link| link.password_ref.as_deref())
-            .collect::<std::collections::BTreeSet<_>>();
-        if references.is_empty() {
-            self.notice = Some("No saved credentials to export.".into());
+            .flat_map(|project| project.links.iter().map(move |link| (project.id, link)))
+            .collect::<Vec<_>>();
+        if !links
+            .iter()
+            .any(|(_, link)| link.password_ref.is_some() || link.password.is_some())
+            && !self
+                .metadata
+                .credentials
+                .iter()
+                .any(|item| item.password_ref.is_some())
+        {
+            self.credential_export_dialog = Some(CredentialExportDialog {
+                fields: [String::new(), String::new()],
+                selected_field: 0,
+                error: Some("No saved credentials are available to export.".into()),
+            });
             return;
         }
         let Some(path) = rfd::FileDialog::new()
@@ -3175,26 +3230,55 @@ impl App {
             self.notice = Some("Credential export cancelled.".into());
             return;
         };
-        let mut credentials = Vec::with_capacity(references.len());
-        for reference in references {
-            let secret = match crate::project_credentials::read_password(reference) {
-                Ok(secret) => secret,
-                Err(error) => {
-                    self.notice = Some(format!("Could not read credential for export: {error}"));
-                    return;
-                }
-            };
-            credentials.push(CredentialRecord {
-                reference: reference.to_string(),
-                password: secret.to_string(),
-            });
+        let mut credentials = Vec::new();
+        let mut seen_references = std::collections::BTreeSet::new();
+        for item in &self.metadata.credentials {
+            if let Some(reference) = item.password_ref.as_deref()
+                && seen_references.insert(reference.to_string())
+            {
+                let secret = match crate::project_credentials::read_password(reference) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.notice =
+                            Some(format!("Could not read credential for export: {error}"));
+                        return;
+                    }
+                };
+                credentials.push(CredentialRecord {
+                    reference: reference.to_string(),
+                    password: secret.to_string(),
+                });
+            }
+        }
+        for (project_id, link) in links {
+            if let Some(reference) = link.password_ref.as_deref()
+                && seen_references.insert(reference.to_string())
+            {
+                let secret = match crate::project_credentials::read_password(reference) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.notice =
+                            Some(format!("Could not read credential for export: {error}"));
+                        return;
+                    }
+                };
+                credentials.push(CredentialRecord {
+                    reference: reference.to_string(),
+                    password: secret.to_string(),
+                });
+            } else if let Some(password) = link.password.as_deref() {
+                credentials.push(CredentialRecord {
+                    reference: format!("config:{project_id}:{}", link.id),
+                    password: password.to_string(),
+                });
+            }
         }
         let payload = CredentialExport {
             format_version: 1,
             credentials,
         };
         let plaintext = match serde_json::to_vec_pretty(&payload) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => Zeroizing::new(bytes),
             Err(error) => {
                 self.notice = Some(format!("Could not prepare credential export: {error}"));
                 return;
@@ -3235,7 +3319,7 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, key: KeyCode) {
-        let count = 10;
+        let count = 11;
         match key {
             KeyCode::Up => {
                 self.selected_setting = self.selected_setting.saturating_sub(1);
@@ -3314,6 +3398,10 @@ impl App {
         }
         if self.section == NavSection::Settings {
             self.handle_settings_key(key);
+            return;
+        }
+        if self.section == NavSection::Credentials {
+            self.handle_credentials_key(key);
             return;
         }
         if self.section == NavSection::Tunnels {
@@ -3408,6 +3496,16 @@ impl App {
             }
             KeyCode::Char('r') if self.section == NavSection::Hosts => self.refresh_hosts(),
             KeyCode::Char('a') if self.section == NavSection::Hosts => self.open_host_form(None),
+            KeyCode::Char('k') if self.section == NavSection::Hosts => {
+                if let Some(host) = self.selected_host() {
+                    self.open_credentials(Some(host.alias.clone()), false);
+                }
+            }
+            KeyCode::Char('U') if self.section == NavSection::Hosts => {
+                if let Some(host) = self.selected_host() {
+                    self.open_credentials(Some(host.alias.clone()), true);
+                }
+            }
             KeyCode::Char('e') if self.section == NavSection::Hosts => {
                 if let Some(host) = self.selected_host().filter(|host| host.managed).cloned() {
                     self.open_host_form(Some(host));
@@ -3458,6 +3556,7 @@ impl App {
             KeyCode::Char('4') | KeyCode::Char('s') => self.switch_section(NavSection::Snippets),
             KeyCode::Char('5') | KeyCode::Char('p') => self.switch_section(NavSection::Runtime),
             KeyCode::Char('6') => self.switch_section(NavSection::Projects),
+            KeyCode::Char('7') => self.switch_section(NavSection::Credentials),
             KeyCode::Char(',') => self.switch_section(NavSection::Settings),
             _ => {}
         }
@@ -4330,13 +4429,14 @@ impl App {
         let dialog = self.host_dialog.as_mut().expect("dialog exists");
         if dialog.deleting {
             match key {
-                KeyCode::Char('y') => {
+                KeyCode::Enter | KeyCode::Char('y') => {
                     let alias = dialog.fields[0].clone();
                     self.host_dialog = None;
                     match self.hosts.delete_managed(&alias) {
                         Ok(()) => {
                             self.metadata.tags.remove(&alias);
                             self.metadata.remote_paths.remove(&alias);
+                            self.metadata.host_passwords.remove(&alias);
                             self.metadata
                                 .tunnels
                                 .retain(|tunnel| tunnel.custom_host || tunnel.host_alias != alias);
@@ -4418,6 +4518,9 @@ impl App {
                             }
                             if let Some(path) = self.metadata.remote_paths.remove(original) {
                                 self.metadata.remote_paths.insert(host.alias.clone(), path);
+                            }
+                            if let Some(id) = self.metadata.host_passwords.remove(original) {
+                                self.metadata.host_passwords.insert(host.alias.clone(), id);
                             }
                             for tunnel in &mut self.metadata.tunnels {
                                 if !tunnel.custom_host && tunnel.host_alias == *original {
@@ -4660,6 +4763,7 @@ impl App {
             .min(self.visible_groups().len().saturating_sub(1));
     }
 
+    #[track_caller]
     pub(crate) fn save_metadata(&mut self) -> bool {
         if self.metadata_error {
             self.notice = Some(
@@ -4673,7 +4777,10 @@ impl App {
             let result = self
                 .metadata_save_path
                 .as_ref()
-                .map_or_else(|| self.metadata.save(), |path| self.metadata.save_to(path));
+                .ok_or_else(|| {
+                    std::io::Error::other("Tests must set an isolated metadata_save_path")
+                })
+                .and_then(|path| self.metadata.save_to(path));
             #[cfg(not(test))]
             let result = self.metadata.save();
             if let Err(error) = result {
@@ -4745,6 +4852,18 @@ mod tests {
     }
 
     #[test]
+    fn tests_without_an_explicit_metadata_path_cannot_save_user_configuration() {
+        let mut app = App::with_catalog(HostCatalog::default(), Ok(Metadata::default()));
+        assert!(!app.save_metadata());
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("isolated metadata_save_path")
+        );
+    }
+
+    #[test]
     fn credential_export_is_age_encrypted_and_round_trips() {
         let plaintext = br#"{"reference":"web-test","password":"secret-value"}"#;
         let password = Zeroizing::new("export-password".to_string());
@@ -4763,6 +4882,44 @@ mod tests {
         let mut decrypted = Vec::new();
         reader.read_to_end(&mut decrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn credential_export_keeps_feedback_inside_dialog() {
+        let mut app = app_fixture();
+        app.credential_export_dialog = Some(CredentialExportDialog {
+            fields: ["short".into(), "short".into()],
+            selected_field: 1,
+            error: None,
+        });
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.credential_export_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.error.as_deref()),
+            Some("Use at least 8 characters.")
+        );
+
+        app.credential_export_dialog = Some(CredentialExportDialog {
+            fields: ["long-enough".into(), "different".into()],
+            selected_field: 1,
+            error: None,
+        });
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.credential_export_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.error.as_deref()),
+            Some("The two passwords do not match.")
+        );
+
+        app.export_credentials(Zeroizing::new("long-enough".into()));
+        assert_eq!(
+            app.credential_export_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.error.as_deref()),
+            Some("No saved credentials are available to export.")
+        );
     }
 
     #[test]
@@ -5120,6 +5277,8 @@ mod tests {
             },
         ];
         app.section = NavSection::Projects;
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.section, NavSection::Credentials);
         app.handle_key(KeyCode::Tab);
         assert_eq!(app.section, NavSection::Hosts);
         app.handle_key(KeyCode::Down);
@@ -5502,7 +5661,7 @@ mod tests {
         let mut app = app_fixture();
         for section in NavSection::ALL {
             app.section = section;
-            for number in 1..=6 {
+            for number in 1..=7 {
                 assert_eq!(
                     press(&mut app, KeyCode::F(number), KeyModifiers::NONE),
                     InputAction::None
@@ -5518,11 +5677,11 @@ mod tests {
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(app.section, NavSection::Hosts);
             press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
-            assert_eq!(app.section, NavSection::Projects);
+            assert_eq!(app.section, NavSection::Credentials);
             press(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
             assert_eq!(app.section, NavSection::Hosts);
             press(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
-            assert_eq!(app.section, NavSection::Projects);
+            assert_eq!(app.section, NavSection::Credentials);
         }
     }
 

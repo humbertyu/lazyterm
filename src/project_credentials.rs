@@ -1,6 +1,4 @@
 use std::{
-    fs::File,
-    io::Read,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -13,6 +11,7 @@ use zeroize::Zeroizing;
 
 const SERVICE: &str = "lazyterm.project-links";
 const PREFIX: &str = "web-";
+const CREDENTIAL_PREFIX: &str = "credential-";
 const CLIPBOARD_LIFETIME: Duration = Duration::from_secs(30);
 
 trait PasswordStore: Send + Sync {
@@ -46,15 +45,23 @@ fn entry(reference: &str) -> Result<keyring::Entry, String> {
         return Err("System keychain is not supported on this platform.".into());
     }
     if !valid_reference(reference) {
-        return Err("Invalid project password reference.".into());
+        return Err("Invalid password reference.".into());
     }
-    keyring::Entry::new(SERVICE, reference).map_err(|_| "Could not access system keychain.".into())
+    let service = if reference.starts_with(CREDENTIAL_PREFIX) {
+        "lazyterm.credentials"
+    } else {
+        SERVICE
+    };
+    keyring::Entry::new(service, reference).map_err(|_| "Could not access system keychain.".into())
 }
 
 fn valid_reference(reference: &str) -> bool {
-    reference.strip_prefix(PREFIX).is_some_and(|token| {
-        token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+    reference
+        .strip_prefix(PREFIX)
+        .or_else(|| reference.strip_prefix(CREDENTIAL_PREFIX))
+        .is_some_and(|token| {
+            token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 impl PasswordStore for SystemStore {
@@ -102,13 +109,21 @@ impl Drop for PreparedPassword {
     }
 }
 
+#[cfg(test)]
 fn save_new(store: &dyn PasswordStore, password: &str) -> Result<String, String> {
+    save_with_prefix(store, password, PREFIX)
+}
+
+fn save_with_prefix(
+    store: &dyn PasswordStore,
+    password: &str,
+    prefix: &str,
+) -> Result<String, String> {
     let mut bytes = [0_u8; 32];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
+    getrandom::fill(&mut bytes)
         .map_err(|_| "Could not generate password reference.".to_string())?;
     let reference = format!(
-        "{PREFIX}{}",
+        "{prefix}{}",
         bytes
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -119,11 +134,26 @@ fn save_new(store: &dyn PasswordStore, password: &str) -> Result<String, String>
 }
 
 pub fn prepare(password: Zeroizing<String>) -> Receiver<Result<PreparedPassword, String>> {
+    prepare_with_prefix(password, PREFIX)
+}
+
+pub fn prepare_credential(
+    password: Zeroizing<String>,
+) -> Receiver<Result<PreparedPassword, String>> {
+    prepare_with_prefix(password, CREDENTIAL_PREFIX)
+}
+
+fn prepare_with_prefix(
+    password: Zeroizing<String>,
+    prefix: &'static str,
+) -> Receiver<Result<PreparedPassword, String>> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = save_new(store().as_ref(), &password).map(|reference| PreparedPassword {
-            reference,
-            committed: false,
+        let result = save_with_prefix(store().as_ref(), &password, prefix).map(|reference| {
+            PreparedPassword {
+                reference,
+                committed: false,
+            }
         });
         let _ = sender.send(result);
     });
@@ -153,12 +183,30 @@ pub fn copy_username(username: String) -> Receiver<Result<String, String>> {
     receiver
 }
 
+pub fn copy_public_key(public_key: String) -> Receiver<Result<String, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = copy(Zeroizing::new(public_key), false).map(|()| "Public key copied.".into());
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
 pub fn copy_password(reference: String) -> Receiver<Result<String, String>> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = store()
             .get(&reference)
             .and_then(|password| copy(password, true));
+        let _ = sender.send(result.map(|()| "Password copied; clipboard expires in 30s.".into()));
+    });
+    receiver
+}
+
+pub fn copy_password_value(password: String) -> Receiver<Result<String, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = copy(Zeroizing::new(password), true);
         let _ = sender.send(result.map(|()| "Password copied; clipboard expires in 30s.".into()));
     });
     receiver

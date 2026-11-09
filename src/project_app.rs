@@ -6,8 +6,8 @@ use crate::{
     app::{App, NavSection},
     project_monitor::{ExternalRun, ProjectMonitor, stop_external_async},
     projects::{
-        CommandKind, ProjectCommand, ProjectDefinition, ProjectLifecycle, ProjectLink,
-        ProjectTarget, TaskKey, execution_target, working_directory,
+        CommandKind, PasswordStorage, ProjectCommand, ProjectDefinition, ProjectLifecycle,
+        ProjectLink, ProjectTarget, TaskKey, execution_target, working_directory,
     },
 };
 
@@ -80,6 +80,7 @@ impl WorkspaceForm {
                 "URL",
                 "Username (optional)",
                 "Password (blank keeps saved)",
+                "Password storage",
                 "Remove saved password",
             ]
         } else if self.project_id.is_some() {
@@ -353,7 +354,7 @@ impl App {
                 self.workspace.saving_password = None;
                 if let Some(mut form) = self.workspace.form.take() {
                     let result = result.and_then(|mut prepared| {
-                        self.save_workspace_form(&form, Some(&prepared.reference))?;
+                        self.save_workspace_form(&form, Some(&prepared.reference), None)?;
                         prepared.commit();
                         Ok(())
                     });
@@ -392,6 +393,12 @@ impl App {
             .iter()
             .flat_map(|project| &project.links)
             .filter_map(|link| link.password_ref.as_ref())
+            .chain(
+                self.metadata
+                    .credentials
+                    .iter()
+                    .filter_map(|item| item.password_ref.as_ref()),
+            )
             .collect();
         let unused: std::collections::HashSet<_> = previous
             .iter()
@@ -819,6 +826,13 @@ impl App {
                         .credential_jobs
                         .push(crate::project_credentials::copy_password(reference));
                     self.notice = Some("Reading password from system keychain...".into());
+                } else if let Some(password) =
+                    self.selected_project_link().unwrap().password.clone()
+                {
+                    self.workspace
+                        .credential_jobs
+                        .push(crate::project_credentials::copy_password_value(password));
+                    self.notice = Some("Reading password from configuration...".into());
                 } else {
                     self.notice = Some("No password saved for this link.".into());
                 }
@@ -1045,6 +1059,7 @@ impl App {
                         String::new(),
                         String::new(),
                         String::new(),
+                        PasswordStorage::Keychain.label().into(),
                         "No".into(),
                     ]
                 },
@@ -1054,6 +1069,7 @@ impl App {
                         link.url.clone(),
                         link.username.clone(),
                         String::new(),
+                        link.password_storage.label().into(),
                         "No".into(),
                     ]
                 },
@@ -1253,6 +1269,11 @@ impl App {
         let lifecycle_field =
             !form.group_form && !form.link_form && form.project_id.is_some() && form.selected == 6;
         let choices = if form.link_form && form.selected == 4 {
+            vec![
+                PasswordStorage::Keychain.label().into(),
+                PasswordStorage::Config.label().into(),
+            ]
+        } else if form.link_form && form.selected == 5 {
             vec!["No".into(), "Yes".into()]
         } else if type_field {
             vec!["Task".to_string(), "Service".into()]
@@ -1288,7 +1309,17 @@ impl App {
             } else {
                 (current + 1) % choices.len()
             };
-            form.fields[form.selected] = choices[next].clone();
+            let next_value = choices[next].clone();
+            let config_warning = form.link_form
+                && form.selected == 4
+                && next_value == PasswordStorage::Config.label();
+            form.fields[form.selected] = next_value;
+            if config_warning {
+                self.notice = Some(
+                    "Warning: this password will be stored as plaintext in hosts.json and its backups."
+                        .into(),
+                );
+            }
             return;
         }
         match key {
@@ -1313,7 +1344,7 @@ impl App {
                         .and_then(|()| {
                             if form.fields[0].trim().is_empty() {
                                 Err("Name is required.".into())
-                            } else if form.fields.get(4).is_some_and(|value| value == "Yes") {
+                            } else if form.fields.get(5).is_some_and(|value| value == "Yes") {
                                 Err("Choose either a new password or removal.".into())
                             } else {
                                 Ok(())
@@ -1323,15 +1354,27 @@ impl App {
                         form.error = Some(error);
                     } else {
                         let password = Zeroizing::new(std::mem::take(&mut form.fields[3]));
-                        self.workspace.saving_password =
-                            Some(crate::project_credentials::prepare(password));
-                        form.error = None;
-                        self.notice = Some("Saving password to system keychain...".into());
+                        if form.fields.get(4).map(String::as_str)
+                            == Some(PasswordStorage::Config.label())
+                        {
+                            if let Err(error) =
+                                self.save_workspace_form(&form, None, Some(password))
+                            {
+                                form.error = Some(error);
+                            } else {
+                                form.error = None;
+                            }
+                        } else {
+                            self.workspace.saving_password =
+                                Some(crate::project_credentials::prepare(password));
+                            form.error = None;
+                            self.notice = Some("Saving password to system keychain...".into());
+                        }
                     }
                     self.workspace.form = Some(form);
                     return;
                 }
-                if let Err(error) = self.save_workspace_form(&form, None) {
+                if let Err(error) = self.save_workspace_form(&form, None, None) {
                     form.error = Some(error);
                     self.workspace.form = Some(form);
                 }
@@ -1344,6 +1387,7 @@ impl App {
         &mut self,
         form: &WorkspaceForm,
         password_reference: Option<&str>,
+        password_value: Option<Zeroizing<String>>,
     ) -> Result<(), String> {
         let previous = self.metadata.projects.clone();
         let name = form.fields[0].trim().to_string();
@@ -1359,6 +1403,24 @@ impl App {
                 .iter_mut()
                 .find(|project| Some(project.id) == form.project_id)
                 .ok_or("Project no longer exists.")?;
+            let storage = PasswordStorage::from_label(
+                form.fields
+                    .get(4)
+                    .map(String::as_str)
+                    .unwrap_or(PasswordStorage::Keychain.label()),
+            )
+            .ok_or("Choose a password storage method.")?;
+            let remove_password = form.fields.get(5).is_some_and(|value| value == "Yes");
+            let existing = form
+                .editing_id
+                .and_then(|id| project.links.iter().find(|link| link.id == id));
+            if password_value.is_none()
+                && password_reference.is_none()
+                && !remove_password
+                && existing.is_some_and(|link| link.password_storage != storage)
+            {
+                return Err("Enter the password when changing its storage.".into());
+            }
             let link = ProjectLink {
                 id: form.editing_id.unwrap_or_else(|| {
                     project.links.iter().map(|link| link.id).max().unwrap_or(0) + 1
@@ -1366,7 +1428,7 @@ impl App {
                 name: name.clone(),
                 url: value,
                 username: form.fields.get(2).map_or("", String::as_str).trim().into(),
-                password_ref: if form.fields.get(4).is_some_and(|value| value == "Yes") {
+                password_ref: if remove_password || storage == PasswordStorage::Config {
                     None
                 } else {
                     password_reference.map(str::to_string).or_else(|| {
@@ -1376,6 +1438,14 @@ impl App {
                             .find(|link| Some(link.id) == form.editing_id)
                             .and_then(|link| link.password_ref.clone())
                     })
+                },
+                password_storage: storage,
+                password: if remove_password || storage == PasswordStorage::Keychain {
+                    None
+                } else if let Some(password) = password_value {
+                    Some(password.to_string())
+                } else {
+                    existing.and_then(|link| link.password.clone())
                 },
             };
             if let Some(id) = form.editing_id {
@@ -2011,6 +2081,7 @@ mod tests {
             "http://localhost:3000".into(),
             "admin".into(),
             "first secret".into(),
+            PasswordStorage::Keychain.label().into(),
             "No".into(),
         ];
         form.selected = 4;
@@ -2090,9 +2161,9 @@ mod tests {
         assert!(password_exists(&replacement));
         app.handle_projects_key(KeyCode::Char('e'));
         let form = app.workspace.form.as_mut().unwrap();
-        form.selected = 4;
+        form.selected = 5;
         app.handle_workspace_dialog(KeyCode::Right);
-        assert_eq!(app.workspace.form.as_ref().unwrap().fields[4], "Yes");
+        assert_eq!(app.workspace.form.as_ref().unwrap().fields[5], "Yes");
         app.handle_workspace_dialog(KeyCode::Enter);
         finish(&mut app);
         assert!(app.selected_project_link().unwrap().password_ref.is_none());
@@ -2154,6 +2225,7 @@ mod tests {
                 url: "http://localhost:3000".into(),
                 username: "admin".into(),
                 password_ref: Some(format!("web-{}", "a".repeat(64))),
+                ..Default::default()
             });
             app.viewport_width = width;
             app.viewport_height = height;
@@ -2206,14 +2278,15 @@ mod tests {
             "http://localhost:3000".into(),
             "admin".into(),
             "secret".into(),
+            PasswordStorage::Keychain.label().into(),
             "Yes".into(),
         ];
-        form.selected = 4;
+        form.selected = 5;
         app.handle_workspace_dialog(KeyCode::Enter);
         assert!(app.workspace.form.as_ref().unwrap().error.is_some());
         assert!(app.workspace.saving_password.is_none());
         assert!(app.metadata.projects[0].links.is_empty());
-        app.workspace.form.as_mut().unwrap().fields[4] = "No".into();
+        app.workspace.form.as_mut().unwrap().fields[5] = "No".into();
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(Err("Keychain locked.".into())).unwrap();
         app.workspace.saving_password = Some(receiver);
@@ -2298,7 +2371,7 @@ mod tests {
         app.handle_projects_key(KeyCode::Enter);
         app.handle_projects_key(KeyCode::Char('L'));
         let form = app.workspace.form.as_mut().unwrap();
-        assert_eq!(form.labels().len(), 5);
+        assert_eq!(form.labels().len(), 6);
         form.fields = vec!["Preview".into(), "http://localhost:3000/".into()];
         form.selected = 1;
         app.handle_workspace_dialog(KeyCode::Enter);
@@ -2369,6 +2442,7 @@ mod tests {
             "http://localhost:3000/".into(),
             "admin".into(),
             String::new(),
+            PasswordStorage::Keychain.label().into(),
             "No".into(),
         ];
         form.selected = 3;
@@ -2379,6 +2453,31 @@ mod tests {
             app.selected_project_link().unwrap().url,
             "http://localhost:3000/"
         );
+    }
+
+    #[test]
+    fn web_link_can_store_password_in_config_with_explicit_choice() {
+        let fixture = Fixture::new("project-link-config-password");
+        let mut app = grouped_app(&fixture);
+        app.handle_projects_key(KeyCode::Enter);
+        app.handle_projects_key(KeyCode::Char('L'));
+        let form = app.workspace.form.as_mut().unwrap();
+        form.fields = vec![
+            "Preview".into(),
+            "http://localhost:3000/".into(),
+            "admin".into(),
+            "config secret".into(),
+            PasswordStorage::Config.label().into(),
+            "No".into(),
+        ];
+        form.selected = 3;
+        app.handle_workspace_dialog(KeyCode::Enter);
+        let link = app.selected_project_link().unwrap();
+        assert_eq!(link.password_storage, PasswordStorage::Config);
+        assert_eq!(link.password.as_deref(), Some("config secret"));
+        assert!(link.password_ref.is_none());
+        let json = std::fs::read_to_string(app.metadata_save_path.as_ref().unwrap()).unwrap();
+        assert!(json.contains("config secret"));
     }
 
     #[test]
