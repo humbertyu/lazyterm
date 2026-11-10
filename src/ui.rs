@@ -146,6 +146,27 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
     if let Some(dialog) = &app.host_password_dialog {
         render_host_password_dialog(frame, dialog);
     }
+    if let Some(dialog) = &app.host_action_dialog {
+        render_host_action_dialog(frame, dialog);
+    }
+}
+
+fn render_host_action_dialog(frame: &mut Frame, dialog: &crate::app::HostActionDialog) {
+    let area = centered_rect(72, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let title = format!(" {} ", dialog.title);
+    let text = Paragraph::new(vec![
+        Line::from(dialog.message.as_str()),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter / Esc close",
+            Style::default().fg(MUTED),
+        )),
+    ])
+    .style(Style::default().fg(TEXT))
+    .block(panel(&title))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(text, area);
 }
 
 fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
@@ -2925,7 +2946,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "1-7 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
     };
-    let hint = if app
+    let hint = if app.host_action_dialog.is_some() {
+        "Enter / Esc close"
+    } else if app
         .workspace
         .form
         .as_ref()
@@ -2987,15 +3010,15 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "Type to filter current pane   ↑↓ move   ← parent   → open   Enter apply   Esc clear"
     } else if app.section == NavSection::Hosts {
         if area.width < 75 && app.showing_groups() {
-            "Arrows select  Enter open/SSH  / find  q quit"
+            "d delete  e edit  Arrows select  Enter open/SSH"
         } else if area.width < 75 {
-            "↑↓ select  Enter SSH  g tags  Left/Esc back"
+            "d delete  e edit  ↑↓ select  Enter SSH  g tags"
         } else if app.showing_groups() {
-            "Arrows select  Enter open/SSH  k configure SSH key  x unlink password  g tags  / find  a add  r reload  q quit"
+            "↑↓ select  Enter open/SSH  d delete  e edit  k key  x unlink password  g tags  / find  a add  r reload"
         } else if area.width < 95 {
-            "↑↓ move  Enter SSH  v view  g tags  / find  Esc back  q quit"
+            "↑↓ move  Enter SSH  d delete  e edit  v view  g tags  / find"
         } else {
-            "↑↓ select  Enter SSH  k configure SSH key  x unlink password  g tags  Esc back  a add  e edit  d delete  / find  r reload  q quit"
+            "↑↓ select  Enter SSH  d delete  e edit  k configure SSH key  x unlink password  g tags  Esc back  a add  / find  r reload  q quit"
         }
     } else if app.section == NavSection::Files {
         if app.host_picker_open {
@@ -3055,6 +3078,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(
                 if app.tunnel_dialog.is_some()
                     || app.host_dialog.is_some()
+                    || app.host_action_dialog.is_some()
                     || app.tags_dialog.is_some()
                     || app.file_dialog.is_some()
                     || app.snippet_dialog.is_some()
@@ -3199,12 +3223,14 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
     if dialog.deleting {
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(format!(
-                    "Delete LazyTerm-managed host \"{}\"?",
-                    dialog.fields[0]
-                )),
+                Line::from(format!("Delete SSH host \"{}\"?", dialog.fields[0])),
+                Line::from(
+                    "Its Host entry will be removed from SSH config, including Include files.",
+                ),
                 Line::from(""),
-                Line::from("y confirm    n / Esc cancel"),
+                Line::from("A backup is created before the config is changed."),
+                Line::from(""),
+                Line::from("y / Enter confirm    n / Esc cancel"),
             ])
             .style(Style::default().fg(TEXT))
             .wrap(Wrap { trim: true }),
@@ -3391,26 +3417,25 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
     let footer = if dialog.pending {
         "Please wait..."
     } else {
-        "Press any key to close"
+        "↑↓ scroll  PgUp/PgDn page  Enter/Esc close"
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                dialog.message.as_str(),
-                Style::default().fg(TEXT),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(footer, Style::default().fg(MUTED))),
-        ])
-        .block(
-            Block::default()
-                .title(format!(" {} ", dialog.title))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border))
-                .style(Style::default().bg(PANEL)),
-        )
-        .wrap(Wrap { trim: true }),
+        Paragraph::new(dialog.message.as_str())
+            .style(Style::default().fg(TEXT))
+            .scroll((dialog.scroll, 0))
+            .block(
+                Block::default()
+                    .title(format!(" {} ", dialog.title))
+                    .title_bottom(Span::styled(
+                        format!(" {footer} "),
+                        Style::default().fg(MUTED),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border))
+                    .style(Style::default().bg(PANEL)),
+            )
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -3584,6 +3609,96 @@ mod tests {
         app::{App, TransferStatus, TransferTask},
         hosts::{Host, HostCatalog},
     };
+
+    #[test]
+    fn host_read_only_notice_renders_as_centered_dialog() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.host_action_dialog = Some(crate::app::HostActionDialog {
+            title: "HOST IS READ-ONLY".into(),
+            message: "This host comes from OpenSSH configuration and cannot be deleted here."
+                .into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("HOST IS READ-ONLY"));
+        assert!(text.contains("OpenSSH configuration"));
+        assert!(text.contains("Enter / Esc close"));
+    }
+
+    #[test]
+    fn long_connection_errors_preserve_lines_and_can_be_scrolled() {
+        use crossterm::event::KeyCode;
+
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.connection_dialog = Some(ConnectionDialog {
+            title: "Connection failed".into(),
+            message: [
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+                "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+                "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!",
+                "Someone could be eavesdropping on you right now.",
+                "It is also possible that a host key has just been changed.",
+                "The fingerprint for the ED25519 key sent by the remote host is",
+                "SHA256:fixture-fingerprint",
+                "Please contact your system administrator.",
+                "Update the key in known_hosts to remove this warning.",
+            ]
+            .join("\n"),
+            pending: false,
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let first_page = format!("{}", terminal.backend());
+        assert!(first_page.contains("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"));
+        assert!(!first_page.contains("fixture-fingerprint"));
+        assert!(first_page.contains("PgUp/PgDn"));
+
+        app.handle_key(KeyCode::PageDown);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(format!("{}", terminal.backend()).contains("SHA256:fixture-fingerprint"));
+    }
+
+    #[test]
+    fn hosts_footer_shows_delete_shortcut_across_layouts() {
+        use crate::hosts::Host;
+        use crate::metadata::parse_tags;
+
+        for (width, height) in [(120, 30), (80, 24), (54, 18), (42, 18)] {
+            let mut app = App::with_catalog(
+                HostCatalog {
+                    hosts: vec![Host {
+                        alias: "managed".into(),
+                        hostname: None,
+                        user: None,
+                        port: None,
+                        identity_file: None,
+                        proxy_jump: None,
+                        managed: true,
+                    }],
+                    error: None,
+                },
+                Ok(crate::metadata::Metadata::default()),
+            );
+            app.section = crate::app::NavSection::Hosts;
+            app.metadata
+                .tags
+                .insert("managed".into(), parse_tags("work"));
+            app.selected_browse_item = app.visible_groups().len();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("d delete"), "{width}x{height}: {text}");
+        }
+    }
 
     #[test]
     fn host_key_password_dialog_is_above_selector_and_masks_the_password() {

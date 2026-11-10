@@ -135,19 +135,23 @@ impl HostCatalog {
         Ok(())
     }
 
-    pub fn delete_managed(&mut self, alias: &str) -> io::Result<()> {
-        let path = Self::config_path()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-        let contents = fs::read_to_string(&path)?;
-        let Some(range) = managed_block_range(&contents, alias) else {
+    pub fn delete_host(&mut self, alias: &str) -> io::Result<()> {
+        let files = Self::config_snapshot()?;
+        let mut changes = Vec::new();
+        for (path, contents) in files {
+            if let Some(updated) = delete_host_alias(&contents, alias)? {
+                changes.push((PathBuf::from(path), updated));
+            }
+        }
+        if changes.is_empty() {
             return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Host is not managed by LazyTerm",
+                io::ErrorKind::NotFound,
+                "Host alias was not found in SSH config",
             ));
-        };
-        let mut updated = contents;
-        updated.replace_range(range, "");
-        safe_write(&path, updated.as_bytes())?;
+        }
+        for (path, contents) in changes {
+            safe_write(&path, contents.as_bytes())?;
+        }
         *self = Self::load();
         Ok(())
     }
@@ -481,6 +485,102 @@ fn managed_block_range(contents: &str, alias: &str) -> Option<std::ops::Range<us
     None
 }
 
+fn delete_host_alias(contents: &str, alias: &str) -> io::Result<Option<String>> {
+    let lines = contents.split_inclusive('\n').collect::<Vec<_>>();
+    let mut offsets = Vec::with_capacity(lines.len() + 1);
+    offsets.push(0);
+    for line in &lines {
+        let next = offsets.last().copied().unwrap_or_default() + line.len();
+        offsets.push(next);
+    }
+
+    let mut edits = Vec::<(std::ops::Range<usize>, String)>::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some((directive, aliases)) = parse_host_directive(line)? else {
+            continue;
+        };
+        if !directive.eq_ignore_ascii_case("Host") || !aliases.iter().any(|item| item == alias) {
+            continue;
+        }
+
+        if aliases.len() > 1 {
+            let remaining = aliases
+                .into_iter()
+                .filter(|item| item != alias)
+                .map(|item| shell_words::quote(&item).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let raw = line;
+            let (line_content, newline) = if let Some(value) = raw.strip_suffix("\r\n") {
+                (value, "\r\n")
+            } else if let Some(value) = raw.strip_suffix('\n') {
+                (value, "\n")
+            } else {
+                (*raw, "")
+            };
+            let comment_start = strip_comment(line_content).len();
+            let comment = &line_content[comment_start..];
+            let indent = line_content.len() - line_content.trim_start().len();
+            let replacement = format!(
+                "{}Host {}{}{}",
+                &line_content[..indent],
+                remaining,
+                comment,
+                newline
+            );
+            edits.push((offsets[index]..offsets[index + 1], replacement));
+            continue;
+        }
+
+        let mut start_index = index;
+        if index > 0 && lines[index - 1].trim() == "# managed-by: lazyterm" {
+            start_index -= 1;
+        }
+        let end_index = lines
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find_map(|(next_index, next_line)| {
+                let (directive, _) = parse_host_directive(next_line).ok().flatten()?;
+                (directive.eq_ignore_ascii_case("Host") || directive.eq_ignore_ascii_case("Match"))
+                    .then_some(next_index)
+            })
+            .unwrap_or(lines.len());
+        edits.push((offsets[start_index]..offsets[end_index], String::new()));
+    }
+
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let mut updated = contents.to_string();
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, replacement) in edits {
+        updated.replace_range(range, &replacement);
+    }
+    Ok(Some(updated))
+}
+
+fn parse_host_directive(line: &str) -> io::Result<Option<(String, Vec<String>)>> {
+    let line = strip_comment(line).trim();
+    let Some(end) = line.find(|character: char| character.is_whitespace() || character == '=')
+    else {
+        return Ok(None);
+    };
+    let directive = line[..end].to_string();
+    if !directive.eq_ignore_ascii_case("Host") && !directive.eq_ignore_ascii_case("Match") {
+        return Ok(None);
+    }
+    let values = line[end..]
+        .trim_start()
+        .strip_prefix('=')
+        .unwrap_or(line[end..].trim_start())
+        .trim_start();
+    Ok(Some((
+        directive,
+        shell_words::split(values).map_err(io::Error::other)?,
+    )))
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -635,6 +735,30 @@ mod tests {
         assert!(!deleted[second.clone()].contains("third"));
         deleted.replace_range(second, "");
         assert_eq!(deleted, "# keep\nhost\tthird\n    User ops\nmatch all\n");
+    }
+
+    #[test]
+    fn deleting_host_alias_preserves_shared_aliases_and_neighboring_stanzas() {
+        let contents = "# global\nHost shared api\n  User deploy\n\nHost remove-me\n  HostName old.example\n  IdentityFile ~/.ssh/old\n\nHost keep\n  User ops\n";
+        let updated = delete_host_alias(contents, "shared").unwrap().unwrap();
+        assert!(updated.contains("# global\nHost api\n  User deploy"));
+        assert!(!updated.contains("Host shared api"));
+        assert!(updated.contains("Host remove-me\n  HostName old.example"));
+        assert!(
+            delete_host_alias(&updated, "remove-me")
+                .unwrap()
+                .unwrap()
+                .contains("Host keep\n  User ops")
+        );
+        assert!(delete_host_alias(contents, "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_managed_host_removes_its_marker_but_keeps_adjacent_blocks() {
+        let contents =
+            "# managed-by: lazyterm\nHost managed\n  User app\n\nHost manual\n  User deploy\n";
+        let updated = delete_host_alias(contents, "managed").unwrap().unwrap();
+        assert_eq!(updated, "Host manual\n  User deploy\n");
     }
 
     #[cfg(unix)]

@@ -233,6 +233,7 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
         title: format!("Connecting to {}", host.alias),
         message: "Checking SSH authentication...".to_string(),
         pending: true,
+        scroll: 0,
     });
     terminal.draw(|frame| ui::render(frame, app))?;
     let mut preflight_command = Command::new("ssh");
@@ -268,6 +269,7 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
                 title: format!("Connection to {} failed", host.alias),
                 message: format!("Could not start OpenSSH: {error}"),
                 pending: false,
+                scroll: 0,
             });
             return Ok(());
         }
@@ -299,6 +301,7 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
                 title: format!("Connection to {} failed", host.alias),
                 message: ssh_error_detail(&detail, preflight.status),
                 pending: false,
+                scroll: 0,
             });
         }
         return Ok(());
@@ -369,7 +372,8 @@ fn ssh_error_detail(stderr: &str, status: ExitStatus) -> String {
         detail
             .strip_prefix("ssh: ")
             .unwrap_or(detail)
-            .replace('\n', " ")
+            .replace("\r\n", "\n")
+            .replace('\r', "")
     }
 }
 
@@ -379,4 +383,21 @@ fn needs_interactive_auth(stderr: &str) -> bool {
         || detail.contains("publickey")
         || detail.contains("keyboard-interactive")
         || detail.contains("password")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_error_detail_preserves_warning_line_breaks() {
+        let detail = ssh_error_detail(
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\r\nSHA256:fingerprint\r\n",
+            ExitStatus::default(),
+        );
+        assert_eq!(
+            detail,
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nSHA256:fingerprint"
+        );
+    }
 }

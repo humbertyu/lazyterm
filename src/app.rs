@@ -220,6 +220,7 @@ pub struct App {
     pub host_password_dialog: Option<HostPasswordDialog>,
     pending_host_password: Option<SubmittedHostPassword>,
     pub host_dialog: Option<HostDialog>,
+    pub host_action_dialog: Option<HostActionDialog>,
     pub tunnel_dialog: Option<TunnelDialog>,
     pub snippet_dialog: Option<SnippetDialog>,
     pub package_dialog: Option<PackageDialog>,
@@ -323,6 +324,12 @@ pub struct HostDialog {
     pub selected_field: usize,
     pub editing: bool,
     pub deleting: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostActionDialog {
+    pub title: String,
+    pub message: String,
 }
 
 pub struct TunnelDialog {
@@ -452,6 +459,7 @@ pub struct ConnectionDialog {
     pub title: String,
     pub message: String,
     pub pending: bool,
+    pub scroll: u16,
 }
 
 #[derive(Clone)]
@@ -562,6 +570,7 @@ impl App {
             host_password_dialog: None,
             pending_host_password: None,
             host_dialog: None,
+            host_action_dialog: None,
             tunnel_dialog: None,
             snippet_dialog: None,
             package_dialog: None,
@@ -3035,6 +3044,7 @@ impl App {
             return InputAction::None;
         }
         let modal = self.host_dialog.is_some()
+            || self.host_action_dialog.is_some()
             || self.tunnel_dialog.is_some()
             || self.snippet_dialog.is_some()
             || self.package_dialog.is_some()
@@ -3099,6 +3109,8 @@ impl App {
             self.handle_file_filter_key(key.code);
         } else if self.file_dialog.is_some() {
             self.handle_file_dialog_key(key.code);
+        } else if self.host_action_dialog.is_some() {
+            self.handle_host_action_dialog_key(key.code);
         } else if self.credential_export_dialog.is_some() {
             self.handle_credential_export_key(key.code);
         } else if self.snippet_confirmation.is_some() {
@@ -3494,6 +3506,21 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.host_action_dialog.is_some() {
+            self.handle_host_action_dialog_key(key);
+            return;
+        }
+        if self.connection_dialog.is_some() {
+            let dialog = self.connection_dialog.as_mut().expect("dialog exists");
+            match key {
+                KeyCode::Up => dialog.scroll = dialog.scroll.saturating_sub(1),
+                KeyCode::Down => dialog.scroll = dialog.scroll.saturating_add(1),
+                KeyCode::PageUp => dialog.scroll = dialog.scroll.saturating_sub(6),
+                KeyCode::PageDown => dialog.scroll = dialog.scroll.saturating_add(6),
+                _ => self.connection_dialog = None,
+            }
+            return;
+        }
         if self.workspace.form.is_some()
             || self.workspace.delete.is_some()
             || self.workspace.confirmation.is_some()
@@ -3587,11 +3614,6 @@ impl App {
                 _ => {}
             }
         }
-        if self.connection_dialog.is_some() {
-            self.connection_dialog = None;
-            return;
-        }
-
         match key {
             KeyCode::Esc | KeyCode::Backspace
                 if self.section == NavSection::Hosts && self.active_group.is_some() =>
@@ -3640,14 +3662,19 @@ impl App {
                 }
             }
             KeyCode::Char('e') if self.section == NavSection::Hosts => {
-                if let Some(host) = self.selected_host().filter(|host| host.managed).cloned() {
-                    self.open_host_form(Some(host));
-                } else {
-                    self.notice = Some("Only LazyTerm-managed hosts can be edited.".to_string());
+                if let Some(host) = self.selected_host() {
+                    if host.managed {
+                        self.open_host_form(Some(host.clone()));
+                    } else {
+                        self.host_action_dialog = Some(HostActionDialog {
+                            title: "HOST IS READ-ONLY".into(),
+                            message: "This host comes from OpenSSH configuration. Edit it in ~/.ssh/config; LazyTerm-managed hosts can be edited here.".into(),
+                        });
+                    }
                 }
             }
             KeyCode::Char('d') if self.section == NavSection::Hosts => {
-                if let Some(host) = self.selected_host().filter(|host| host.managed) {
+                if let Some(host) = self.selected_host() {
                     self.host_dialog = Some(HostDialog {
                         fields: [
                             host.alias.clone(),
@@ -3661,8 +3688,6 @@ impl App {
                         editing: false,
                         deleting: true,
                     });
-                } else {
-                    self.notice = Some("Only LazyTerm-managed hosts can be deleted.".to_string());
                 }
             }
             KeyCode::Char('a') if self.section == NavSection::Tunnels => {
@@ -4565,7 +4590,7 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('y') => {
                     let alias = dialog.fields[0].clone();
                     self.host_dialog = None;
-                    match self.hosts.delete_managed(&alias) {
+                    match self.hosts.delete_host(&alias) {
                         Ok(()) => {
                             self.metadata.tags.remove(&alias);
                             self.metadata.remote_paths.remove(&alias);
@@ -4682,6 +4707,12 @@ impl App {
                 dialog.fields[dialog.selected_field].push(value)
             }
             _ => {}
+        }
+    }
+
+    fn handle_host_action_dialog_key(&mut self, key: KeyCode) {
+        if matches!(key, KeyCode::Enter | KeyCode::Esc) {
+            self.host_action_dialog = None;
         }
     }
 
@@ -4986,6 +5017,35 @@ mod tests {
         app.metadata_error = true;
         app.viewport_width = 32;
         app
+    }
+
+    #[test]
+    fn external_hosts_can_be_deleted_after_confirmation_but_remain_read_only_for_editing() {
+        let mut app = grouped_fixture();
+        let fixture = crate::projects::tests::Fixture::new("host-action-dialog");
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        app.section = NavSection::Hosts;
+        app.selected_browse_item = app.visible_groups().len()
+            + app
+                .matching_hosts()
+                .iter()
+                .position(|host| host.alias == "web")
+                .unwrap();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(app.host_dialog.as_ref().unwrap().deleting);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.host_dialog.is_none());
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(
+            app.host_action_dialog
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("OpenSSH")
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.host_action_dialog.is_none());
     }
 
     #[test]
@@ -5979,6 +6039,7 @@ mod tests {
             title: "Error".into(),
             message: "Failed".into(),
             pending: false,
+            scroll: 0,
         });
         assert_eq!(
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
