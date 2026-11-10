@@ -13,6 +13,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Default)]
 pub struct CredentialState {
+    pub host_key_sources: std::collections::BTreeMap<String, Vec<String>>,
+    host_key_scan: Option<Receiver<std::collections::BTreeMap<String, Vec<String>>>>,
     pub open: bool,
     pub selected: usize,
     pub target: Option<String>,
@@ -295,6 +297,7 @@ mod tests {
         sender
             .send(Ok(CredentialJob::UploadedKey {
                 alias: "web".into(),
+                username: None,
                 fingerprint: "SHA256:test".into(),
                 message: "Public key installed on web.".into(),
                 prepared_password: None,
@@ -347,6 +350,7 @@ mod tests {
             &mut app,
             CredentialJob::UploadFailed {
                 alias: "web".into(),
+                username: None,
                 credential: key.clone(),
                 error: "Permission denied (publickey,password).".into(),
                 save_password: true,
@@ -363,10 +367,10 @@ mod tests {
                 .unwrap()
                 .contains("IdentityFile is saved")
         );
+        app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         for character in "new password".chars() {
             app.handle_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
-        app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::RetryPublicKeyUpload
@@ -395,6 +399,7 @@ mod tests {
             &mut app,
             CredentialJob::UploadFailed {
                 alias: "web".into(),
+                username: None,
                 credential: upload_test_key(),
                 error: "Connection timed out".into(),
                 save_password: false,
@@ -425,6 +430,7 @@ mod tests {
                 &mut app,
                 CredentialJob::UploadedKey {
                     alias: "web".into(),
+                    username: Some("root".into()),
                     fingerprint: "SHA256:fixture".into(),
                     message: "Public key installed.".into(),
                     prepared_password: Some(prepared),
@@ -436,6 +442,7 @@ mod tests {
                 app.host_password_reference("web"),
                 save.then_some(reference.as_str())
             );
+            assert_eq!(app.host_password_username("web"), save.then_some("root"));
             assert_eq!(app.metadata.uploaded_keys["web"], ["SHA256:fixture"]);
             let saved = std::fs::read_to_string(fixture.root.join("hosts.json")).unwrap();
             assert!(!saved.contains("new server secret"));
@@ -463,6 +470,7 @@ mod tests {
             &mut app,
             CredentialJob::UploadedKey {
                 alias: "web".into(),
+                username: Some("root".into()),
                 fingerprint: "SHA256:fixture".into(),
                 message: "Public key installed.".into(),
                 prepared_password: Some(prepared),
@@ -619,6 +627,7 @@ pub enum CredentialJob {
     Key(Credential),
     UploadedKey {
         alias: String,
+        username: Option<String>,
         fingerprint: String,
         message: String,
         prepared_password: Option<PreparedPassword>,
@@ -627,6 +636,7 @@ pub enum CredentialJob {
     },
     UploadFailed {
         alias: String,
+        username: Option<String>,
         credential: Credential,
         error: String,
         save_password: bool,
@@ -806,13 +816,23 @@ impl App {
     }
 
     pub fn host_password_reference(&self, alias: &str) -> Option<&str> {
+        self.host_password_credential(alias)?
+            .password_ref
+            .as_deref()
+    }
+
+    pub fn host_password_username(&self, alias: &str) -> Option<&str> {
+        self.host_password_credential(alias)
+            .map(|credential| credential.username.as_str())
+            .filter(|username| !username.is_empty())
+    }
+
+    fn host_password_credential(&self, alias: &str) -> Option<&Credential> {
         let id = self.metadata.host_passwords.get(alias)?;
         self.metadata
             .credentials
             .iter()
-            .find(|item| item.id == *id && item.kind == CredentialKind::Password)?
-            .password_ref
-            .as_deref()
+            .find(|item| item.id == *id && item.kind == CredentialKind::Password)
     }
 
     pub(crate) fn unlink_host_password(&mut self, alias: &str) {
@@ -831,6 +851,7 @@ impl App {
     pub(crate) fn save_host_password_prepared(
         &mut self,
         alias: &str,
+        username: &str,
         prepared: &mut PreparedPassword,
         uploaded_fingerprint: Option<&str>,
     ) -> bool {
@@ -870,7 +891,7 @@ impl App {
             id,
             name: format!("{alias} password"),
             kind: CredentialKind::Password,
-            username: String::new(),
+            username: username.to_string(),
             password_ref: Some(prepared.reference.clone()),
             private_key_path: None,
             public_key: String::new(),
@@ -992,7 +1013,41 @@ impl App {
         self.credential_manager.pending.is_some()
     }
 
+    pub(crate) fn refresh_host_key_sources(&mut self) {
+        let aliases = self
+            .hosts
+            .hosts
+            .iter()
+            .map(|host| host.alias.clone())
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        self.credential_manager.host_key_sources.clear();
+        self.credential_manager.host_key_scan = Some(receiver);
+        std::thread::spawn(move || {
+            let sources = aliases
+                .into_iter()
+                .map(|alias| {
+                    let sources = crate::hosts::ssh_key_sources(&alias);
+                    (alias, sources)
+                })
+                .collect();
+            let _ = sender.send(sources);
+        });
+    }
+
     pub fn poll_credentials(&mut self) {
+        if let Some(receiver) = &self.credential_manager.host_key_scan {
+            match receiver.try_recv() {
+                Ok(sources) => {
+                    self.credential_manager.host_key_sources = sources;
+                    self.credential_manager.host_key_scan = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.credential_manager.host_key_scan = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         self.credential_manager
             .cleanup
             .retain(|receiver| match receiver.try_recv() {
@@ -1023,6 +1078,7 @@ impl App {
         match result {
             Ok(CredentialJob::UploadedKey {
                 alias,
+                username,
                 fingerprint,
                 message,
                 mut prepared_password,
@@ -1039,7 +1095,12 @@ impl App {
                 if let Some(prepared) = &mut prepared_password
                     && save_password
                 {
-                    if self.save_host_password_prepared(&alias, prepared, Some(&fingerprint)) {
+                    if self.save_host_password_prepared(
+                        &alias,
+                        username.as_deref().unwrap_or_default(),
+                        prepared,
+                        Some(&fingerprint),
+                    ) {
                         self.credential_manager.message =
                             Some(format!("{message} Password saved in the system Keychain."));
                     } else {
@@ -1078,6 +1139,7 @@ impl App {
             }
             Ok(CredentialJob::UploadFailed {
                 alias,
+                username,
                 credential,
                 error,
                 save_password,
@@ -1097,7 +1159,10 @@ impl App {
                         self.unlink_host_password(&alias);
                     }
                     self.prompt_host_password(
-                        alias,
+                        alias.clone(),
+                        username
+                            .or_else(|| crate::hosts::ssh_config_user(&alias))
+                            .unwrap_or_default(),
                         Some(format!("{partial} Enter the Host password to retry.")),
                         save_password,
                         HostPasswordPurpose::UploadKey {
@@ -1410,6 +1475,7 @@ impl App {
         let save_password = submitted
             .as_ref()
             .map_or(had_saved_password, |value| value.save_in_keychain);
+        let username = submitted.as_ref().map(|value| value.username.clone());
         let (sender, receiver) = mpsc::channel();
         self.credential_manager.pending = Some(receiver);
         self.credential_manager.message = Some(format!("Uploading public key to {alias}..."));
@@ -1419,6 +1485,7 @@ impl App {
             let result = credentials::upload(
                 &credential.public_key,
                 &alias,
+                username.as_deref(),
                 password_ref.as_deref(),
                 None,
                 &cancelled,
@@ -1426,6 +1493,7 @@ impl App {
             let result = match result {
                 Ok(message) => Ok(CredentialJob::UploadedKey {
                     alias,
+                    username: username.clone(),
                     fingerprint,
                     message,
                     prepared_password: prepared,
@@ -1434,6 +1502,7 @@ impl App {
                 }),
                 Err(error) => Ok(CredentialJob::UploadFailed {
                     alias,
+                    username: username.clone(),
                     credential,
                     authentication_failed: upload_authentication_failed(&error),
                     error,

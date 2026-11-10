@@ -355,7 +355,7 @@ fn render_overlays(frame: &mut Frame, app: &App) {
                 .skip(chars.len().saturating_sub(width))
                 .collect::<String>();
             frame.render_widget(
-                Paragraph::new(format!("{visible}{}", if focused { "_" } else { "" }))
+                Paragraph::new(crate::ui::input_value(&visible, focused, false))
                     .block(
                         Block::default()
                             .title(*label)

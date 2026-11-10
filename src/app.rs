@@ -146,7 +146,7 @@ pub fn host_browser_width(width: u16) -> u16 {
     if width < 70 {
         width
     } else {
-        ((u32::from(width) * 2 + 2) / 5) as u16
+        (((u32::from(width) * 2 + 2) / 5) as u16).saturating_add(4)
     }
 }
 
@@ -473,6 +473,7 @@ pub enum HostPasswordPurpose {
 
 pub struct HostPasswordDialog {
     pub alias: String,
+    pub username: String,
     pub password: Zeroizing<String>,
     pub save_in_keychain: bool,
     pub selected_field: usize,
@@ -488,6 +489,7 @@ impl Drop for HostPasswordDialog {
 
 pub struct SubmittedHostPassword {
     pub alias: String,
+    pub username: String,
     pub password: Zeroizing<String>,
     pub save_in_keychain: bool,
     pub purpose: HostPasswordPurpose,
@@ -523,6 +525,7 @@ impl App {
     pub fn new() -> Self {
         let mut app = Self::with_catalog(HostCatalog::load(), Metadata::load());
         app.reconcile_metadata();
+        app.refresh_host_key_sources();
         app.refresh_local_files();
         app.project_service.restore(&app.metadata.projects);
         app
@@ -2939,6 +2942,7 @@ impl App {
     pub fn prompt_host_password(
         &mut self,
         alias: String,
+        username: String,
         error: Option<String>,
         save_in_keychain: bool,
         purpose: HostPasswordPurpose,
@@ -2946,6 +2950,7 @@ impl App {
         self.connection_dialog = None;
         self.host_password_dialog = Some(HostPasswordDialog {
             alias,
+            username,
             password: Zeroizing::new(String::new()),
             save_in_keychain,
             selected_field: 0,
@@ -2967,33 +2972,40 @@ impl App {
                 self.host_password_dialog = None;
                 self.pending_host_password = None;
             }
-            KeyCode::Tab | KeyCode::Down | KeyCode::Up | KeyCode::BackTab => {
-                dialog.selected_field = 1 - dialog.selected_field;
+            KeyCode::Tab | KeyCode::Down => {
+                dialog.selected_field = (dialog.selected_field + 1) % 3;
             }
-            KeyCode::Char(' ') if dialog.selected_field == 1 => {
+            KeyCode::BackTab | KeyCode::Up => {
+                dialog.selected_field = (dialog.selected_field + 2) % 3;
+            }
+            KeyCode::Char(' ') if dialog.selected_field == 2 => {
                 dialog.save_in_keychain = !dialog.save_in_keychain;
             }
-            KeyCode::Char('y') if dialog.selected_field == 1 => {
-                dialog.save_in_keychain = true;
-            }
-            KeyCode::Char(' ') if dialog.selected_field == 0 => {
+            KeyCode::Char(' ') if dialog.selected_field == 1 => {
                 dialog.password.push(' ');
                 dialog.error = None;
             }
-            KeyCode::Char('n') if dialog.selected_field == 1 => {
-                dialog.save_in_keychain = false;
-            }
             KeyCode::Backspace if dialog.selected_field == 0 => {
+                dialog.username.pop();
+                dialog.error = None;
+            }
+            KeyCode::Backspace if dialog.selected_field == 1 => {
                 dialog.password.pop();
                 dialog.error = None;
             }
-            KeyCode::Char(value) if dialog.selected_field == 0 && !value.is_control() => {
+            KeyCode::Char(value)
+                if dialog.selected_field == 0 && !value.is_control() && !value.is_whitespace() =>
+            {
+                dialog.username.push(value);
+                dialog.error = None;
+            }
+            KeyCode::Char(value) if dialog.selected_field == 1 && !value.is_control() => {
                 dialog.password.push(value);
                 dialog.error = None;
             }
             KeyCode::Enter if dialog.selected_field == 0 => {
-                if dialog.password.is_empty() {
-                    dialog.error = Some("Enter the Host password.".into());
+                if dialog.username.trim().is_empty() {
+                    dialog.error = Some("Enter the SSH username.".into());
                 } else {
                     dialog.selected_field = 1;
                 }
@@ -3001,7 +3013,33 @@ impl App {
             KeyCode::Enter if dialog.selected_field == 1 => {
                 if dialog.password.is_empty() {
                     dialog.error = Some("Enter the Host password.".into());
+                } else {
+                    let Some(dialog) = self.host_password_dialog.take() else {
+                        return InputAction::None;
+                    };
+                    let action = match &dialog.purpose {
+                        HostPasswordPurpose::Connect => InputAction::Connect,
+                        HostPasswordPurpose::UploadKey { .. } => InputAction::RetryPublicKeyUpload,
+                    };
+                    self.pending_host_password = Some(SubmittedHostPassword {
+                        alias: dialog.alias.clone(),
+                        username: dialog.username.clone(),
+                        password: Zeroizing::new(dialog.password.to_string()),
+                        save_in_keychain: dialog.save_in_keychain,
+                        purpose: dialog.purpose.clone(),
+                    });
+                    return action;
+                }
+            }
+            KeyCode::Enter if dialog.selected_field == 2 => {
+                if dialog.username.trim().is_empty() {
+                    dialog.error = Some("Enter the SSH username.".into());
                     dialog.selected_field = 0;
+                    return InputAction::None;
+                }
+                if dialog.password.is_empty() {
+                    dialog.error = Some("Enter the Host password.".into());
+                    dialog.selected_field = 1;
                     return InputAction::None;
                 }
                 let Some(dialog) = self.host_password_dialog.take() else {
@@ -3013,6 +3051,7 @@ impl App {
                 };
                 self.pending_host_password = Some(SubmittedHostPassword {
                     alias: dialog.alias.clone(),
+                    username: dialog.username.clone(),
                     password: Zeroizing::new(dialog.password.to_string()),
                     save_in_keychain: dialog.save_in_keychain,
                     purpose: dialog.purpose.clone(),
@@ -4071,7 +4110,13 @@ impl App {
                     (dialog.selected_field + dialog.fields.len() - 1) % dialog.fields.len()
             }
             KeyCode::Backspace => {
-                dialog.fields[dialog.selected_field].pop();
+                if dialog.selected_field < 3 {
+                    dialog.fields[dialog.selected_field].pop();
+                }
+            }
+            KeyCode::Char(' ') if dialog.selected_field == 3 => {
+                let dangerous = dialog.fields[3].parse::<bool>().unwrap_or(false);
+                dialog.fields[3] = (!dangerous).to_string();
             }
             KeyCode::Enter => {
                 if dialog.selected_field + 1 < dialog.fields.len() {
@@ -4088,10 +4133,7 @@ impl App {
                     self.snippet_dialog = Some(dialog);
                     return;
                 }
-                let dangerous = matches!(
-                    dialog.fields[3].trim().to_ascii_lowercase().as_str(),
-                    "y" | "yes" | "true" | "1"
-                );
+                let dangerous = dialog.fields[3].parse::<bool>().unwrap_or(false);
                 let id = dialog.editing_id.unwrap_or_else(|| {
                     self.metadata
                         .snippet_packages
@@ -4125,7 +4167,7 @@ impl App {
                     self.save_metadata();
                 }
             }
-            KeyCode::Char(value) if !value.is_control() => {
+            KeyCode::Char(value) if dialog.selected_field < 3 && !value.is_control() => {
                 dialog.fields[dialog.selected_field].push(value)
             }
             _ => {}
@@ -4596,6 +4638,7 @@ impl App {
                             self.metadata.remote_paths.remove(&alias);
                             self.metadata.host_passwords.remove(&alias);
                             self.metadata.uploaded_keys.remove(&alias);
+                            self.metadata.host_public_key_auth.remove(&alias);
                             self.metadata
                                 .tunnels
                                 .retain(|tunnel| tunnel.custom_host || tunnel.host_alias != alias);
@@ -4683,6 +4726,11 @@ impl App {
                             }
                             if let Some(keys) = self.metadata.uploaded_keys.remove(original) {
                                 self.metadata.uploaded_keys.insert(host.alias.clone(), keys);
+                            }
+                            if self.metadata.host_public_key_auth.remove(original) {
+                                self.metadata
+                                    .host_public_key_auth
+                                    .insert(host.alias.clone());
                             }
                             for tunnel in &mut self.metadata.tunnels {
                                 if !tunnel.custom_host && tunnel.host_alias == *original {
@@ -4868,6 +4916,7 @@ impl App {
 
     fn refresh_hosts(&mut self) {
         self.hosts = HostCatalog::load();
+        self.refresh_host_key_sources();
         if let Some(alias) = &self.host_context
             && !self.hosts.hosts.iter().any(|host| &host.alias == alias)
             && self.hosts.error.is_none()
@@ -5063,20 +5112,28 @@ mod tests {
     #[test]
     fn host_password_dialog_masks_flow_and_returns_connect_action() {
         let mut app = app_fixture();
-        app.prompt_host_password("web".into(), None, false, HostPasswordPurpose::Connect);
+        app.prompt_host_password(
+            "web".into(),
+            "tester".into(),
+            None,
+            false,
+            HostPasswordPurpose::Connect,
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
         assert_eq!(
             app.host_password_dialog.as_ref().unwrap().password.as_str(),
             "s"
         );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
         assert!(app.host_password_dialog.as_ref().unwrap().save_in_keychain);
         assert_eq!(
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
             InputAction::Connect
         );
         let submitted = app.take_pending_host_password().unwrap();
+        assert_eq!(submitted.username, "tester");
         assert_eq!(submitted.password.as_str(), "s");
         assert!(submitted.save_in_keychain);
         assert_eq!(submitted.alias, "web");
@@ -5085,7 +5142,13 @@ mod tests {
     #[test]
     fn host_password_requires_input_and_space_toggles_keychain_choice() {
         let mut app = app_fixture();
-        app.prompt_host_password("web".into(), None, false, HostPasswordPurpose::Connect);
+        app.prompt_host_password(
+            "web".into(),
+            "tester".into(),
+            None,
+            false,
+            HostPasswordPurpose::Connect,
+        );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
@@ -5102,6 +5165,40 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.host_password_dialog.is_none());
         assert!(app.take_pending_host_password().is_none());
+    }
+
+    #[test]
+    fn host_password_dialog_edits_username_and_requires_both_fields() {
+        let mut app = app_fixture();
+        app.prompt_host_password(
+            "web".into(),
+            "dada".into(),
+            None,
+            false,
+            HostPasswordPurpose::Connect,
+        );
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        for value in "root".chars() {
+            press(&mut app, KeyCode::Char(value), KeyModifiers::NONE);
+        }
+        assert_eq!(app.host_password_dialog.as_ref().unwrap().username, "root");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        );
+        assert_eq!(app.host_password_dialog.as_ref().unwrap().selected_field, 1);
+        for value in "secret".chars() {
+            press(&mut app, KeyCode::Char(value), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Connect
+        );
+        let submitted = app.take_pending_host_password().unwrap();
+        assert_eq!(submitted.username, "root");
+        assert_eq!(submitted.password.as_str(), "secret");
     }
 
     #[test]

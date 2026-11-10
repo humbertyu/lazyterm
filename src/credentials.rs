@@ -274,11 +274,19 @@ fn password_prompt_matches(prompt: &str, expected: &str) -> bool {
 pub fn upload(
     key: &str,
     alias: &str,
+    username: Option<&str>,
     password_ref: Option<&str>,
     config: Option<&Path>,
     cancelled: &AtomicBool,
 ) -> Result<String, String> {
-    run_upload(upload_command(key)?, alias, password_ref, config, cancelled)
+    run_upload(
+        upload_command(key)?,
+        alias,
+        username,
+        password_ref,
+        config,
+        cancelled,
+    )
 }
 
 #[cfg(test)]
@@ -292,6 +300,7 @@ pub fn upload_fixture(key: &str, config: &Path, remote_home: &Path) -> Result<St
         script,
         "lazyterm-fixture",
         None,
+        None,
         Some(config),
         &AtomicBool::new(false),
     )
@@ -300,6 +309,7 @@ pub fn upload_fixture(key: &str, config: &Path, remote_home: &Path) -> Result<St
 fn run_upload(
     script: String,
     alias: &str,
+    username: Option<&str>,
     password_ref: Option<&str>,
     config: Option<&Path>,
     cancelled: &AtomicBool,
@@ -308,6 +318,16 @@ fn run_upload(
         return Err("Invalid Host alias.".into());
     }
     let mut command = Command::new("ssh");
+    if let Some(username) = username {
+        if username.is_empty()
+            || username.starts_with('-')
+            || username.chars().any(char::is_whitespace)
+            || username.chars().any(char::is_control)
+        {
+            return Err("Invalid SSH username.".into());
+        }
+        command.arg("-l").arg(username);
+    }
     if let Some(config) = config {
         command.arg("-F").arg(config);
     }

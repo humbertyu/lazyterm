@@ -165,6 +165,9 @@ fn open_files(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     };
 
     let mut command = Command::new("sftp");
+    if let Some(username) = app.host_password_username(&host.alias) {
+        command.arg("-l").arg(username);
+    }
     if let Some(reference) = app.host_password_reference(&host.alias) {
         command.args(["-o", "BatchMode=no"]);
         if let Err(error) =
@@ -206,6 +209,11 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
         return Ok(());
     };
     let submitted = app.take_pending_host_password();
+    let saved_username = app.host_password_username(&host.alias).map(str::to_string);
+    let username = submitted
+        .as_ref()
+        .map(|value| value.username.clone())
+        .or_else(|| saved_username.clone());
     let saved_reference = app.host_password_reference(&host.alias).map(str::to_string);
     let mut prepared = if let Some(value) = &submitted {
         match crate::project_credentials::prepare_credential(value.password.clone()).recv() {
@@ -237,7 +245,11 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     });
     terminal.draw(|frame| ui::render(frame, app))?;
     let mut preflight_command = Command::new("ssh");
+    if let Some(username) = &username {
+        preflight_command.arg("-l").arg(username);
+    }
     preflight_command.args([
+        "-v",
         "-o",
         "RequestTTY=no",
         "-o",
@@ -284,8 +296,14 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
             let save = submitted
                 .as_ref()
                 .map_or(saved_reference.is_some(), |value| value.save_in_keychain);
+            let username = username
+                .clone()
+                .or_else(|| crate::hosts::ssh_config_user(&host.alias))
+                .or_else(|| host.user.clone())
+                .unwrap_or_default();
             app.prompt_host_password(
                 host.alias,
+                username,
                 Some(if submitted.is_some() {
                     "Authentication failed. Check the password and try again.".into()
                 } else if saved_reference.is_some() {
@@ -306,9 +324,13 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
         }
         return Ok(());
     }
+    if authenticated_with_public_key(&detail) {
+        app.metadata.host_public_key_auth.insert(host.alias.clone());
+        app.save_metadata();
+    }
     if let (Some(value), Some(prepared)) = (&submitted, &mut prepared)
         && value.save_in_keychain
-        && !app.save_host_password_prepared(&host.alias, prepared, None)
+        && !app.save_host_password_prepared(&host.alias, &value.username, prepared, None)
     {
         app.connection_dialog = None;
         app.notice =
@@ -318,6 +340,9 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     app.connection_dialog = None;
 
     let mut command = Command::new("ssh");
+    if let Some(username) = &username {
+        command.arg("-l").arg(username);
+    }
     if let Some(reference) = password_reference.as_deref() {
         command.args(["-o", "BatchMode=no"]);
         if let Err(error) =
@@ -355,6 +380,12 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     terminal.clear()?;
     app.notice = Some(notice);
     Ok(())
+}
+
+fn authenticated_with_public_key(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.contains("Authenticated to ") && line.contains("using \"publickey\""))
 }
 
 fn exit_status(status: ExitStatus) -> String {
@@ -399,5 +430,18 @@ mod tests {
             detail,
             "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nSHA256:fingerprint"
         );
+    }
+
+    #[test]
+    fn public_key_auth_is_only_recorded_when_openssh_confirms_it() {
+        assert!(authenticated_with_public_key(
+            "debug1: Authenticated to host.example ([192.0.2.1]:22) using \"publickey\"."
+        ));
+        assert!(!authenticated_with_public_key(
+            "debug1: Authenticated to host.example ([192.0.2.1]:22) using \"password\"."
+        ));
+        assert!(!authenticated_with_public_key(
+            "debug1: Offering public key: /Users/test/.ssh/id_ed25519"
+        ));
     }
 }

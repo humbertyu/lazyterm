@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -22,6 +23,68 @@ impl Host {
     pub fn destination(&self) -> &str {
         self.hostname.as_deref().unwrap_or(&self.alias)
     }
+}
+
+/// Inspect local OpenSSH candidates without connecting to the server.
+pub fn ssh_key_sources(alias: &str) -> Vec<String> {
+    let Ok(output) = Command::new("ssh").args(["-G", "--", alias]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let config = String::from_utf8_lossy(&output.stdout);
+    let mut sources = configured_key_sources(&config, |value| {
+        crate::credentials::expand_path(value).is_file()
+    });
+    let option = |name: &str| {
+        config
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(str::trim)
+    };
+    if option("pubkeyauthentication ") != Some("no")
+        && option("identitiesonly ") != Some("yes")
+        && option("identityagent ") != Some("none")
+    {
+        let mut agent = Command::new("ssh-add");
+        agent.arg("-l");
+        if let Some(socket) = option("identityagent ")
+            && socket != "SSH_AUTH_SOCK"
+        {
+            agent.env("SSH_AUTH_SOCK", crate::credentials::expand_path(socket));
+        }
+        if agent.output().is_ok_and(|output| output.status.success()) {
+            sources.push("ssh-agent".into());
+        }
+    }
+    sources
+}
+
+fn configured_key_sources(config: &str, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    if config.lines().any(|line| line == "pubkeyauthentication no") {
+        return Vec::new();
+    }
+    config
+        .lines()
+        .filter_map(|line| line.strip_prefix("identityfile "))
+        .map(str::trim)
+        .filter(|value| *value != "none" && exists(value))
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn ssh_config_user(alias: &str) -> Option<String> {
+    let output = Command::new("ssh").args(["-G", alias]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("user "))
+        .map(str::trim)
+        .filter(|user| !user.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Default)]
@@ -697,6 +760,61 @@ fn is_concrete_alias(alias: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_key_candidates_include_existing_default_and_custom_files_only() {
+        let config = "pubkeyauthentication yes\nidentityfile ~/.ssh/custom key\nidentityfile ~/.ssh/id_ed25519\nidentityfile ~/.ssh/missing\nidentityfile none\n";
+        assert_eq!(
+            configured_key_sources(config, |path| {
+                matches!(path, "~/.ssh/custom key" | "~/.ssh/id_ed25519")
+            }),
+            ["~/.ssh/custom key", "~/.ssh/id_ed25519"]
+        );
+        assert!(
+            configured_key_sources(
+                "pubkeyauthentication no\nidentityfile ~/.ssh/id_ed25519\n",
+                |_| true
+            )
+            .is_empty()
+        );
+        assert!(configured_key_sources("identityfile none\n", |_| true).is_empty());
+    }
+
+    #[test]
+    fn ssh_key_candidates_resolve_includes_and_wildcard_configuration() {
+        let fixture = crate::projects::tests::Fixture::new("effective-host-keys");
+        let config = fixture.root.join("config");
+        let included = fixture.root.join("keys.conf");
+        let key = fixture.root.join("external-key");
+        fs::write(&key, "fixture").unwrap();
+        fs::write(
+            &included,
+            format!("Host web*\n  IdentityFile {}\n", key.display()),
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            format!(
+                "Include {}\nHost web\n  HostName example.invalid\n",
+                included.display()
+            ),
+        )
+        .unwrap();
+        let output = Command::new("ssh")
+            .arg("-G")
+            .arg("-F")
+            .arg(config)
+            .arg("web")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            configured_key_sources(&String::from_utf8_lossy(&output.stdout), |path| {
+                Path::new(path).is_file()
+            }),
+            [key.display().to_string()]
+        );
+    }
 
     #[test]
     fn assigning_identity_preserves_routing_comments_and_neighboring_blocks() {

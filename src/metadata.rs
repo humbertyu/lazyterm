@@ -100,6 +100,8 @@ pub struct Metadata {
     pub host_passwords: BTreeMap<String, u64>,
     #[serde(default)]
     pub uploaded_keys: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub host_public_key_auth: std::collections::BTreeSet<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
@@ -167,6 +169,7 @@ impl Default for Metadata {
             credentials: Vec::new(),
             host_passwords: BTreeMap::new(),
             uploaded_keys: BTreeMap::new(),
+            host_public_key_auth: std::collections::BTreeSet::new(),
             extra: BTreeMap::new(),
             snapshot: RefCell::new(None),
         }
@@ -299,7 +302,8 @@ impl Metadata {
             + self.remote_paths.len()
             + self.tunnels.len()
             + self.host_passwords.len()
-            + self.uploaded_keys.len();
+            + self.uploaded_keys.len()
+            + self.host_public_key_auth.len();
         self.host_passwords.retain(|alias, id| {
             aliases.contains(alias.as_str())
                 && self.credentials.iter().any(|credential| {
@@ -316,11 +320,14 @@ impl Metadata {
         self.uploaded_keys.retain(|alias, fingerprints| {
             aliases.contains(alias.as_str()) && !fingerprints.is_empty()
         });
+        self.host_public_key_auth
+            .retain(|alias| aliases.contains(alias.as_str()));
         self.tags.len()
             + self.remote_paths.len()
             + self.tunnels.len()
             + self.host_passwords.len()
             + self.uploaded_keys.len()
+            + self.host_public_key_auth.len()
             != previous_len
     }
 
@@ -571,6 +578,7 @@ mod tests {
         metadata
             .uploaded_keys
             .insert("web".into(), vec!["SHA256:fixture".into()]);
+        metadata.host_public_key_auth.insert("web".into());
         metadata.show_hidden_files = true;
         metadata.tunnels.push(TunnelDefinition {
             id: 7,
@@ -594,6 +602,7 @@ mod tests {
         assert_eq!(restored.local_path, Some(PathBuf::from("/tmp/lazyterm")));
         assert_eq!(restored.remote_paths["web"], "projects");
         assert_eq!(restored.uploaded_keys["web"], ["SHA256:fixture"]);
+        assert!(restored.host_public_key_auth.contains("web"));
         assert!(restored.show_hidden_files);
         assert_eq!(restored.tunnels[0].label, "web-db");
         assert_eq!(restored.tunnels[0].local_port, 5432);
@@ -674,10 +683,14 @@ mod tests {
         metadata
             .uploaded_keys
             .insert("deleted".into(), vec!["SHA256:stale".into()]);
+        metadata.host_public_key_auth.insert("web".into());
+        metadata.host_public_key_auth.insert("deleted".into());
 
         assert!(metadata.reconcile(&catalog));
         assert!(metadata.uploaded_keys.contains_key("web"));
         assert!(!metadata.uploaded_keys.contains_key("deleted"));
+        assert!(metadata.host_public_key_auth.contains("web"));
+        assert!(!metadata.host_public_key_auth.contains("deleted"));
     }
 
     #[test]
