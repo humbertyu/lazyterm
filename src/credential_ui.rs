@@ -23,6 +23,18 @@ fn panel(title: &str) -> Block<'_> {
         .style(Style::default().bg(BG).fg(TEXT))
 }
 
+fn action_panel<'a>(title: &'a str, footer: &str) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .title_bottom(Span::styled(
+            format!(" {footer} "),
+            Style::default().fg(MUTED),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG).fg(TEXT))
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     if app.credential_manager.open {
         render_page(frame, frame.area().inner(Margin::new(1, 1)), app);
@@ -377,7 +389,17 @@ fn render_overlays(frame: &mut Frame, app: &App) {
     if let Some(alias) = &state.confirm_upload {
         let area = centered(frame.area(), 70, 11);
         frame.render_widget(Clear, area);
-        frame.render_widget(Paragraph::new(format!("Host: {alias}\nRemote file: ~/.ssh/authorized_keys\n\nAppend the selected public key (duplicates are skipped)?\nOnly the public key is sent. SSH config is unchanged.\n\ny / Enter upload   n / Esc cancel")).wrap(Wrap { trim: false }).block(panel(" UPLOAD PUBLIC KEY ")), area);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Host: {alias}\nRemote file: ~/.ssh/authorized_keys\n\nAppend the selected public key (duplicates are skipped)?\nOnly the public key is sent. SSH config is unchanged."
+            ))
+            .wrap(Wrap { trim: false })
+            .block(action_panel(
+                " UPLOAD PUBLIC KEY ",
+                "y/Enter yes  n/Esc no",
+            )),
+            area,
+        );
     }
     if state.deleting {
         let area = centered(frame.area(), 72, 9);
@@ -412,15 +434,15 @@ fn render_overlays(frame: &mut Frame, app: &App) {
                 false,
             ),
         };
-        let action = if can_delete {
-            "y / Enter remove    n / Esc cancel"
+        let (title, footer) = if can_delete {
+            (title, "y/Enter yes  n/Esc no")
         } else {
-            "Enter / Esc close"
+            (title, "Enter/Esc close")
         };
         frame.render_widget(
-            Paragraph::new(format!("{message}\n\n{action}"))
+            Paragraph::new(message)
                 .wrap(Wrap { trim: false })
-                .block(panel(title)),
+                .block(action_panel(title, footer)),
             area,
         );
     }
@@ -601,7 +623,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("REMOVE CREDENTIAL"));
         assert!(text.contains("Deploy password"));
-        assert!(text.contains("Enter remove"));
+        assert!(text.contains("y/Enter yes"));
         assert!(!text.contains("Remove this credential record?"));
     }
 }

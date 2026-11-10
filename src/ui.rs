@@ -155,17 +155,10 @@ fn render_host_action_dialog(frame: &mut Frame, dialog: &crate::app::HostActionD
     let area = centered_rect(72, 9, frame.area());
     frame.render_widget(Clear, area);
     let title = format!(" {} ", dialog.title);
-    let text = Paragraph::new(vec![
-        Line::from(dialog.message.as_str()),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter / Esc close",
-            Style::default().fg(MUTED),
-        )),
-    ])
-    .style(Style::default().fg(TEXT))
-    .block(panel(&title))
-    .wrap(Wrap { trim: true });
+    let text = Paragraph::new(vec![Line::from(dialog.message.as_str())])
+        .style(Style::default().fg(TEXT))
+        .block(action_panel(&title, "Enter/Esc close", BORDER))
+        .wrap(Wrap { trim: true });
     frame.render_widget(text, area);
 }
 
@@ -646,11 +639,13 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             )));
             lines.push(Line::from(run.root.command.clone()));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from("y / Enter confirm    n / Esc cancel"));
         frame.render_widget(
             Paragraph::new(lines)
-                .block(panel(" EXTERNAL PROCESS "))
+                .block(action_panel(
+                    " EXTERNAL PROCESS ",
+                    "y/Enter yes  n/Esc no",
+                    BORDER,
+                ))
                 .style(Style::default().fg(TEXT))
                 .wrap(Wrap { trim: false }),
             area,
@@ -782,8 +777,8 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
         let area = centered_rect(72, 7, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(format!("{message}\n\ny / Enter confirm    n / Esc cancel"))
-                .block(panel(" DELETE "))
+            Paragraph::new(message)
+                .block(action_panel(" DELETE ", "y/Enter yes  n/Esc no", BORDER))
                 .style(Style::default().fg(TEXT))
                 .wrap(Wrap { trim: false }),
             area,
@@ -1281,11 +1276,15 @@ fn render_runtime_kill_confirmation(
     let pid = entry
         .pid
         .map_or_else(|| "?".to_string(), |pid| pid.to_string());
-    let block = panel(if force {
-        " FORCE KILL PROCESS "
-    } else {
-        " TERMINATE PROCESS "
-    });
+    let block = action_panel(
+        if force {
+            " FORCE KILL PROCESS "
+        } else {
+            " TERMINATE PROCESS "
+        },
+        "y/Enter yes  n/Esc no",
+        Color::Rgb(221, 132, 112),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -1327,10 +1326,6 @@ fn render_runtime_kill_confirmation(
                     },
                 )
             }),
-            Line::from(Span::styled(
-                "y / Enter confirm    n / Esc cancel",
-                Style::default().fg(MUTED),
-            )),
         ])
         .style(Style::default().fg(TEXT))
         .wrap(Wrap { trim: false }),
@@ -2489,6 +2484,18 @@ fn panel(title: &str) -> Block<'_> {
         .style(Style::default().bg(PANEL))
 }
 
+fn action_panel<'a>(title: &'a str, footer: &str, border: Color) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .title_bottom(Span::styled(
+            format!(" {footer} "),
+            Style::default().fg(MUTED),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(PANEL))
+}
+
 fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
     if app.snippet_execution_view {
         render_snippet_execution(frame, area, app);
@@ -2801,7 +2808,11 @@ fn render_package_dialog(frame: &mut Frame, dialog: &crate::app::PackageDialog) 
 fn render_snippet_confirmation(frame: &mut Frame, pending: &crate::app::PendingSnippetRun) {
     let area = centered_rect(76, 9, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(" CONFIRM DANGEROUS COMMAND ");
+    let block = action_panel(
+        " CONFIRM DANGEROUS COMMAND ",
+        "y/Enter yes  n/Esc no",
+        Color::Rgb(221, 132, 112),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -2812,10 +2823,6 @@ fn render_snippet_confirmation(frame: &mut Frame, pending: &crate::app::PendingS
                 pending.targets.len()
             )),
             Line::from(pending.command.clone()),
-            Line::from(Span::styled(
-                "y / Enter confirm    n / Esc cancel",
-                Style::default().fg(MUTED),
-            )),
         ])
         .style(Style::default().fg(TEXT))
         .wrap(Wrap { trim: true }),
@@ -2835,18 +2842,11 @@ fn render_snippet_delete_confirmation(frame: &mut Frame, target: &crate::app::Sn
             (" DELETE SNIPPET ", format!("Delete snippet \"{name}\"?"))
         }
     };
-    let block = panel(title);
+    let block = action_panel(title, "y/Enter yes  n/Esc no", Color::Rgb(221, 132, 112));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(message),
-            Line::from(Span::styled(
-                "y / Enter confirm    n / Esc cancel",
-                Style::default().fg(MUTED),
-            )),
-        ])
-        .style(Style::default().fg(TEXT)),
+        Paragraph::new(message).style(Style::default().fg(TEXT)),
         inner,
     );
 }
@@ -2941,12 +2941,34 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let confirmation_open = app.workspace.delete.is_some()
+        || app.workspace.confirmation.is_some()
+        || app.snippet_confirmation.is_some()
+        || app.snippet_delete_confirmation.is_some()
+        || app.runtime_kill_confirmation.is_some()
+        || app.runtime_force_kill_confirmation.is_some()
+        || app
+            .host_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        || app
+            .tunnel_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        || matches!(
+            app.file_dialog.as_ref(),
+            Some(FileDialog::Delete { .. } | FileDialog::TransferConflict { .. })
+        )
+        || app.credential_manager.confirm_upload.is_some()
+        || app.credential_manager.deleting;
     let navigation = if area.width < 75 {
         "1-7 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
         "1-7 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
     };
-    let hint = if app.host_action_dialog.is_some() {
+    let hint = if confirmation_open {
+        ""
+    } else if app.host_action_dialog.is_some() {
         "Enter / Esc close"
     } else if app
         .workspace
@@ -3090,6 +3112,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     || app.workspace.form.is_some()
                     || app.workspace.delete.is_some()
                     || app.workspace.confirmation.is_some()
+                    || app.credential_manager.confirm_upload.is_some()
+                    || app.credential_manager.deleting
                 {
                     ""
                 } else if app.searching {
@@ -3136,6 +3160,11 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
         FileDialog::Delete { name, is_dir, .. } => {
             let area = centered_rect(68, 7, frame.area());
             frame.render_widget(Clear, area);
+            let title = if *is_dir {
+                " DELETE DIRECTORY "
+            } else {
+                " DELETE FILE "
+            };
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(format!("Delete \"{name}\"?")),
@@ -3144,17 +3173,13 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
                     } else {
                         "This action cannot be undone."
                     }),
-                    Line::from(Span::styled(
-                        "y / Enter confirm   n / Esc cancel",
-                        Style::default().fg(MUTED),
-                    )),
                 ])
                 .style(Style::default().fg(TEXT))
-                .block(panel(if *is_dir {
-                    " DELETE DIRECTORY "
-                } else {
-                    " DELETE FILE "
-                }))
+                .block(action_panel(
+                    title,
+                    "y/Enter yes  n/Esc no",
+                    Color::Rgb(221, 132, 112),
+                ))
                 .wrap(Wrap { trim: true }),
                 area,
             );
@@ -3194,13 +3219,13 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
                 Paragraph::new(vec![
                     Line::from(format!("{direction} will overwrite:")),
                     Line::from(target),
-                    Line::from(Span::styled(
-                        "y / Enter overwrite   n / Esc cancel",
-                        Style::default().fg(MUTED),
-                    )),
                 ])
                 .style(Style::default().fg(TEXT))
-                .block(panel(" TRANSFER CONFLICT "))
+                .block(action_panel(
+                    " TRANSFER CONFLICT ",
+                    "y/Enter yes  n/Esc no",
+                    Color::Rgb(221, 132, 112),
+                ))
                 .wrap(Wrap { trim: true }),
                 area,
             );
@@ -3211,13 +3236,17 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
 fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
     let area = centered_rect(68, 15, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(if dialog.deleting {
-        " DELETE HOST "
+    let block = if dialog.deleting {
+        action_panel(
+            " DELETE HOST ",
+            "y/Enter yes  n/Esc no",
+            Color::Rgb(221, 132, 112),
+        )
     } else if dialog.editing {
-        " EDIT HOST "
+        panel(" EDIT HOST ")
     } else {
-        " NEW HOST "
-    });
+        panel(" NEW HOST ")
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if dialog.deleting {
@@ -3227,10 +3256,7 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
                 Line::from(
                     "Its Host entry will be removed from SSH config, including Include files.",
                 ),
-                Line::from(""),
                 Line::from("A backup is created before the config is changed."),
-                Line::from(""),
-                Line::from("y / Enter confirm    n / Esc cancel"),
             ])
             .style(Style::default().fg(TEXT))
             .wrap(Wrap { trim: true }),
@@ -3271,7 +3297,7 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
 fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
     let area = centered_rect(82, 22, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(if dialog.deleting {
+    let title = if dialog.deleting {
         " DELETE PORT FORWARDING "
     } else if dialog.editing_id.is_some() {
         match dialog.kind {
@@ -3285,16 +3311,20 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
             crate::metadata::TunnelKind::Remote => " NEW REMOTE FORWARDING ",
             crate::metadata::TunnelKind::Dynamic => " NEW DYNAMIC FORWARDING ",
         }
-    });
+    };
+    let block = if dialog.deleting {
+        action_panel(title, "y/Enter yes  n/Esc no", Color::Rgb(221, 132, 112))
+    } else {
+        panel(title)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if dialog.deleting {
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!("Delete forwarding \"{}\"?", dialog.fields[0])),
-                Line::from(""),
-                Line::from("y / Enter confirm    n / Esc cancel"),
-            ])
+            Paragraph::new(vec![Line::from(format!(
+                "Delete forwarding \"{}\"?",
+                dialog.fields[0]
+            ))])
             .style(Style::default().fg(TEXT))
             .wrap(Wrap { trim: true }),
             inner,
@@ -3409,6 +3439,19 @@ fn render_search(frame: &mut Frame, app: &App) {
 
 fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
     let area = centered_rect(72, 9, frame.area());
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    let content = Paragraph::new(dialog.message.as_str()).wrap(Wrap { trim: false });
+    let content_lines = content.line_count(inner_width);
+    let needs_scroll = content_lines > usize::from(inner_height);
+    let max_scroll = content_lines.saturating_sub(usize::from(inner_height));
+    let scroll = if needs_scroll {
+        usize::from(dialog.scroll)
+            .min(max_scroll)
+            .min(u16::MAX as usize) as u16
+    } else {
+        0
+    };
     let border = if dialog.pending {
         GREEN
     } else {
@@ -3416,14 +3459,20 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
     };
     let footer = if dialog.pending {
         "Please wait..."
+    } else if needs_scroll {
+        if area.width < 60 {
+            "↑↓ scroll  Enter/Esc close"
+        } else {
+            "↑↓ scroll  PgUp/PgDn page  Enter/Esc close"
+        }
     } else {
-        "↑↓ scroll  PgUp/PgDn page  Enter/Esc close"
+        "Enter/Esc close"
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(dialog.message.as_str())
+        content
             .style(Style::default().fg(TEXT))
-            .scroll((dialog.scroll, 0))
+            .scroll((scroll, 0))
             .block(
                 Block::default()
                     .title(format!(" {} ", dialog.title))
@@ -3434,8 +3483,7 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border))
                     .style(Style::default().bg(PANEL)),
-            )
-            .wrap(Wrap { trim: false }),
+            ),
         area,
     );
 }
@@ -3626,7 +3674,7 @@ mod tests {
         let text = format!("{}", terminal.backend());
         assert!(text.contains("HOST IS READ-ONLY"));
         assert!(text.contains("OpenSSH configuration"));
-        assert!(text.contains("Enter / Esc close"));
+        assert!(text.contains("Enter/Esc close"));
     }
 
     #[test]
@@ -3665,6 +3713,54 @@ mod tests {
         app.handle_key(KeyCode::PageDown);
         terminal.draw(|frame| render(frame, &app)).unwrap();
         assert!(format!("{}", terminal.backend()).contains("SHA256:fixture-fingerprint"));
+    }
+
+    #[test]
+    fn short_connection_errors_do_not_show_scroll_controls() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.connection_dialog = Some(ConnectionDialog {
+            title: "Connection failed".into(),
+            message: "Connection refused.".into(),
+            pending: false,
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("Enter/Esc close"));
+        assert!(!text.contains("scroll"));
+        assert!(!text.contains("PgUp"));
+    }
+
+    #[test]
+    fn host_delete_confirmation_places_actions_on_dialog_bottom_border() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.host_dialog = Some(crate::app::HostDialog {
+            fields: [
+                "prod".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+            original_alias: None,
+            selected_field: 0,
+            editing: false,
+            deleting: true,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        let footer_row = text.lines().nth(21).unwrap();
+        assert!(footer_row.contains("y/Enter yes"));
+        assert!(footer_row.contains("n/Esc no"));
+        assert!(!text.contains("y / Enter confirm"));
     }
 
     #[test]
