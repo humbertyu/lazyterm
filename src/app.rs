@@ -220,6 +220,7 @@ pub struct App {
     pub host_password_dialog: Option<HostPasswordDialog>,
     pending_host_password: Option<SubmittedHostPassword>,
     pub host_dialog: Option<HostDialog>,
+    pub host_group_dialog: Option<HostGroupDialog>,
     pub host_action_dialog: Option<HostActionDialog>,
     pub tunnel_dialog: Option<TunnelDialog>,
     pub snippet_dialog: Option<SnippetDialog>,
@@ -320,9 +321,19 @@ pub enum FilesState {
 
 pub struct HostDialog {
     pub fields: [String; 5],
+    pub tags: Vec<String>,
+    pub tag_picker_open: bool,
+    pub tag_filter: String,
+    pub tag_picker_selected: usize,
     pub original_alias: Option<String>,
     pub selected_field: usize,
     pub editing: bool,
+    pub deleting: bool,
+}
+
+pub struct HostGroupDialog {
+    pub name: String,
+    pub original_name: Option<String>,
     pub deleting: bool,
 }
 
@@ -537,7 +548,8 @@ impl App {
             .err()
             .map(|error| format!("Could not read host metadata: {error}"));
         let metadata_error = metadata.is_err();
-        let metadata = metadata.unwrap_or_default();
+        let mut metadata = metadata.unwrap_or_default();
+        metadata.normalize_host_groups();
         let show_hidden_files = metadata.show_hidden_files;
         let local_path = metadata.local_path.clone().unwrap_or_else(|| {
             std::env::var_os("HOME")
@@ -573,6 +585,7 @@ impl App {
             host_password_dialog: None,
             pending_host_password: None,
             host_dialog: None,
+            host_group_dialog: None,
             host_action_dialog: None,
             tunnel_dialog: None,
             snippet_dialog: None,
@@ -688,6 +701,15 @@ impl App {
 
     pub fn visible_groups(&self) -> Vec<HostGroup> {
         let mut groups = std::collections::BTreeSet::new();
+        let query = self.search_query.to_lowercase();
+        groups.extend(
+            self.metadata
+                .host_groups
+                .iter()
+                .filter(|tag| query.is_empty() || tag.to_lowercase().contains(&query))
+                .cloned()
+                .map(HostGroup::Tag),
+        );
         for host in self.matching_hosts() {
             if self.tags(host).is_empty() {
                 groups.insert(HostGroup::Untagged);
@@ -2211,6 +2233,13 @@ impl App {
         }
 
         let mut groups = std::collections::BTreeSet::new();
+        groups.extend(
+            self.metadata
+                .host_groups
+                .iter()
+                .cloned()
+                .map(HostGroup::Tag),
+        );
         for host in &self.hosts.hosts {
             if self.tags(host).is_empty() {
                 groups.insert(HostGroup::Untagged);
@@ -2413,7 +2442,9 @@ impl App {
         if self.credentials_modal() {
             return InputAction::None;
         }
-        if self.workspace.form.is_some()
+        if self.host_dialog.is_some()
+            || self.host_group_dialog.is_some()
+            || self.workspace.form.is_some()
             || self.workspace.delete.is_some()
             || self.workspace.confirmation.is_some()
         {
@@ -3083,6 +3114,7 @@ impl App {
             return InputAction::None;
         }
         let modal = self.host_dialog.is_some()
+            || self.host_group_dialog.is_some()
             || self.host_action_dialog.is_some()
             || self.tunnel_dialog.is_some()
             || self.snippet_dialog.is_some()
@@ -3545,6 +3577,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.host_group_dialog.is_some() {
+            self.handle_host_group_dialog_key(key);
+            return;
+        }
         if self.host_action_dialog.is_some() {
             self.handle_host_action_dialog_key(key);
             return;
@@ -3689,6 +3725,31 @@ impl App {
                 }
             }
             KeyCode::Char('r') if self.section == NavSection::Hosts => self.refresh_hosts(),
+            KeyCode::Char('A') if self.section == NavSection::Hosts && self.showing_groups() => {
+                self.host_group_dialog = Some(HostGroupDialog {
+                    name: String::new(),
+                    original_name: None,
+                    deleting: false,
+                });
+            }
+            KeyCode::Char('E') if self.section == NavSection::Hosts && self.showing_groups() => {
+                if let Some(HostGroup::Tag(name)) = self.selected_group() {
+                    self.host_group_dialog = Some(HostGroupDialog {
+                        name: name.clone(),
+                        original_name: Some(name),
+                        deleting: false,
+                    });
+                }
+            }
+            KeyCode::Char('D') if self.section == NavSection::Hosts && self.showing_groups() => {
+                if let Some(HostGroup::Tag(name)) = self.selected_group() {
+                    self.host_group_dialog = Some(HostGroupDialog {
+                        name: name.clone(),
+                        original_name: Some(name),
+                        deleting: true,
+                    });
+                }
+            }
             KeyCode::Char('a') if self.section == NavSection::Hosts => self.open_host_form(None),
             KeyCode::Char('k') if self.section == NavSection::Hosts => {
                 if let Some(host) = self.selected_host() {
@@ -3697,7 +3758,12 @@ impl App {
             }
             KeyCode::Char('x') if self.section == NavSection::Hosts => {
                 if let Some(alias) = self.selected_host().map(|host| host.alias.clone()) {
-                    self.unlink_host_password(&alias);
+                    self.confirm_delete_host_password(&alias);
+                }
+            }
+            KeyCode::Char('p') if self.section == NavSection::Hosts => {
+                if let Some(alias) = self.selected_host().map(|host| host.alias.clone()) {
+                    self.open_host_password_editor(&alias);
                 }
             }
             KeyCode::Char('e') if self.section == NavSection::Hosts => {
@@ -3722,6 +3788,10 @@ impl App {
                             String::new(),
                             String::new(),
                         ],
+                        tags: Vec::new(),
+                        tag_picker_open: false,
+                        tag_filter: String::new(),
+                        tag_picker_selected: 0,
                         original_alias: None,
                         selected_field: 0,
                         editing: false,
@@ -4273,6 +4343,13 @@ impl App {
     fn open_host_form(&mut self, host: Option<Host>) {
         let editing = host.is_some();
         let original_alias = host.as_ref().map(|host| host.alias.clone());
+        let tags = host.as_ref().map_or_else(
+            || match &self.active_group {
+                Some(HostGroup::Tag(tag)) => vec![tag.clone()],
+                _ => Vec::new(),
+            },
+            |host| self.tags(host).to_vec(),
+        );
         self.host_dialog = Some(HostDialog {
             fields: host.map_or_else(
                 || std::array::from_fn(|_| String::new()),
@@ -4286,6 +4363,10 @@ impl App {
                     ]
                 },
             ),
+            tags,
+            tag_picker_open: false,
+            tag_filter: String::new(),
+            tag_picker_selected: 0,
             original_alias,
             selected_field: 0,
             editing,
@@ -4626,6 +4707,77 @@ impl App {
     }
 
     fn handle_host_dialog_key(&mut self, key: KeyCode) {
+        if self
+            .host_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.tag_picker_open)
+        {
+            let available = self
+                .metadata
+                .tags
+                .values()
+                .flatten()
+                .cloned()
+                .chain(self.metadata.host_groups.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let dialog = self.host_dialog.as_mut().expect("dialog exists");
+            let filter = dialog.tag_filter.to_lowercase();
+            let matches = available
+                .iter()
+                .filter(|tag| tag.to_lowercase().contains(&filter))
+                .cloned()
+                .collect::<Vec<_>>();
+            let exact_match = available
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case(dialog.tag_filter.trim()));
+            let has_create = !dialog.tag_filter.trim().is_empty() && !exact_match;
+            let option_count = matches.len() + usize::from(has_create);
+            match key {
+                KeyCode::Esc => {
+                    dialog.tag_picker_open = false;
+                    dialog.tag_filter.clear();
+                }
+                KeyCode::Up => {
+                    dialog.tag_picker_selected = dialog.tag_picker_selected.saturating_sub(1);
+                }
+                KeyCode::Down if option_count > 0 => {
+                    dialog.tag_picker_selected =
+                        (dialog.tag_picker_selected + 1).min(option_count - 1);
+                }
+                KeyCode::Backspace => {
+                    dialog.tag_filter.pop();
+                    dialog.tag_picker_selected = 0;
+                }
+                KeyCode::Char(' ') if dialog.tag_filter.is_empty() && option_count > 0 => {
+                    if let Some(tag) = matches.get(dialog.tag_picker_selected) {
+                        toggle_host_tag(&mut dialog.tags, tag);
+                    }
+                }
+                KeyCode::Char(' ') if option_count > 0 => {
+                    if let Some(tag) = matches.get(dialog.tag_picker_selected) {
+                        toggle_host_tag(&mut dialog.tags, tag);
+                    }
+                }
+                KeyCode::Enter if has_create && dialog.tag_picker_selected == matches.len() => {
+                    let tag = dialog.tag_filter.trim().to_string();
+                    toggle_host_tag(&mut dialog.tags, &tag);
+                    dialog.tag_filter.clear();
+                    dialog.tag_picker_selected = 0;
+                }
+                KeyCode::Enter => {
+                    dialog.tag_picker_open = false;
+                    dialog.tag_filter.clear();
+                }
+                KeyCode::Char(value) if !value.is_control() => {
+                    dialog.tag_filter.push(value);
+                    dialog.tag_picker_selected = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
         let dialog = self.host_dialog.as_mut().expect("dialog exists");
         if dialog.deleting {
             match key {
@@ -4657,15 +4809,19 @@ impl App {
         }
         match key {
             KeyCode::Esc => self.host_dialog = None,
-            KeyCode::Tab | KeyCode::Down => dialog.selected_field = (dialog.selected_field + 1) % 5,
+            KeyCode::Tab | KeyCode::Down => dialog.selected_field = (dialog.selected_field + 1) % 6,
             KeyCode::BackTab | KeyCode::Up => {
-                dialog.selected_field = (dialog.selected_field + 4) % 5
+                dialog.selected_field = (dialog.selected_field + 5) % 6
             }
             KeyCode::Backspace => {
-                dialog.fields[dialog.selected_field].pop();
+                if dialog.selected_field == 2 {
+                    dialog.tags.pop();
+                } else {
+                    dialog.fields[host_field_index(dialog.selected_field)].pop();
+                }
             }
             KeyCode::Enter => {
-                if dialog.selected_field < 4 {
+                if dialog.selected_field < 5 {
                     dialog.selected_field += 1;
                     return;
                 }
@@ -4737,12 +4893,12 @@ impl App {
                                     tunnel.host_alias = host.alias.clone();
                                 }
                             }
-                        } else if !dialog.editing
-                            && let Some(HostGroup::Tag(tag)) = &self.active_group
-                        {
-                            self.metadata
-                                .tags
-                                .insert(host.alias.clone(), vec![tag.clone()]);
+                        }
+                        let tags = dialog.tags.clone();
+                        if tags.is_empty() {
+                            self.metadata.tags.remove(&host.alias);
+                        } else {
+                            self.metadata.tags.insert(host.alias.clone(), tags);
                         }
                         self.notice = Some(format!("Saved host {}.", host.alias));
                         self.save_metadata();
@@ -4752,7 +4908,15 @@ impl App {
                 }
             }
             KeyCode::Char(value) if !value.is_control() => {
-                dialog.fields[dialog.selected_field].push(value)
+                if dialog.selected_field == 2 {
+                    if value == ' ' {
+                        dialog.tag_picker_open = true;
+                        dialog.tag_filter.clear();
+                        dialog.tag_picker_selected = 0;
+                    }
+                } else if dialog.selected_field != 2 {
+                    dialog.fields[host_field_index(dialog.selected_field)].push(value);
+                }
             }
             _ => {}
         }
@@ -4761,6 +4925,107 @@ impl App {
     fn handle_host_action_dialog_key(&mut self, key: KeyCode) {
         if matches!(key, KeyCode::Enter | KeyCode::Esc) {
             self.host_action_dialog = None;
+        }
+    }
+
+    fn handle_host_group_dialog_key(&mut self, key: KeyCode) {
+        if self
+            .host_group_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        {
+            match key {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let dialog = self.host_group_dialog.take().unwrap();
+                    let Some(old_name) = dialog.original_name else {
+                        return;
+                    };
+                    let previous_groups = self.metadata.host_groups.clone();
+                    let previous_tags = self.metadata.tags.clone();
+                    self.metadata.host_groups.retain(|group| group != &old_name);
+                    for tags in self.metadata.tags.values_mut() {
+                        tags.retain(|tag| tag != &old_name);
+                    }
+                    self.metadata.tags.retain(|_, tags| !tags.is_empty());
+                    if self.save_metadata() {
+                        self.notice = Some(format!("Deleted group {old_name}; hosts were kept."));
+                        self.clamp_selection();
+                    } else {
+                        self.metadata.host_groups = previous_groups;
+                        self.metadata.tags = previous_tags;
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => self.host_group_dialog = None,
+                _ => {}
+            }
+            return;
+        }
+
+        let dialog = self.host_group_dialog.as_mut().unwrap();
+        match key {
+            KeyCode::Esc => self.host_group_dialog = None,
+            KeyCode::Backspace => {
+                dialog.name.pop();
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.host_group_dialog.take() else {
+                    return;
+                };
+                let name = dialog.name.trim().to_string();
+                if name.is_empty() || name.contains(',') {
+                    self.notice = Some("Group name is required and cannot contain commas.".into());
+                    self.host_group_dialog = Some(dialog);
+                    return;
+                }
+                if self.metadata.host_groups.iter().any(|group| {
+                    group.eq_ignore_ascii_case(&name)
+                        && dialog.original_name.as_deref() != Some(group.as_str())
+                }) {
+                    self.notice = Some(format!("Group {name} already exists."));
+                    self.host_group_dialog = Some(dialog);
+                    return;
+                }
+
+                let previous_groups = self.metadata.host_groups.clone();
+                let previous_tags = self.metadata.tags.clone();
+                if let Some(old_name) = &dialog.original_name {
+                    if old_name != &name {
+                        self.metadata.host_groups.retain(|group| group != old_name);
+                        self.metadata.host_groups.push(name.clone());
+                        for tags in self.metadata.tags.values_mut() {
+                            for tag in tags.iter_mut() {
+                                if tag == old_name {
+                                    *tag = name.clone();
+                                }
+                            }
+                            tags.sort();
+                            tags.dedup();
+                        }
+                    }
+                } else {
+                    self.metadata.host_groups.push(name.clone());
+                }
+                self.metadata.host_groups.sort();
+                self.metadata.host_groups.dedup();
+                if self.save_metadata() {
+                    self.notice = Some(if dialog.original_name.is_some() {
+                        format!("Renamed group to {name}.")
+                    } else {
+                        format!("Created group {name}.")
+                    });
+                    self.selected_browse_item = self
+                        .visible_groups()
+                        .iter()
+                        .position(|group| group == &HostGroup::Tag(name.clone()))
+                        .unwrap_or(0);
+                    self.selected_group = self.selected_browse_item;
+                } else {
+                    self.metadata.host_groups = previous_groups;
+                    self.metadata.tags = previous_tags;
+                }
+            }
+            KeyCode::Char(value) if !value.is_control() => dialog.name.push(value),
+            _ => {}
         }
     }
 
@@ -4990,6 +5255,7 @@ impl App {
             false
         } else {
             self.metadata.reconcile(&self.hosts);
+            self.metadata.normalize_host_groups();
             #[cfg(test)]
             let result = self
                 .metadata_save_path
@@ -5054,6 +5320,26 @@ impl Drop for App {
 fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn toggle_host_tag(tags: &mut Vec<String>, tag: &str) {
+    if let Some(index) = tags.iter().position(|existing| existing == tag) {
+        tags.remove(index);
+    } else if !tag.trim().is_empty() {
+        tags.push(tag.trim().to_string());
+        tags.sort();
+    }
+}
+
+fn host_field_index(display_index: usize) -> usize {
+    match display_index {
+        0 => 0,
+        1 => 1,
+        3 => 2,
+        4 => 3,
+        5 => 4,
+        _ => unreachable!("group field has no host config value"),
+    }
 }
 
 #[cfg(test)]
@@ -5968,6 +6254,95 @@ mod tests {
         assert_eq!(app.selected_host().unwrap().alias, "web");
         assert_eq!(app.selected_host, 0);
         assert!(app.tags_dialog.is_none());
+    }
+
+    #[test]
+    fn host_add_and_edit_forms_include_group_tags() {
+        let mut app = grouped_fixture();
+        app.active_group = Some(HostGroup::Tag("prod".into()));
+        app.open_host_form(None);
+        assert_eq!(app.host_dialog.as_ref().unwrap().tags, ["prod"]);
+        app.host_dialog = None;
+
+        let host = app
+            .hosts
+            .hosts
+            .iter()
+            .find(|host| host.alias == "web")
+            .unwrap()
+            .clone();
+        app.open_host_form(Some(host));
+        let form = app.host_dialog.as_ref().unwrap();
+        assert_eq!(form.tags, ["prod", "work"]);
+        assert_eq!(form.selected_field, 0);
+        for _ in 0..6 {
+            app.handle_host_dialog_key(KeyCode::Tab);
+        }
+        assert_eq!(app.host_dialog.as_ref().unwrap().selected_field, 0);
+        for _ in 0..2 {
+            app.handle_host_dialog_key(KeyCode::Tab);
+        }
+        app.handle_host_dialog_key(KeyCode::Char(' '));
+        assert!(app.host_dialog.as_ref().unwrap().tag_picker_open);
+        app.handle_host_dialog_key(KeyCode::Char('d'));
+        app.handle_host_dialog_key(KeyCode::Char('o'));
+        app.handle_host_dialog_key(KeyCode::Char('g'));
+        app.handle_host_dialog_key(KeyCode::Char('f'));
+        app.handle_host_dialog_key(KeyCode::Char('o'));
+        app.handle_host_dialog_key(KeyCode::Char('o'));
+        app.handle_host_dialog_key(KeyCode::Down);
+        app.handle_host_dialog_key(KeyCode::Enter);
+        assert!(
+            app.host_dialog
+                .as_ref()
+                .unwrap()
+                .tags
+                .contains(&"dogfoo".into())
+        );
+        assert!(app.host_dialog.as_ref().unwrap().tag_picker_open);
+        app.handle_host_dialog_key(KeyCode::Esc);
+        assert!(!app.host_dialog.as_ref().unwrap().tag_picker_open);
+    }
+
+    #[test]
+    fn host_groups_can_be_created_renamed_and_deleted_without_deleting_hosts() {
+        let mut app = grouped_fixture();
+        let fixture = crate::projects::tests::Fixture::new("host-group-crud");
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        app.section = NavSection::Hosts;
+
+        app.handle_key(KeyCode::Char('A'));
+        for character in "temporary".chars() {
+            app.handle_key(KeyCode::Char(character));
+        }
+        app.handle_key(KeyCode::Enter);
+        assert!(app.metadata.host_groups.contains(&"temporary".into()));
+
+        app.selected_browse_item = app
+            .visible_groups()
+            .iter()
+            .position(|group| group == &HostGroup::Tag("prod".into()))
+            .unwrap();
+        app.handle_key(KeyCode::Char('E'));
+        app.host_group_dialog.as_mut().unwrap().name = "production".into();
+        app.handle_key(KeyCode::Enter);
+        assert!(app.metadata.host_groups.contains(&"production".into()));
+        assert!(!app.metadata.host_groups.contains(&"prod".into()));
+        assert_eq!(app.metadata.tags["web"], ["production", "work"]);
+        assert_eq!(app.metadata.tags["db"], ["production"]);
+
+        app.selected_browse_item = app
+            .visible_groups()
+            .iter()
+            .position(|group| group == &HostGroup::Tag("production".into()))
+            .unwrap();
+        app.handle_key(KeyCode::Char('D'));
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.metadata.host_groups.contains(&"production".into()));
+        assert_eq!(app.metadata.tags["web"], ["work"]);
+        assert!(!app.metadata.tags.contains_key("db"));
+        assert!(app.hosts.hosts.iter().any(|host| host.alias == "web"));
     }
 
     #[test]

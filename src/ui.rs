@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     app::{
@@ -86,6 +87,12 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
     }
     if let Some(dialog) = &app.host_dialog {
         render_host_dialog(frame, dialog);
+        if dialog.tag_picker_open {
+            render_host_tag_picker(frame, app, dialog);
+        }
+    }
+    if let Some(dialog) = &app.host_group_dialog {
+        render_host_group_dialog(frame, dialog);
     }
     if let Some(dialog) = &app.tunnel_dialog {
         render_tunnel_dialog(frame, dialog);
@@ -2471,17 +2478,44 @@ fn host_list_lines(
 ) -> Vec<Line<'static>> {
     let alias = host_alias_line(host, "  ");
     let badges = host_auth_badges(app, host);
-    let badge_indent = content_width.saturating_sub(badges.width());
-    let mut middle = vec![Span::raw(" ".repeat(badge_indent))];
-    middle.extend(badges.spans);
-    vec![
-        alias,
-        Line::from(middle),
-        Line::from(Span::styled(
-            format!("  {}", host.destination()),
-            Style::default().fg(MUTED),
-        )),
-    ]
+    let has_badges = !badges.spans.is_empty();
+    let address_width = content_width
+        .saturating_sub(badges.width())
+        .saturating_sub(usize::from(has_badges));
+    let address_text = format!("  {}", host.destination());
+    let address_text = truncate_display(&address_text, address_width);
+    let address = Line::from(Span::styled(address_text, Style::default().fg(MUTED)));
+    let gap = content_width.saturating_sub(address.width() + badges.width());
+    let mut second_line = address.spans;
+    second_line.push(Span::raw(" ".repeat(gap)));
+    second_line.extend(badges.spans);
+    vec![alias, Line::from(second_line)]
+}
+
+fn truncate_display(value: &str, max_width: usize) -> String {
+    let value_width = value
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum::<usize>();
+    if value_width <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let available = max_width.saturating_sub(1);
+    let mut result = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > available {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push('…');
+    result
 }
 
 fn host_auth_badges(app: &App, host: &crate::hosts::Host) -> Line<'static> {
@@ -3016,7 +3050,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Some(FileDialog::Delete { .. } | FileDialog::TransferConflict { .. })
         )
         || app.credential_manager.confirm_upload.is_some()
-        || app.credential_manager.deleting;
+        || app.credential_manager.deleting
+        || app.credential_manager.delete_host_password.is_some();
     let navigation = if area.width < 75 {
         "1-7 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
@@ -3072,7 +3107,17 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             "F1 Local  F2 Remote  F3 Dynamic  Tab / ↑↓ field  Enter next/save  Esc cancel"
         }
     } else if app.host_dialog.is_some() {
-        "Tab / Shift+Tab field  Enter next/save  Esc cancel"
+        "Tab / Shift+Tab field  Space groups  Enter next/save  Esc cancel"
+    } else if app.host_group_dialog.is_some() {
+        if app
+            .host_group_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        {
+            "y / Enter delete group  n / Esc cancel"
+        } else {
+            "Type group name  Enter save  Esc cancel"
+        }
     } else if app.tags_dialog.is_some() {
         "Enter save tags  Esc cancel"
     } else if let Some(dialog) = &app.file_dialog {
@@ -3088,15 +3133,15 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "Type to filter current pane   ↑↓ move   ← parent   → open   Enter apply   Esc clear"
     } else if app.section == NavSection::Hosts {
         if area.width < 75 && app.showing_groups() {
-            "d delete  e edit  Arrows select  Enter open/SSH"
+            "A group  E edit  D del  d delete host  Enter"
         } else if area.width < 75 {
-            "d delete  e edit  ↑↓ select  Enter SSH  g tags"
+            "d delete  e edit  p password  x delete password  Enter SSH"
         } else if app.showing_groups() {
-            "↑↓ select  Enter open/SSH  d delete  e edit  k key  x unlink password  g tags  / find  a add  r reload"
+            "↑↓ select  Enter open/SSH  A add group  E edit group  D delete group  d delete host  e edit host  a add host  / find"
         } else if area.width < 95 {
-            "↑↓ move  Enter SSH  d delete  e edit  v view  g tags  / find"
+            "↑↓ move  Enter SSH  d delete  e edit  p password  x delete password  v view  g tags  / find"
         } else {
-            "↑↓ select  Enter SSH  d delete  e edit  k configure SSH key  x unlink password  g tags  Esc back  a add  / find  r reload  q quit"
+            "↑↓ select  Enter SSH  d delete  e edit  k configure SSH key  p password  x delete password  g tags  Esc back  a add  / find  r reload  q quit"
         }
     } else if app.section == NavSection::Files {
         if app.host_picker_open {
@@ -3156,6 +3201,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(
                 if app.tunnel_dialog.is_some()
                     || app.host_dialog.is_some()
+                    || app.host_group_dialog.is_some()
                     || app.host_action_dialog.is_some()
                     || app.tags_dialog.is_some()
                     || app.file_dialog.is_some()
@@ -3290,7 +3336,7 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
 }
 
 fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
-    let area = centered_rect(68, 15, frame.area());
+    let area = centered_rect(72, 20, frame.area());
     frame.render_widget(Clear, area);
     let block = if dialog.deleting {
         action_panel(
@@ -3299,9 +3345,17 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
             Color::Rgb(221, 132, 112),
         )
     } else if dialog.editing {
-        panel(" EDIT HOST ")
+        action_panel(
+            " EDIT HOST ",
+            "Tab / ↑↓ field  Space groups  Enter next/save  Esc cancel",
+            BORDER,
+        )
     } else {
-        panel(" NEW HOST ")
+        action_panel(
+            " NEW HOST ",
+            "Tab / ↑↓ field  Space groups  Enter next/save  Esc cancel",
+            BORDER,
+        )
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3320,33 +3374,157 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
         );
         return;
     }
-    let labels = ["Alias", "HostName", "User", "Port", "IdentityFile"];
+    let labels = [
+        "Alias",
+        "HostName",
+        "Groups",
+        "User",
+        "Port",
+        "IdentityFile",
+    ];
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1); 5])
+        .constraints([Constraint::Length(2); 6])
         .split(inner);
-    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+    for (index, label) in labels.iter().enumerate() {
+        let value = if index == 2 {
+            format!("{}  [Space to select]", dialog.tags.join(", "))
+        } else {
+            dialog.fields[match index {
+                0 => 0,
+                1 => 1,
+                3 => 2,
+                4 => 3,
+                5 => 4,
+                _ => unreachable!(),
+            }]
+            .clone()
+        };
         frame.render_widget(
             Paragraph::new(input_line(
                 label,
-                value,
+                &value,
                 index == dialog.selected_field,
                 false,
             )),
             rows[index],
         );
     }
-    let help_area = Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(6),
-        width: inner.width,
-        height: inner.height.saturating_sub(6),
-    };
-    frame.render_widget(
-        Paragraph::new("Tab / ↑↓ next field    Enter next / save    Esc cancel")
-            .style(Style::default().fg(MUTED)),
-        help_area,
+}
+
+fn render_host_tag_picker(frame: &mut Frame, app: &App, dialog: &crate::app::HostDialog) {
+    let available = app
+        .metadata
+        .tags
+        .values()
+        .flatten()
+        .cloned()
+        .chain(app.metadata.host_groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let filter = dialog.tag_filter.to_lowercase();
+    let matches = available
+        .iter()
+        .filter(|tag| tag.to_lowercase().contains(&filter))
+        .collect::<Vec<_>>();
+    let exact_match = available
+        .iter()
+        .any(|tag| tag.eq_ignore_ascii_case(dialog.tag_filter.trim()));
+    let create_tag =
+        (!dialog.tag_filter.trim().is_empty() && !exact_match).then(|| dialog.tag_filter.trim());
+    let option_count = matches.len() + usize::from(create_tag.is_some());
+    let selected = dialog
+        .tag_picker_selected
+        .min(option_count.saturating_sub(1));
+    let mut items = matches
+        .iter()
+        .enumerate()
+        .map(|(index, tag)| {
+            let checked = dialog.tags.iter().any(|selected| selected == *tag);
+            ListItem::new(format!(
+                "{} [{}] {}",
+                if selected == index { ">" } else { " " },
+                if checked { "x" } else { " " },
+                tag
+            ))
+        })
+        .collect::<Vec<_>>();
+    if let Some(tag) = create_tag {
+        items.push(ListItem::new(format!(
+            "{} [+] Create and add \"{tag}\"",
+            if selected == matches.len() { ">" } else { " " }
+        )));
+    }
+
+    let area = centered_rect(64, 16, frame.area());
+    frame.render_widget(Clear, area);
+    let block = action_panel(
+        " SELECT GROUPS ",
+        "Type filter  Space toggle  Enter create/apply  Esc done",
+        BORDER,
     );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(input_line("Filter", &dialog.tag_filter, true, false)),
+        rows[0],
+    );
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No groups yet. Type a name to create one."),
+            rows[1],
+        );
+    } else {
+        let mut state = ListState::default().with_selected((option_count > 0).then_some(selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().bg(PANEL)),
+            rows[1],
+            &mut state,
+        );
+    }
+}
+
+fn render_host_group_dialog(frame: &mut Frame, dialog: &crate::app::HostGroupDialog) {
+    let area = centered_rect(68, 9, frame.area());
+    frame.render_widget(Clear, area);
+    if dialog.deleting {
+        let name = dialog.original_name.as_deref().unwrap_or("group");
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("Delete group \"{name}\"?")),
+                Line::from("Hosts will be kept; only this group assignment is removed."),
+            ])
+            .style(Style::default().fg(TEXT))
+            .block(action_panel(
+                " DELETE GROUP ",
+                "y/Enter delete  n/Esc cancel",
+                Color::Rgb(221, 132, 112),
+            ))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+    } else {
+        let title = if dialog.original_name.is_some() {
+            " EDIT GROUP "
+        } else {
+            " NEW GROUP "
+        };
+        frame.render_widget(
+            Paragraph::new(input_line("Name", &dialog.name, true, false))
+                .style(Style::default().fg(TEXT))
+                .block(action_panel(
+                    title,
+                    "Type name  Enter save  Esc cancel",
+                    BORDER,
+                )),
+            area,
+        );
+    }
 }
 
 fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
@@ -3741,10 +3919,12 @@ mod tests {
 
     #[test]
     fn host_read_only_notice_renders_as_centered_dialog() {
-        let mut app = App::with_catalog(
-            HostCatalog::default(),
-            Ok(crate::metadata::Metadata::default()),
+        let mut metadata = crate::metadata::Metadata::default();
+        metadata.tags.insert(
+            "other".into(),
+            vec!["dogfooding".into(), "production".into()],
         );
+        let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
         app.host_action_dialog = Some(crate::app::HostActionDialog {
             title: "HOST IS READ-ONLY".into(),
             message: "This host comes from OpenSSH configuration and cannot be deleted here."
@@ -3830,6 +4010,10 @@ mod tests {
                 String::new(),
                 String::new(),
             ],
+            tags: Vec::new(),
+            tag_picker_open: false,
+            tag_filter: String::new(),
+            tag_picker_selected: 0,
             original_alias: None,
             selected_field: 0,
             editing: false,
@@ -3838,10 +4022,57 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let text = format!("{}", terminal.backend());
-        let footer_row = text.lines().nth(21).unwrap();
-        assert!(footer_row.contains("y/Enter yes"));
-        assert!(footer_row.contains("n/Esc no"));
+        assert!(text.lines().any(|line| line.contains("y/Enter yes")));
+        assert!(text.lines().any(|line| line.contains("n/Esc no")));
         assert!(!text.contains("y / Enter confirm"));
+    }
+
+    #[test]
+    fn host_forms_render_group_field_and_consistent_bottom_actions() {
+        let mut metadata = crate::metadata::Metadata::default();
+        metadata.tags.insert(
+            "other".into(),
+            vec!["dogfooding".into(), "production".into()],
+        );
+        let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
+        app.host_dialog = Some(crate::app::HostDialog {
+            fields: [
+                "prod".into(),
+                "example.com".into(),
+                "deploy".into(),
+                "22".into(),
+                String::new(),
+            ],
+            tags: vec!["production".into(), "dogfooding".into()],
+            tag_picker_open: false,
+            tag_filter: String::new(),
+            tag_picker_selected: 0,
+            original_alias: Some("prod".into()),
+            selected_field: 2,
+            editing: true,
+            deleting: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("EDIT HOST"));
+        assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
+        assert!(text.contains("Space groups  Enter next/save"));
+
+        app.host_dialog.as_mut().unwrap().editing = false;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("NEW HOST"));
+        assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
+        assert!(text.contains("Space groups  Enter next/save"));
+
+        app.host_dialog.as_mut().unwrap().tag_picker_open = true;
+        app.host_dialog.as_mut().unwrap().tag_filter = "dog".into();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("SELECT GROUPS"));
+        assert!(text.contains("[x] dogfooding"), "{text}");
+        assert!(text.contains("Create and add \"dog\""));
     }
 
     #[test]
@@ -4351,8 +4582,15 @@ mod tests {
         assert_eq!(key.style.fg, Some(BG));
         assert!(!badges.to_string().contains("Password"));
         let lines = host_list_lines(&app, &host, 40);
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[1].width(), 40);
+        assert!(lines[1].to_string().starts_with("  external"));
         assert!(lines[1].to_string().contains("Key uploaded"));
+        let narrow = host_list_lines(&app, &host, 22);
+        assert_eq!(narrow.len(), 2);
+        assert_eq!(narrow[1].width(), 22);
+        assert!(narrow[1].to_string().contains("…"));
+        assert!(narrow[1].to_string().contains("Key uploaded"));
         app.credential_manager
             .host_key_sources
             .insert(host.alias.clone(), vec!["ssh-agent".into()]);

@@ -1954,6 +1954,7 @@ dependencies = [
  "shell-words",
  "ssh-key",
  "tokio",
+ "unicode-width",
  "url",
  "vte",
  "webbrowser",

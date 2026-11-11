@@ -22,6 +22,7 @@ pub struct CredentialState {
     pub ssh_key_only: bool,
     pub form: Option<CredentialForm>,
     pub deleting: bool,
+    pub delete_host_password: Option<(String, Credential)>,
     pub confirm_upload: Option<String>,
     pub message: Option<String>,
     pending: Option<Receiver<Result<CredentialJob, String>>>,
@@ -123,6 +124,96 @@ mod tests {
         assert!(!crate::project_credentials::tests::password_exists(
             &replacement
         ));
+    }
+
+    #[test]
+    fn host_password_shortcut_replaces_secret_without_losing_shared_associations() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let fixture = Fixture::new("host-password-edit");
+        let mut app = app(&fixture);
+        let mut other = app.hosts.hosts[0].clone();
+        other.alias = "other".into();
+        app.hosts.hosts.push(other);
+        save_password(&mut app, "old secret");
+        let id = app.metadata.credentials[0].id;
+        let old_ref = app.metadata.credentials[0].password_ref.clone().unwrap();
+        app.metadata.host_passwords.insert("web".into(), id);
+        app.metadata.host_passwords.insert("other".into(), id);
+        app.handle_credentials_key(KeyCode::Esc);
+        app.enter_group();
+        app.handle_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let form = app.credential_manager.form.as_mut().unwrap();
+        assert_eq!(form.id, Some(id));
+        assert_eq!(form.selected, 2);
+        assert!(form.fields[2].is_empty());
+        form.fields[2] = "new secret".into();
+        app.handle_credentials_key(KeyCode::Enter);
+        finish(&mut app);
+        assert_eq!(app.metadata.host_passwords.get("web"), Some(&id));
+        assert_eq!(app.metadata.host_passwords.get("other"), Some(&id));
+        let reference = app.host_password_reference("web").unwrap();
+        assert_eq!(
+            &**crate::project_credentials::read_password(reference).unwrap(),
+            "new secret"
+        );
+        assert!(!crate::project_credentials::tests::password_exists(
+            &old_ref
+        ));
+        let json = std::fs::read_to_string(fixture.root.join("hosts.json")).unwrap();
+        assert!(!json.contains("old secret"));
+        assert!(!json.contains("new secret"));
+    }
+
+    #[test]
+    fn deleting_linked_password_confirms_and_rolls_back_on_save_failure() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let fixture = Fixture::new("host-password-delete");
+        let mut app = app(&fixture);
+        save_password(&mut app, "secret");
+        let id = app.metadata.credentials[0].id;
+        let reference = app.metadata.credentials[0].password_ref.clone().unwrap();
+        app.metadata.host_passwords.insert("web".into(), id);
+        app.metadata.host_passwords.insert("other".into(), id);
+        app.handle_credentials_key(KeyCode::Esc);
+        app.enter_group();
+        let press = |app: &mut App, code| app.handle_event(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.credentials_modal());
+        assert!(!app.credential_manager.open);
+        assert!(app.credential_manager.delete_host_password.is_some());
+        press(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.section, NavSection::Hosts);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.credentials_modal());
+        assert_eq!(app.metadata.credentials.len(), 1);
+        assert_eq!(app.metadata.host_passwords.len(), 2);
+        app.metadata_save_path = Some(fixture.root.clone());
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Enter);
+        finish(&mut app);
+        assert_eq!(app.metadata.credentials.len(), 1);
+        assert_eq!(app.metadata.host_passwords.len(), 2);
+        assert!(crate::project_credentials::tests::password_exists(
+            &reference
+        ));
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Enter);
+        finish(&mut app);
+        assert!(app.metadata.credentials.is_empty());
+        assert!(app.metadata.host_passwords.is_empty());
+        assert!(!crate::project_credentials::tests::password_exists(
+            &reference
+        ));
+        let saved: Metadata = serde_json::from_str(
+            &std::fs::read_to_string(fixture.root.join("hosts.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.credentials.is_empty());
+        assert!(saved.host_passwords.is_empty());
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.host_action_dialog.is_some());
+        assert!(!app.credentials_modal());
     }
 
     #[test]
@@ -696,6 +787,7 @@ impl App {
     pub fn credentials_modal(&self) -> bool {
         let state = &self.credential_manager;
         state.open
+            || state.delete_host_password.is_some()
             || (self.section == NavSection::Credentials
                 && (state.form.is_some() || state.deleting || state.confirm_upload.is_some()))
     }
@@ -713,6 +805,61 @@ impl App {
     pub fn open_host_ssh_key_selector(&mut self, alias: String) {
         self.open_credentials(Some(alias), false);
         self.credential_manager.ssh_key_only = true;
+    }
+
+    pub fn open_host_password_editor(&mut self, alias: &str) {
+        let Some(credential) = self.host_password_credential(alias).cloned() else {
+            self.notice = Some(format!(
+                "No saved password for {alias}. Connect to enter and save a password."
+            ));
+            return;
+        };
+        self.open_credentials(None, false);
+        self.credential_manager.selected = self
+            .visible_credentials()
+            .iter()
+            .position(|item| item.credential.id == credential.id)
+            .unwrap_or(0);
+        self.credential_form(FormKind::Password, Some(credential));
+        self.credential_manager.form.as_mut().unwrap().selected = 2;
+    }
+
+    pub fn confirm_delete_host_password(&mut self, alias: &str) {
+        if let Some(credential) = self.host_password_credential(alias).cloned() {
+            self.credential_manager.delete_host_password = Some((alias.to_string(), credential));
+        } else {
+            self.host_action_dialog = Some(crate::app::HostActionDialog {
+                title: "NO SAVED PASSWORD".into(),
+                message: format!("No saved password is configured for {alias}."),
+            });
+        }
+    }
+
+    fn remove_credential_record(&mut self, credential: Credential) {
+        let previous = self.metadata.credentials.clone();
+        let previous_passwords = self.metadata.host_passwords.clone();
+        self.metadata
+            .credentials
+            .retain(|item| item.id != credential.id);
+        self.metadata
+            .host_passwords
+            .retain(|_, id| *id != credential.id);
+        if self.save_metadata() {
+            if let Some(reference) = credential.password_ref {
+                self.cleanup_credential_reference(reference);
+            }
+            let message = if credential.kind == CredentialKind::Password {
+                "Removed saved password and its Host associations."
+            } else {
+                "Removed credential record. SSH key files and IdentityFile entries are retained."
+            };
+            self.notice = Some(message.into());
+            self.credential_manager.message = Some(message.into());
+        } else {
+            self.metadata.credentials = previous;
+            self.metadata.host_passwords = previous_passwords;
+            self.credential_manager.message = self.notice.clone();
+        }
     }
 
     pub fn visible_credentials(&self) -> Vec<CredentialItem> {
@@ -1515,6 +1662,20 @@ impl App {
     }
 
     pub fn handle_credentials_key(&mut self, key: KeyCode) {
+        if self.credential_manager.delete_host_password.is_some() {
+            match key {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let (_, credential) =
+                        self.credential_manager.delete_host_password.take().unwrap();
+                    self.remove_credential_record(credential);
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.credential_manager.delete_host_password = None;
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.credentials_busy() {
             if key == KeyCode::Esc
                 && let Some(cancel) = &self.credential_manager.upload_cancel
@@ -1575,26 +1736,7 @@ impl App {
                             self.credential_manager.deleting = false;
                             return;
                         }
-                        let value = item.credential;
-                        let associated = self.credential_hosts(&value);
-                        if value.kind == CredentialKind::Password && !associated.is_empty() {
-                            self.credential_manager.message = Some(format!(
-                                "Still used by {}; unlink it from each Host first (Hosts / k / x).",
-                                associated.join(", ")
-                            ));
-                        } else {
-                            let previous = self.metadata.credentials.clone();
-                            self.metadata.credentials.retain(|item| item.id != value.id);
-                            if self.save_metadata() {
-                                if let Some(reference) = value.password_ref {
-                                    self.cleanup_credential_reference(reference);
-                                }
-                                self.credential_manager.message = Some("Removed credential record. SSH key files and IdentityFile entries are retained.".into());
-                            } else {
-                                self.metadata.credentials = previous;
-                                self.credential_manager.message = self.notice.clone();
-                            }
-                        }
+                        self.remove_credential_record(item.credential);
                     }
                     self.credential_manager.deleting = false;
                 }
@@ -1688,15 +1830,7 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(alias) = self.credential_manager.target.clone() {
-                    let previous = self.metadata.host_passwords.clone();
-                    self.metadata.host_passwords.remove(&alias);
-                    if self.save_metadata() {
-                        self.credential_manager.message =
-                            Some(format!("Unlinked saved password from {alias}."));
-                    } else {
-                        self.metadata.host_passwords = previous;
-                        self.credential_manager.message = self.notice.clone();
-                    }
+                    self.confirm_delete_host_password(&alias);
                 }
             }
             KeyCode::Enter

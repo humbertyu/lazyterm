@@ -82,6 +82,8 @@ pub struct Metadata {
     pub version: u32,
     pub view: HostView,
     pub tags: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub host_groups: Vec<String>,
     pub local_path: Option<PathBuf>,
     pub remote_paths: BTreeMap<String, String>,
     pub show_hidden_files: bool,
@@ -157,6 +159,7 @@ impl Default for Metadata {
             version: 1,
             view: HostView::Groups,
             tags: BTreeMap::new(),
+            host_groups: Vec::new(),
             local_path: None,
             remote_paths: BTreeMap::new(),
             show_hidden_files: false,
@@ -177,6 +180,24 @@ impl Default for Metadata {
 }
 
 impl Metadata {
+    pub fn normalize_host_groups(&mut self) -> bool {
+        let mut groups = self
+            .host_groups
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for tag in self.tags.values().flatten() {
+            groups.insert(tag.clone());
+        }
+        let groups = groups.into_iter().collect::<Vec<_>>();
+        if groups == self.host_groups {
+            false
+        } else {
+            self.host_groups = groups;
+            true
+        }
+    }
+
     pub fn load() -> io::Result<Self> {
         Self::read_from(&Self::path()?)
     }

@@ -42,6 +42,24 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.credential_manager.open || app.section == crate::app::NavSection::Credentials {
         render_overlays(frame, app);
     }
+    if let Some((alias, credential)) = &app.credential_manager.delete_host_password {
+        let related = app.credential_hosts(credential);
+        let message = format!(
+            "Delete the saved password for {alias}?\n\nRemove its saved record and unused Keychain password.\nAffected Hosts: {}\nThe server password will not change.",
+            related.join(", ")
+        );
+        let area = centered(frame.area(), 76, 12);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(message)
+                .wrap(Wrap { trim: false })
+                .block(action_panel(
+                    " DELETE HOST PASSWORD ",
+                    "y/Enter delete  n/Esc cancel",
+                )),
+            area,
+        );
+    }
 }
 
 pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
@@ -211,7 +229,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
         )
     } else if state.target.is_some() && !state.upload_only {
         format!(
-            "Host: {}  Enter configure SSH key  u upload public key  x unlink password\na password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back",
+            "Host: {}  Enter configure SSH key  u upload public key  x delete password\na password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back",
             state.target.as_deref().unwrap_or_default()
         )
     } else if state.target.is_some() && state.upload_only {
@@ -299,7 +317,14 @@ fn render_overlays(frame: &mut Frame, app: &App) {
         frame.render_widget(block, form_area);
         let note = match form.kind {
             FormKind::Password => {
-                "Saved in the OS credential store. Configuration contains only a reference.".into()
+                let related = form.id.and_then(|id| {
+                    app.metadata.credentials.iter().find(|item| item.id == id)
+                }).map(|item| app.credential_hosts(item)).unwrap_or_default();
+                if related.is_empty() {
+                    "Saved in the OS credential store. Configuration contains only a reference.".into()
+                } else {
+                    format!("Updates the saved password for Hosts: {}. Blank keeps the current password.", related.join(", "))
+                }
             }
             FormKind::Generate => {
                 "Creates id_ed25519 + id_ed25519.pub in a NEW directory. This key has no passphrase; keep its private file protected.".into()
@@ -406,10 +431,23 @@ fn render_overlays(frame: &mut Frame, app: &App) {
         frame.render_widget(Clear, area);
         let (message, title, can_delete) = match app.selected_credential() {
             Some(item) if item.source == CredentialSource::Managed => (
-                format!(
-                    "Remove \"{}\" from LazyTerm?\nSSH key files and IdentityFile entries will be retained.",
-                    item.credential.name
-                ),
+                if item.credential.kind == CredentialKind::Password {
+                    let related = app.credential_hosts(&item.credential);
+                    format!(
+                        "Delete saved password \"{}\" from Keychain?\n{}\nThe server password will not change.",
+                        item.credential.name,
+                        if related.is_empty() {
+                            "No Hosts are linked.".into()
+                        } else {
+                            format!("Unlink from Hosts: {}.", related.join(", "))
+                        }
+                    )
+                } else {
+                    format!(
+                        "Remove \"{}\" from LazyTerm?\nSSH key files and IdentityFile entries will be retained.",
+                        item.credential.name
+                    )
+                },
                 " REMOVE CREDENTIAL ",
                 true,
             ),
@@ -608,7 +646,22 @@ mod tests {
             public_key: String::new(),
             fingerprint: String::new(),
         });
-        let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
+        metadata.host_passwords.insert("web".into(), 1);
+        let mut app = App::with_catalog(
+            HostCatalog {
+                hosts: vec![crate::hosts::Host {
+                    alias: "web".into(),
+                    hostname: Some("example.com".into()),
+                    user: Some("deploy".into()),
+                    port: None,
+                    identity_file: None,
+                    proxy_jump: None,
+                    managed: false,
+                }],
+                error: None,
+            },
+            Ok(metadata),
+        );
         app.section = crate::app::NavSection::Credentials;
         app.credential_manager.deleting = true;
 
@@ -624,6 +677,25 @@ mod tests {
         assert!(text.contains("REMOVE CREDENTIAL"));
         assert!(text.contains("Deploy password"));
         assert!(text.contains("y/Enter yes"));
+        assert!(text.contains("Unlink from Hosts: web."));
+        assert!(text.contains("The server password will not change."));
         assert!(!text.contains("Remove this credential record?"));
+
+        app.credential_manager.deleting = false;
+        app.section = crate::app::NavSection::Hosts;
+        app.confirm_delete_host_password("web");
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("DELETE HOST PASSWORD"));
+        assert!(text.contains("saved password for web?"));
+        assert!(text.contains("Affected Hosts: web"));
+        assert!(text.contains("y/Enter delete"));
+        assert!(!app.credential_manager.open);
     }
 }
