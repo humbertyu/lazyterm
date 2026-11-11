@@ -3034,43 +3034,13 @@ impl App {
                 dialog.password.push(value);
                 dialog.error = None;
             }
-            KeyCode::Enter if dialog.selected_field == 0 => {
+            KeyCode::Enter => {
                 if dialog.username.trim().is_empty() {
                     dialog.error = Some("Enter the SSH username.".into());
-                } else {
-                    dialog.selected_field = 1;
-                }
-            }
-            KeyCode::Enter if dialog.selected_field == 1 => {
-                if dialog.password.is_empty() {
-                    dialog.error = Some("Enter the Host password.".into());
-                } else {
-                    let Some(dialog) = self.host_password_dialog.take() else {
-                        return InputAction::None;
-                    };
-                    let action = match &dialog.purpose {
-                        HostPasswordPurpose::Connect => InputAction::Connect,
-                        HostPasswordPurpose::UploadKey { .. } => InputAction::RetryPublicKeyUpload,
-                    };
-                    self.pending_host_password = Some(SubmittedHostPassword {
-                        alias: dialog.alias.clone(),
-                        username: dialog.username.clone(),
-                        password: Zeroizing::new(dialog.password.to_string()),
-                        save_in_keychain: dialog.save_in_keychain,
-                        purpose: dialog.purpose.clone(),
-                    });
-                    return action;
-                }
-            }
-            KeyCode::Enter if dialog.selected_field == 2 => {
-                if dialog.username.trim().is_empty() {
-                    dialog.error = Some("Enter the SSH username.".into());
-                    dialog.selected_field = 0;
                     return InputAction::None;
                 }
                 if dialog.password.is_empty() {
                     dialog.error = Some("Enter the Host password.".into());
-                    dialog.selected_field = 1;
                     return InputAction::None;
                 }
                 let Some(dialog) = self.host_password_dialog.take() else {
@@ -3378,30 +3348,26 @@ impl App {
                 dialog.error = None;
             }
             KeyCode::Enter => {
-                if dialog.selected_field == 0 {
-                    dialog.selected_field = 1;
-                    dialog.error = None;
+                let Some(mut dialog) = self.credential_export_dialog.take() else {
+                    return;
+                };
+                let selected_field = dialog.selected_field;
+                let password = Zeroizing::new(std::mem::take(&mut dialog.fields[0]));
+                let confirmation = Zeroizing::new(std::mem::take(&mut dialog.fields[1]));
+                if password.len() < 8 {
+                    self.credential_export_dialog = Some(CredentialExportDialog {
+                        fields: [password.to_string(), confirmation.to_string()],
+                        selected_field,
+                        error: Some("Use at least 8 characters.".into()),
+                    });
+                } else if password.as_str() != confirmation.as_str() {
+                    self.credential_export_dialog = Some(CredentialExportDialog {
+                        fields: [password.to_string(), confirmation.to_string()],
+                        selected_field,
+                        error: Some("The two passwords do not match.".into()),
+                    });
                 } else {
-                    let Some(mut dialog) = self.credential_export_dialog.take() else {
-                        return;
-                    };
-                    let password = Zeroizing::new(std::mem::take(&mut dialog.fields[0]));
-                    let confirmation = Zeroizing::new(std::mem::take(&mut dialog.fields[1]));
-                    if password.len() < 8 {
-                        self.credential_export_dialog = Some(CredentialExportDialog {
-                            fields: [password.to_string(), confirmation.to_string()],
-                            selected_field: 0,
-                            error: Some("Use at least 8 characters.".into()),
-                        });
-                    } else if password.as_str() != confirmation.as_str() {
-                        self.credential_export_dialog = Some(CredentialExportDialog {
-                            fields: [password.to_string(), confirmation.to_string()],
-                            selected_field: 1,
-                            error: Some("The two passwords do not match.".into()),
-                        });
-                    } else {
-                        self.export_credentials(password);
-                    }
+                    self.export_credentials(password);
                 }
             }
             KeyCode::Char(value) => {
@@ -3719,16 +3685,18 @@ impl App {
                 self.selected_host = 0;
                 self.selected_browse_item = 0;
             }
-            KeyCode::Char('g') if self.section == NavSection::Hosts => {
+            KeyCode::Char('g')
+                if self.section == NavSection::Hosts && self.selected_group().is_none() =>
+            {
                 if let Some(host) = self.selected_host() {
                     self.tags_dialog = Some((host.alias.clone(), self.tags(host).join(", ")));
                 }
             }
             KeyCode::Char('r') if self.section == NavSection::Hosts => self.refresh_hosts(),
-            KeyCode::Char('a')
+            KeyCode::Char('g')
                 if self.section == NavSection::Hosts
                     && self.showing_groups()
-                    && self.selected_group().is_some() =>
+                    && (self.selected_group().is_some() || self.selected_host().is_none()) =>
             {
                 self.host_group_dialog = Some(HostGroupDialog {
                     name: String::new(),
@@ -3780,14 +3748,7 @@ impl App {
             }
             KeyCode::Char('e') if self.section == NavSection::Hosts => {
                 if let Some(host) = self.selected_host() {
-                    if host.managed {
-                        self.open_host_form(Some(host.clone()));
-                    } else {
-                        self.host_action_dialog = Some(HostActionDialog {
-                            title: "HOST IS READ-ONLY".into(),
-                            message: "This host comes from OpenSSH configuration. Edit it in ~/.ssh/config; LazyTerm-managed hosts can be edited here.".into(),
-                        });
-                    }
+                    self.open_host_form(Some(host.clone()));
                 }
             }
             KeyCode::Char('d') if self.section == NavSection::Hosts => {
@@ -4124,10 +4085,6 @@ impl App {
                 dialog.fields[dialog.selected_field].pop();
             }
             KeyCode::Enter => {
-                if dialog.selected_field == 0 {
-                    dialog.selected_field = 1;
-                    return;
-                }
                 let Some(dialog) = self.package_dialog.take() else {
                     return;
                 };
@@ -4201,10 +4158,6 @@ impl App {
                 dialog.fields[3] = (!dangerous).to_string();
             }
             KeyCode::Enter => {
-                if dialog.selected_field + 1 < dialog.fields.len() {
-                    dialog.selected_field += 1;
-                    return;
-                }
                 let Some(dialog) = self.snippet_dialog.take() else {
                     return;
                 };
@@ -4355,8 +4308,9 @@ impl App {
     fn open_host_form(&mut self, host: Option<Host>) {
         let editing = host.is_some();
         let original_alias = host.as_ref().map(|host| host.alias.clone());
+        let inherited_group = self.active_group.clone().or_else(|| self.selected_group());
         let tags = host.as_ref().map_or_else(
-            || match &self.active_group {
+            || match &inherited_group {
                 Some(HostGroup::Tag(tag)) => vec![tag.clone()],
                 _ => Vec::new(),
             },
@@ -4585,10 +4539,6 @@ impl App {
                 dialog.fields[dialog.selected_field].pop();
             }
             KeyCode::Enter => {
-                if dialog.selected_field + 1 < dialog.fields.len() {
-                    dialog.selected_field += 1;
-                    return;
-                }
                 let Some(dialog) = self.tunnel_dialog.take() else {
                     return;
                 };
@@ -4833,10 +4783,6 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if dialog.selected_field < 5 {
-                    dialog.selected_field += 1;
-                    return;
-                }
                 let Some(dialog) = self.host_dialog.take() else {
                     return;
                 };
@@ -4872,7 +4818,7 @@ impl App {
                 };
                 match self
                     .hosts
-                    .upsert_managed_from(&host, dialog.original_alias.as_deref())
+                    .upsert_from(&host, dialog.original_alias.as_deref())
                 {
                     Ok(()) => {
                         if let Some(original) = dialog
@@ -5367,7 +5313,7 @@ mod tests {
     }
 
     #[test]
-    fn external_hosts_can_be_deleted_after_confirmation_but_remain_read_only_for_editing() {
+    fn external_hosts_can_be_edited_and_deleted_after_confirmation() {
         let mut app = grouped_fixture();
         let fixture = crate::projects::tests::Fixture::new("host-action-dialog");
         app.metadata_error = false;
@@ -5384,14 +5330,10 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.host_dialog.is_none());
         press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
-        assert!(
-            app.host_action_dialog
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("OpenSSH")
+        assert_eq!(
+            app.host_dialog.as_ref().unwrap().original_alias.as_deref(),
+            Some("web")
         );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.host_action_dialog.is_none());
     }
 
@@ -5418,6 +5360,8 @@ mod tests {
             HostPasswordPurpose::Connect,
         );
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.host_password_dialog.as_ref().unwrap().selected_field, 0);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
         assert_eq!(
             app.host_password_dialog.as_ref().unwrap().password.as_str(),
@@ -5454,6 +5398,7 @@ mod tests {
         );
         assert!(app.take_pending_host_password().is_none());
         assert!(app.host_password_dialog.as_ref().unwrap().error.is_some());
+        assert_eq!(app.host_password_dialog.as_ref().unwrap().selected_field, 1);
         press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
@@ -5486,7 +5431,8 @@ mod tests {
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
             InputAction::None
         );
-        assert_eq!(app.host_password_dialog.as_ref().unwrap().selected_field, 1);
+        assert_eq!(app.host_password_dialog.as_ref().unwrap().selected_field, 0);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         for value in "secret".chars() {
             press(&mut app, KeyCode::Char(value), KeyModifiers::NONE);
         }
@@ -5546,6 +5492,12 @@ mod tests {
                 .as_ref()
                 .and_then(|dialog| dialog.error.as_deref()),
             Some("Use at least 8 characters.")
+        );
+        assert_eq!(
+            app.credential_export_dialog
+                .as_ref()
+                .map(|dialog| dialog.selected_field),
+            Some(1)
         );
 
         app.credential_export_dialog = Some(CredentialExportDialog {
@@ -6324,7 +6276,7 @@ mod tests {
         app.metadata_save_path = Some(fixture.root.join("hosts.json"));
         app.section = NavSection::Hosts;
 
-        app.handle_key(KeyCode::Char('a'));
+        app.handle_key(KeyCode::Char('g'));
         for character in "temporary".chars() {
             app.handle_key(KeyCode::Char(character));
         }
@@ -7270,7 +7222,7 @@ mod tests {
             "10".into(),
             "30".into(),
         ];
-        dialog.selected_field = 7;
+        dialog.selected_field = 0;
         app.handle_key(KeyCode::Enter);
 
         assert_eq!(app.metadata.tunnels.len(), 1);
@@ -7299,7 +7251,7 @@ mod tests {
             "10".into(),
             "30".into(),
         ];
-        dialog.selected_field = 7;
+        dialog.selected_field = 0;
         app.handle_key(KeyCode::Enter);
 
         assert_eq!(app.metadata.tunnels.len(), 1);
@@ -7327,7 +7279,7 @@ mod tests {
             "10".into(),
             "30".into(),
         ];
-        dialog.selected_field = 7;
+        dialog.selected_field = 0;
         app.handle_key(KeyCode::Enter);
 
         assert_eq!(app.metadata.tunnels[0].kind, TunnelKind::Remote);
@@ -7345,7 +7297,7 @@ mod tests {
             "10".into(),
             "30".into(),
         ];
-        dialog.selected_field = 7;
+        dialog.selected_field = 0;
         app.handle_key(KeyCode::Enter);
 
         assert_eq!(app.metadata.tunnels[1].kind, TunnelKind::Dynamic);
@@ -7370,6 +7322,31 @@ mod tests {
         assert!(app.tunnel_dialog.as_ref().unwrap().fields[5].is_empty());
         app.handle_key(KeyCode::F(1));
         assert_eq!(app.tunnel_dialog.as_ref().unwrap().kind, TunnelKind::Local);
+    }
+
+    #[test]
+    fn package_and_snippet_forms_save_from_the_current_field_on_enter() {
+        let mut app = app_fixture();
+        app.open_package_form(None);
+        app.package_dialog.as_mut().unwrap().fields = ["Operations".into(), "Common tasks".into()];
+        app.handle_package_dialog_key(KeyCode::Enter);
+        assert!(app.package_dialog.is_none());
+        assert_eq!(app.metadata.snippet_packages[0].name, "Operations");
+
+        let package_id = app.metadata.snippet_packages[0].id;
+        app.open_snippet_form(package_id, None);
+        app.snippet_dialog.as_mut().unwrap().fields = [
+            "Health check".into(),
+            "uptime".into(),
+            "Show system uptime".into(),
+            "false".into(),
+        ];
+        app.handle_snippet_dialog_key(KeyCode::Enter);
+        assert!(app.snippet_dialog.is_none());
+        assert_eq!(
+            app.metadata.snippet_packages[0].snippets[0].name,
+            "Health check"
+        );
     }
 
     #[test]

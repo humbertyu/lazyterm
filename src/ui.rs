@@ -2844,7 +2844,7 @@ fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, 
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "Package: {}   Tab / ↑↓ next field   Enter next / save   Esc cancel",
+            "Package: {}   Tab / ↑↓ field   Enter save   Esc cancel",
             app.metadata
                 .snippet_packages
                 .iter()
@@ -2885,7 +2885,7 @@ fn render_package_dialog(frame: &mut Frame, dialog: &crate::app::PackageDialog) 
         );
     }
     frame.render_widget(
-        Paragraph::new("Tab / ↑↓ next field    Enter next / save    Esc cancel")
+        Paragraph::new("Tab / ↑↓ field    Enter save    Esc cancel")
             .style(Style::default().fg(MUTED)),
         Rect {
             y: inner.y + 4,
@@ -3061,15 +3061,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ""
     } else if app.host_action_dialog.is_some() {
         "Enter / Esc close"
-    } else if app
-        .workspace
-        .form
-        .as_ref()
-        .is_some_and(|form| form.link_form)
-    {
-        "Tab / ↑↓ field  ←→ choice  Enter save  Esc cancel"
     } else if app.workspace.form.is_some() {
-        "Tab / ↑↓ field  ←→ choice  Enter next/save  Esc cancel"
+        "Tab / ↑↓ field  ←→ choice  Enter save  Esc cancel"
     } else if app.workspace.delete.is_some() || app.workspace.confirmation.is_some() {
         "y / Enter confirm  n / Esc cancel"
     } else if app.section == NavSection::Projects {
@@ -3093,7 +3086,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.snippet_confirmation.is_some() || app.snippet_delete_confirmation.is_some() {
         "y / Enter confirm    n / Esc cancel"
     } else if app.snippet_dialog.is_some() || app.package_dialog.is_some() {
-        "Tab / ↑↓ field  Enter next/save  Esc cancel"
+        "Tab / ↑↓ field  Enter save  Esc cancel"
     } else if app.tunnel_host_picker_open {
         "↑↓ select group/Host  Enter open/choose  Backspace back  Esc cancel"
     } else if app.tunnel_dialog.is_some() {
@@ -3104,10 +3097,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         {
             "y / Enter confirm  n / Esc cancel"
         } else {
-            "F1 Local  F2 Remote  F3 Dynamic  Tab / ↑↓ field  Enter next/save  Esc cancel"
+            "F1 Local  F2 Remote  F3 Dynamic  Tab / ↑↓ field  Enter save  Esc cancel"
         }
     } else if app.host_dialog.is_some() {
-        "Tab / Shift+Tab field  Space groups  Enter next/save  Esc cancel"
+        "Tab / Shift+Tab field  Space groups  Enter save  Esc cancel"
     } else if app.host_group_dialog.is_some() {
         if app
             .host_group_dialog
@@ -3134,10 +3127,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.section == NavSection::Hosts {
         if area.width < 75 && app.showing_groups() {
             match app.selected_group() {
-                Some(crate::app::HostGroup::Tag(_)) => {
-                    "a add group  e edit group  d delete group  Enter open"
-                }
-                Some(crate::app::HostGroup::Untagged) => "a add group  Enter open",
+                Some(crate::app::HostGroup::Tag(_)) => "a host  g add grp  e edit  d delete  Enter",
+                Some(crate::app::HostGroup::Untagged) => "a host  g add grp  Enter open",
                 None => "a add host  e edit  d delete  Enter SSH",
             }
         } else if area.width < 75 {
@@ -3145,12 +3136,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else if app.showing_groups() {
             match app.selected_group() {
                 Some(crate::app::HostGroup::Tag(_)) => {
-                    "↑↓ select  a add group  e edit group  d delete group  Enter open"
+                    "↑↓ select  a add host  g add group  e edit  d delete  Enter open"
                 }
                 Some(crate::app::HostGroup::Untagged) => {
-                    "↑↓ select  a add group  Enter open  / find"
+                    "↑↓ select  a add host  g add group  Enter open  / find"
                 }
-                None => "↑↓ select  a add host  e edit host  d delete host  Enter SSH  / find",
+                None => "↑↓ select  a add host  e edit host  d delete host  g tags  Enter SSH",
             }
         } else if area.width < 95 {
             "↑↓ move  Enter SSH  d delete  e edit  p password  x delete password  v view  g tags  / find"
@@ -3361,13 +3352,13 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
     } else if dialog.editing {
         action_panel(
             " EDIT HOST ",
-            "Tab / ↑↓ field  Space groups  Enter next/save  Esc cancel",
+            "Tab / ↑↓ field  Space groups  Enter save  Esc cancel",
             BORDER,
         )
     } else {
         action_panel(
             " NEW HOST ",
-            "Tab / ↑↓ field  Space groups  Enter next/save  Esc cancel",
+            "Tab / ↑↓ field  Space groups  Enter save  Esc cancel",
             BORDER,
         )
     };
@@ -3653,7 +3644,7 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
     };
     frame.render_widget(
         Paragraph::new(
-            "Use a Host alias from ~/.ssh/config, or enter an IP/domain    Tab / ↑↓ field    Enter next/save    Esc cancel",
+            "Use a Host alias from ~/.ssh/config, or enter an IP/domain    Tab / ↑↓ field    Enter save    Esc cancel",
         )
             .style(Style::default().fg(MUTED)),
         help_area,
@@ -3768,7 +3759,7 @@ fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPassw
     let title = format!(" {purpose} ");
     let block = action_panel(
         &title,
-        "Tab/↑↓ field  Space toggle  Enter next/connect  Esc cancel",
+        "Tab/↑↓ field  Space toggle  Enter connect  Esc cancel",
         GREEN,
     );
     frame.render_widget(Clear, area);
@@ -3932,7 +3923,7 @@ mod tests {
     };
 
     #[test]
-    fn host_read_only_notice_renders_as_centered_dialog() {
+    fn host_action_notice_renders_as_centered_dialog() {
         let mut metadata = crate::metadata::Metadata::default();
         metadata.tags.insert(
             "other".into(),
@@ -3940,15 +3931,14 @@ mod tests {
         );
         let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
         app.host_action_dialog = Some(crate::app::HostActionDialog {
-            title: "HOST IS READ-ONLY".into(),
-            message: "This host comes from OpenSSH configuration and cannot be deleted here."
-                .into(),
+            title: "NO SAVED PASSWORD".into(),
+            message: "No saved password is configured for this Host.".into(),
         });
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let text = format!("{}", terminal.backend());
-        assert!(text.contains("HOST IS READ-ONLY"));
-        assert!(text.contains("OpenSSH configuration"));
+        assert!(text.contains("NO SAVED PASSWORD"));
+        assert!(text.contains("No saved password"));
         assert!(text.contains("Enter/Esc close"));
     }
 
@@ -4071,14 +4061,14 @@ mod tests {
         let text = format!("{}", terminal.backend());
         assert!(text.contains("EDIT HOST"));
         assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
-        assert!(text.contains("Space groups  Enter next/save"));
+        assert!(text.contains("Space groups  Enter save"));
 
         app.host_dialog.as_mut().unwrap().editing = false;
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let text = format!("{}", terminal.backend());
         assert!(text.contains("NEW HOST"));
         assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
-        assert!(text.contains("Space groups  Enter next/save"));
+        assert!(text.contains("Space groups  Enter save"));
 
         app.host_dialog.as_mut().unwrap().tag_picker_open = true;
         app.host_dialog.as_mut().unwrap().tag_filter = "dog".into();

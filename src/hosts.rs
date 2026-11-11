@@ -138,63 +138,85 @@ impl HostCatalog {
         let Some(ssh_dir) = config_path.parent() else {
             return Ok(BTreeMap::new());
         };
+        Self::snapshot_from(&config_path, ssh_dir)
+    }
+
+    fn snapshot_from(config_path: &Path, ssh_dir: &Path) -> io::Result<BTreeMap<String, String>> {
         let mut visited = HashSet::new();
         let mut files = BTreeMap::new();
-        snapshot_file(&config_path, ssh_dir, &mut visited, &mut files)?;
+        snapshot_file(config_path, ssh_dir, &mut visited, &mut files)?;
         Ok(files)
     }
 
-    pub fn upsert_managed_from(
+    pub fn upsert_from(&mut self, host: &Host, original_alias: Option<&str>) -> io::Result<()> {
+        let path = Self::config_path()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        let ssh_dir = path
+            .parent()
+            .ok_or_else(|| io::Error::other("SSH config has no parent directory"))?;
+        self.upsert_from_paths(&path, ssh_dir, host, original_alias)
+    }
+
+    fn upsert_from_paths(
         &mut self,
+        path: &Path,
+        ssh_dir: &Path,
         host: &Host,
         original_alias: Option<&str>,
     ) -> io::Result<()> {
-        let path = Self::config_path()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-        let mut contents = match fs::read_to_string(&path) {
+        validate_host_values(host)?;
+        let files = Self::snapshot_from(path, ssh_dir)?;
+        if let Some(original_alias) = original_alias {
+            if host.alias != original_alias
+                && files.values().try_fold(false, |found, contents| {
+                    Ok::<_, io::Error>(found || host_exists(contents, &host.alias)?)
+                })?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "That SSH alias already exists.",
+                ));
+            }
+            let mut changes = Vec::new();
+            for (file, contents) in files {
+                if let Some(updated) = edit_host_block(&contents, original_alias, host)? {
+                    changes.push((file, updated));
+                }
+            }
+            if changes.len() != 1 {
+                return Err(io::Error::other(if changes.is_empty() {
+                    "Host was not found in SSH config."
+                } else {
+                    "Multiple Host blocks define this alias; edit the SSH config explicitly."
+                }));
+            }
+            let (file, updated) = changes.pop().unwrap();
+            safe_write(Path::new(&file), updated.as_bytes())?;
+            *self = Self::load_from(path, ssh_dir);
+            return Ok(());
+        }
+        if files.values().try_fold(false, |found, contents| {
+            Ok::<_, io::Error>(found || host_exists(contents, &host.alias)?)
+        })? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "That SSH alias already exists.",
+            ));
+        }
+        let mut contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
-        if let Some(original_alias) = original_alias
-            && managed_block_range(&contents, original_alias).is_none()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Original host is no longer managed by LazyTerm",
-            ));
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
         }
-        if let Some(original_alias) = original_alias
-            && original_alias != host.alias
-        {
-            let Some(range) = managed_block_range(&contents, original_alias) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Original host is not managed by LazyTerm",
-                ));
-            };
-            contents.replace_range(range, "");
+        if !contents.is_empty() {
+            contents.push('\n');
         }
-        if host_exists(&contents, &host.alias)? && original_alias != Some(host.alias.as_str()) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "That SSH alias already exists and is not managed by LazyTerm",
-            ));
-        }
-        let block = format_host_block(host);
-        if let Some(range) = managed_block_range(&contents, &host.alias) {
-            contents.replace_range(range, &block);
-        } else {
-            if !contents.is_empty() && !contents.ends_with('\n') {
-                contents.push('\n');
-            }
-            if !contents.is_empty() {
-                contents.push('\n');
-            }
-            contents.push_str(&block);
-        }
-        safe_write(&path, contents.as_bytes())?;
-        *self = Self::load();
+        contents.push_str(&format_host_block(host));
+        safe_write(path, contents.as_bytes())?;
+        *self = Self::load_from(path, ssh_dir);
         Ok(())
     }
 
@@ -305,6 +327,198 @@ fn replace_identity(contents: &str, alias: &str, path: &str) -> io::Result<Optio
     }
     result.push_str(&lines[end..].concat());
     Ok(Some(result))
+}
+
+fn validate_host_values(host: &Host) -> io::Result<()> {
+    if !is_concrete_alias(&host.alias) || host.alias.chars().any(char::is_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Host alias must be a concrete alias without whitespace.",
+        ));
+    }
+    if [
+        Some(host.alias.as_str()),
+        host.hostname.as_deref(),
+        host.user.as_deref(),
+        host.identity_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.chars().any(char::is_control))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Host values cannot contain control characters.",
+        ));
+    }
+    Ok(())
+}
+
+fn edit_host_block(
+    contents: &str,
+    original_alias: &str,
+    host: &Host,
+) -> io::Result<Option<String>> {
+    let lines = contents.split_inclusive('\n').collect::<Vec<_>>();
+    let mut block = None;
+    for (index, line) in lines.iter().enumerate() {
+        let Some((directive, aliases)) = parse_host_directive(line)? else {
+            continue;
+        };
+        if !directive.eq_ignore_ascii_case("Host")
+            || !aliases.iter().any(|alias| alias == original_alias)
+        {
+            continue;
+        }
+        if aliases.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "This Host block shares multiple aliases; split it into individual blocks before editing.",
+            ));
+        }
+        if block.is_some() {
+            return Err(io::Error::other(
+                "Multiple Host blocks define this alias; edit the SSH config explicitly.",
+            ));
+        }
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find_map(|(next_index, next_line)| {
+                let (directive, _) = parse_host_directive(next_line).ok().flatten()?;
+                (directive.eq_ignore_ascii_case("Host") || directive.eq_ignore_ascii_case("Match"))
+                    .then_some(next_index)
+            })
+            .unwrap_or(lines.len());
+        block = Some((index, end));
+    }
+    let Some((start, end)) = block else {
+        return Ok(None);
+    };
+
+    let port_value = host.port.map(|port| port.to_string());
+    let options = [
+        ("HostName", host.hostname.as_deref()),
+        ("User", host.user.as_deref()),
+        ("Port", port_value.as_deref()),
+        ("IdentityFile", host.identity_file.as_deref()),
+    ];
+    let identity_values = lines[start + 1..end]
+        .iter()
+        .filter_map(|line| {
+            let (key, rest) = config_value(line)?;
+            key.eq_ignore_ascii_case("IdentityFile").then_some(rest)
+        })
+        .flat_map(|rest| {
+            let rest = rest
+                .trim_start()
+                .strip_prefix('=')
+                .unwrap_or(rest.trim_start())
+                .trim_start();
+            shell_words::split(rest).unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let preserve_identity_values = identity_values.len() > 1
+        && host.identity_file.as_deref() == identity_values.first().map(String::as_str);
+    let mut present = std::collections::BTreeSet::new();
+    for line in &lines[start + 1..end] {
+        let Some((key, _)) = config_value(line) else {
+            continue;
+        };
+        if options
+            .iter()
+            .any(|(option, _)| option.eq_ignore_ascii_case(&key))
+        {
+            present.insert(key.to_ascii_lowercase());
+        }
+    }
+    let mut rewritten = lines[..start].concat();
+    rewritten.push_str(
+        &replace_config_value(lines[start], "Host", Some(&host.alias))
+            .expect("matched Host directive"),
+    );
+    if !rewritten.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    for (key, value) in options {
+        if let Some(value) = value
+            && !present.contains(&key.to_ascii_lowercase())
+        {
+            rewritten.push_str(&format!("    {key} {}\n", quote_config_value(value)));
+        }
+    }
+    for line in &lines[start + 1..end] {
+        let Some((key, _)) = config_value(line) else {
+            rewritten.push_str(line);
+            continue;
+        };
+        let Some((_, value)) = options
+            .iter()
+            .find(|(option, _)| option.eq_ignore_ascii_case(&key))
+        else {
+            rewritten.push_str(line);
+            continue;
+        };
+        if key.eq_ignore_ascii_case("IdentityFile") && preserve_identity_values {
+            rewritten.push_str(line);
+            continue;
+        }
+        if let Some(value) = value {
+            rewritten.push_str(&replace_config_value(line, &key, Some(value)).unwrap());
+        }
+    }
+    rewritten.push_str(&lines[end..].concat());
+    Ok(Some(rewritten))
+}
+
+fn config_value(line: &str) -> Option<(String, String)> {
+    let body = strip_comment(line);
+    let trimmed = body.trim_start();
+    let end = trimmed.find(|character: char| character.is_whitespace() || character == '=')?;
+    let key = trimmed[..end].to_string();
+    Some((key, trimmed[end..].to_string()))
+}
+
+fn replace_config_value(line: &str, expected_key: &str, value: Option<&str>) -> Option<String> {
+    let (body, newline) = if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    };
+    let comment_start = strip_comment(body).len();
+    let before_comment = &body[..comment_start];
+    let comment = &body[comment_start..];
+    let indent = before_comment.len() - before_comment.trim_start().len();
+    let trimmed = &before_comment[indent..];
+    let key_end = trimmed.find(|character: char| character.is_whitespace() || character == '=')?;
+    if !trimmed[..key_end].eq_ignore_ascii_case(expected_key) {
+        return None;
+    }
+    let key_start = indent;
+    let key_end = key_start + key_end;
+    let rest = &before_comment[key_end..];
+    let separator_len = if let Some(rest) = rest.strip_prefix('=') {
+        1 + (rest.len() - rest.trim_start().len())
+    } else {
+        rest.len() - rest.trim_start().len()
+    };
+    let value_start = key_end + separator_len;
+    let trailing_start = before_comment.trim_end().len();
+    let replacement = value?;
+    let mut updated = String::with_capacity(line.len() + replacement.len());
+    updated.push_str(&before_comment[..value_start]);
+    updated.push_str(&quote_config_value(replacement));
+    updated.push_str(&before_comment[trailing_start..]);
+    updated.push_str(comment);
+    updated.push_str(newline);
+    Some(updated)
+}
+
+fn quote_config_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn snapshot_file(
@@ -487,21 +701,25 @@ fn format_host_block(host: &Host) -> String {
         format!("Host {}", host.alias),
     ];
     if let Some(value) = &host.hostname {
-        lines.push(format!("    HostName {value}"));
+        lines.push(format!("    HostName {}", quote_config_value(value)));
     }
     if let Some(value) = &host.user {
-        lines.push(format!("    User {value}"));
+        lines.push(format!("    User {}", quote_config_value(value)));
     }
     if let Some(value) = host.port {
-        lines.push(format!("    Port {value}"));
+        lines.push(format!(
+            "    Port {}",
+            quote_config_value(&value.to_string())
+        ));
     }
     if let Some(value) = &host.identity_file {
-        lines.push(format!("    IdentityFile {value}"));
+        lines.push(format!("    IdentityFile {}", quote_config_value(value)));
     }
     lines.push(String::new());
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn managed_block_range(contents: &str, alias: &str) -> Option<std::ops::Range<usize>> {
     let lines = contents.split_inclusive('\n').collect::<Vec<_>>();
     let mut offset = 0;
@@ -839,6 +1057,154 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn editing_manual_host_preserves_other_options_and_supports_renaming() {
+        let contents = "# user comment\nHost=web # host note\n  HostName old.example\n  User deploy # keep this comment\n  Port 22\n  IdentityFile ~/.ssh/old\n  ProxyJump bastion\n  ServerAliveInterval 30\nHost next\n  User root\n";
+        let host = Host {
+            alias: "web-prod".into(),
+            hostname: Some("new.example".into()),
+            user: None,
+            port: Some(2200),
+            identity_file: Some("~/.ssh/new key".into()),
+            proxy_jump: None,
+            managed: false,
+        };
+        let updated = edit_host_block(contents, "web", &host).unwrap().unwrap();
+        assert!(updated.contains("Host=\"web-prod\" # host note\n"));
+        assert!(updated.contains("HostName \"new.example\"\n"));
+        assert!(!updated.contains("  User deploy"));
+        assert!(!updated.contains("  Port 22"));
+        assert!(updated.contains("Port \"2200\"\n"));
+        assert!(updated.contains("IdentityFile \"~/.ssh/new key\"\n"));
+        assert!(updated.contains("  ProxyJump bastion\n"));
+        assert!(updated.contains("  ServerAliveInterval 30\nHost next\n"));
+        assert!(updated.starts_with("# user comment\n"));
+    }
+
+    #[test]
+    fn edited_manual_host_config_is_accepted_by_openssh() {
+        let fixture = crate::projects::tests::Fixture::new("edit-manual-ssh-config");
+        let config = fixture.root.join("config");
+        let host = Host {
+            alias: "web".into(),
+            hostname: Some("new.example".into()),
+            user: Some("deploy".into()),
+            port: Some(2200),
+            identity_file: Some(fixture.root.join("key file").display().to_string()),
+            proxy_jump: None,
+            managed: false,
+        };
+        let contents = edit_host_block(
+            "Host web\n  User old\n  Port 22\n  ProxyJump bastion\n",
+            "web",
+            &host,
+        )
+        .unwrap()
+        .unwrap();
+        fs::write(&config, contents).unwrap();
+        let output = Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(&config)
+            .arg("web")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let resolved = String::from_utf8_lossy(&output.stdout);
+        assert!(resolved.lines().any(|line| line == "hostname new.example"));
+        assert!(resolved.lines().any(|line| line == "user deploy"));
+        assert!(resolved.lines().any(|line| line == "port 2200"));
+        assert!(resolved.lines().any(
+            |line| line == format!("identityfile {}", fixture.root.join("key file").display())
+        ));
+        assert!(resolved.lines().any(|line| line == "proxyjump bastion"));
+    }
+
+    #[test]
+    fn editing_host_from_include_updates_its_original_file() {
+        let fixture = crate::projects::tests::Fixture::new("edit-host-include");
+        let ssh_dir = fixture.root.join(".ssh");
+        let include_dir = ssh_dir.join("config.d");
+        fs::create_dir_all(&include_dir).unwrap();
+        let config = ssh_dir.join("config");
+        let included = include_dir.join("work.conf");
+        fs::write(
+            &config,
+            "Include config.d/*.conf\nHost root-host\n  User root\n",
+        )
+        .unwrap();
+        fs::write(
+            &included,
+            "Host web\n  HostName old.example\n  User deploy\n  ProxyJump bastion\n",
+        )
+        .unwrap();
+        let mut catalog = HostCatalog::load_from(&config, &ssh_dir);
+        assert!(catalog.hosts.iter().any(|host| host.alias == "web"));
+        let host = Host {
+            alias: "web".into(),
+            hostname: Some("new.example".into()),
+            user: Some("ops".into()),
+            port: Some(2200),
+            identity_file: None,
+            proxy_jump: None,
+            managed: false,
+        };
+
+        catalog
+            .upsert_from_paths(&config, &ssh_dir, &host, Some("web"))
+            .unwrap();
+
+        let updated = fs::read_to_string(&included).unwrap();
+        assert!(updated.contains("HostName \"new.example\""));
+        assert!(updated.contains("User \"ops\""));
+        assert!(updated.contains("Port \"2200\""));
+        assert!(!updated.contains("IdentityFile"));
+        assert!(updated.contains("ProxyJump bastion"));
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "Include config.d/*.conf\nHost root-host\n  User root\n"
+        );
+    }
+
+    #[test]
+    fn manual_host_edit_rejects_shared_or_ambiguous_host_blocks() {
+        let host = Host {
+            alias: "renamed".into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_file: None,
+            proxy_jump: None,
+            managed: false,
+        };
+        assert!(edit_host_block("Host web api\n  User deploy\n", "web", &host).is_err());
+        assert!(
+            edit_host_block(
+                "Host web\n  User deploy\nHost web\n  User root\n",
+                "web",
+                &host
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn editing_other_host_fields_preserves_multiple_identity_files() {
+        let contents = "Host web\n  HostName old.example\n  IdentityFile ~/.ssh/primary\n  IdentityFile ~/.ssh/backup\n";
+        let host = Host {
+            alias: "web".into(),
+            hostname: Some("new.example".into()),
+            user: None,
+            port: None,
+            identity_file: Some("~/.ssh/primary".into()),
+            proxy_jump: None,
+            managed: false,
+        };
+        let updated = edit_host_block(contents, "web", &host).unwrap().unwrap();
+        assert!(updated.contains("HostName \"new.example\""));
+        assert!(updated.contains("IdentityFile ~/.ssh/primary\n"));
+        assert!(updated.contains("IdentityFile ~/.ssh/backup\n"));
     }
 
     #[test]

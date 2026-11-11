@@ -84,7 +84,7 @@ mod tests {
         app.handle_credentials_key(KeyCode::Char('a'));
         let form = app.credential_manager.form.as_mut().unwrap();
         form.fields = vec!["Production".into(), "deploy".into(), secret.into()];
-        form.selected = 2;
+        form.selected = 0;
         app.handle_credentials_key(KeyCode::Enter);
         finish(app);
     }
@@ -459,6 +459,7 @@ mod tests {
                 .contains("IdentityFile is saved")
         );
         app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         for character in "new password".chars() {
             app.handle_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
@@ -1694,13 +1695,7 @@ impl App {
                     form.selected = (form.selected + count - 1) % count
                 }
                 KeyCode::Down | KeyCode::Tab => form.selected = (form.selected + 1) % count,
-                KeyCode::Enter => {
-                    if form.selected + 1 == count {
-                        self.save_credential_form();
-                    } else {
-                        form.selected += 1;
-                    }
-                }
+                KeyCode::Enter => self.save_credential_form(),
                 KeyCode::Backspace => {
                     form.fields[form.selected].pop();
                 }

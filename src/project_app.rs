@@ -1334,9 +1334,6 @@ impl App {
             KeyCode::Char(value) if !value.is_control() && choices.is_empty() => {
                 form.fields[form.selected].push(value)
             }
-            KeyCode::Enter if !form.link_form && form.selected + 1 < form.fields.len() => {
-                form.selected += 1
-            }
             KeyCode::Enter => {
                 let mut form = self.workspace.form.take().expect("checked");
                 if form.link_form && !form.fields.get(3).is_none_or(String::is_empty) {
@@ -2373,7 +2370,7 @@ mod tests {
         let form = app.workspace.form.as_mut().unwrap();
         assert_eq!(form.labels().len(), 6);
         form.fields = vec!["Preview".into(), "http://localhost:3000/".into()];
-        form.selected = 1;
+        form.selected = 0;
         app.handle_workspace_dialog(KeyCode::Enter);
         assert!(app.workspace.form.is_none());
         assert_eq!(app.selected_project_link().unwrap().name, "Preview");

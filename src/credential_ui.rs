@@ -406,7 +406,7 @@ fn render_overlays(frame: &mut Frame, app: &App) {
             rows[2],
         );
         frame.render_widget(
-            Paragraph::new("Tab / Up / Down field   Enter next/save   Esc cancel")
+            Paragraph::new("Tab / Up / Down field   Enter save   Esc cancel")
                 .style(Style::default().fg(MUTED)),
             rows[3],
         );
