@@ -3133,11 +3133,25 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "Type to filter current pane   ↑↓ move   ← parent   → open   Enter apply   Esc clear"
     } else if app.section == NavSection::Hosts {
         if area.width < 75 && app.showing_groups() {
-            "A group  E edit  D del  d delete host  Enter"
+            match app.selected_group() {
+                Some(crate::app::HostGroup::Tag(_)) => {
+                    "a add group  e edit group  d delete group  Enter open"
+                }
+                Some(crate::app::HostGroup::Untagged) => "a add group  Enter open",
+                None => "a add host  e edit  d delete  Enter SSH",
+            }
         } else if area.width < 75 {
             "d delete  e edit  p password  x delete password  Enter SSH"
         } else if app.showing_groups() {
-            "↑↓ select  Enter open/SSH  A add group  E edit group  D delete group  d delete host  e edit host  a add host  / find"
+            match app.selected_group() {
+                Some(crate::app::HostGroup::Tag(_)) => {
+                    "↑↓ select  a add group  e edit group  d delete group  Enter open"
+                }
+                Some(crate::app::HostGroup::Untagged) => {
+                    "↑↓ select  a add group  Enter open  / find"
+                }
+                None => "↑↓ select  a add host  e edit host  d delete host  Enter SSH  / find",
+            }
         } else if area.width < 95 {
             "↑↓ move  Enter SSH  d delete  e edit  p password  x delete password  v view  g tags  / find"
         } else {

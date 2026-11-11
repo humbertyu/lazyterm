@@ -3725,14 +3725,22 @@ impl App {
                 }
             }
             KeyCode::Char('r') if self.section == NavSection::Hosts => self.refresh_hosts(),
-            KeyCode::Char('A') if self.section == NavSection::Hosts && self.showing_groups() => {
+            KeyCode::Char('a')
+                if self.section == NavSection::Hosts
+                    && self.showing_groups()
+                    && self.selected_group().is_some() =>
+            {
                 self.host_group_dialog = Some(HostGroupDialog {
                     name: String::new(),
                     original_name: None,
                     deleting: false,
                 });
             }
-            KeyCode::Char('E') if self.section == NavSection::Hosts && self.showing_groups() => {
+            KeyCode::Char('e')
+                if self.section == NavSection::Hosts
+                    && self.showing_groups()
+                    && self.selected_group().is_some() =>
+            {
                 if let Some(HostGroup::Tag(name)) = self.selected_group() {
                     self.host_group_dialog = Some(HostGroupDialog {
                         name: name.clone(),
@@ -3741,7 +3749,11 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('D') if self.section == NavSection::Hosts && self.showing_groups() => {
+            KeyCode::Char('d')
+                if self.section == NavSection::Hosts
+                    && self.showing_groups()
+                    && self.selected_group().is_some() =>
+            {
                 if let Some(HostGroup::Tag(name)) = self.selected_group() {
                     self.host_group_dialog = Some(HostGroupDialog {
                         name: name.clone(),
@@ -6312,7 +6324,7 @@ mod tests {
         app.metadata_save_path = Some(fixture.root.join("hosts.json"));
         app.section = NavSection::Hosts;
 
-        app.handle_key(KeyCode::Char('A'));
+        app.handle_key(KeyCode::Char('a'));
         for character in "temporary".chars() {
             app.handle_key(KeyCode::Char(character));
         }
@@ -6324,7 +6336,7 @@ mod tests {
             .iter()
             .position(|group| group == &HostGroup::Tag("prod".into()))
             .unwrap();
-        app.handle_key(KeyCode::Char('E'));
+        app.handle_key(KeyCode::Char('e'));
         app.host_group_dialog.as_mut().unwrap().name = "production".into();
         app.handle_key(KeyCode::Enter);
         assert!(app.metadata.host_groups.contains(&"production".into()));
@@ -6337,7 +6349,7 @@ mod tests {
             .iter()
             .position(|group| group == &HostGroup::Tag("production".into()))
             .unwrap();
-        app.handle_key(KeyCode::Char('D'));
+        app.handle_key(KeyCode::Char('d'));
         app.handle_key(KeyCode::Enter);
         assert!(!app.metadata.host_groups.contains(&"production".into()));
         assert_eq!(app.metadata.tags["web"], ["work"]);
