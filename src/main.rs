@@ -78,6 +78,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         app.poll_projects();
         app.poll_runtime();
         app.poll_credentials();
+        app.update_toast();
         let size = terminal.size()?;
         app.viewport_width = size.width;
         app.viewport_height = size.height;

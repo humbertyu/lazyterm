@@ -63,6 +63,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         NavSection::Credentials => crate::credential_ui::render_page(frame, page[2], app),
         NavSection::Settings => render_settings(frame, page[2], app),
     }
+    render_toast(frame, app);
     render_footer(frame, page[3], app);
     render_dialogs(frame, app);
 }
@@ -74,8 +75,51 @@ fn page_layout() -> Layout {
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Min(8),
-            Constraint::Length(3),
+            Constraint::Length(2),
         ])
+}
+
+fn render_toast(frame: &mut Frame, app: &App) {
+    let Some(toast) = app
+        .toast
+        .as_ref()
+        .filter(|toast| toast.expires_at > std::time::Instant::now())
+    else {
+        return;
+    };
+    let screen = frame.area();
+    let max_width = screen.width.saturating_sub(2).min(58);
+    if max_width < 12 {
+        return;
+    }
+    let text_width = toast
+        .message
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0) as u16)
+        .sum::<u16>();
+    let width = text_width.saturating_add(6).min(max_width).max(12);
+    let height = 4.min(screen.height.saturating_sub(4));
+    if height < 3 {
+        return;
+    }
+    let area = Rect {
+        x: screen.x + screen.width - width - 1,
+        y: screen.y + 3,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  • ", Style::default().fg(MUTED)),
+            Span::styled(toast.message.as_str(), Style::default().fg(TEXT)),
+            Span::raw("  "),
+        ]))
+        .style(Style::default().bg(PANEL))
+        .block(Block::default().style(Style::default().bg(PANEL)))
+        .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn render_dialogs(frame: &mut Frame, app: &App) {
@@ -2432,10 +2476,12 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
             vertical[1],
         );
 
-        let recent = app.notice.as_deref().unwrap_or("No session history yet.");
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled(recent, Style::default().fg(MUTED))),
+                Line::from(Span::styled(
+                    "No session history yet.",
+                    Style::default().fg(MUTED),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Enter connects using the system OpenSSH client.",
@@ -2447,13 +2493,13 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
             vertical[2],
         );
     } else {
-        let message = app.hosts.error.as_deref().unwrap_or({
-            if app.search_query.is_empty() && app.hosts.hosts.is_empty() {
-                "Add a Host alias to ~/.ssh/config, then press r to reload."
-            } else {
-                "No hosts match the current search."
-            }
-        });
+        let message = if let Some(error) = app.hosts.error.as_deref() {
+            error
+        } else if app.search_query.is_empty() && app.hosts.hosts.is_empty() {
+            "Add a Host alias to ~/.ssh/config, then press r to reload."
+        } else {
+            "No hosts match the current search."
+        };
         frame.render_widget(
             Paragraph::new(message)
                 .style(Style::default().fg(MUTED))
@@ -3203,39 +3249,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(
-                if app.tunnel_dialog.is_some()
-                    || app.host_dialog.is_some()
-                    || app.host_group_dialog.is_some()
-                    || app.host_action_dialog.is_some()
-                    || app.tags_dialog.is_some()
-                    || app.file_dialog.is_some()
-                    || app.snippet_dialog.is_some()
-                    || app.package_dialog.is_some()
-                    || app.snippet_confirmation.is_some()
-                    || app.snippet_delete_confirmation.is_some()
-                    || app.runtime_host_picker_open
-                    || app.runtime_kill_confirmation.is_some()
-                    || app.workspace.form.is_some()
-                    || app.workspace.delete.is_some()
-                    || app.workspace.confirmation.is_some()
-                    || app.credential_manager.confirm_upload.is_some()
-                    || app.credential_manager.deleting
-                {
-                    ""
-                } else if app.searching {
-                    "Ctrl+Left/Right tabs  [,] settings"
-                } else {
-                    navigation
-                },
-            ),
+            Line::from(if app.searching {
+                "Ctrl+Left/Right tabs  [,] settings"
+            } else {
+                navigation
+            }),
             Line::from(hint),
-            Line::from(
-                app.notice
-                    .as_deref()
-                    .or(app.hosts.error.as_deref())
-                    .unwrap_or(""),
-            ),
         ])
         .style(Style::default().fg(MUTED)),
         area,
@@ -3940,6 +3959,60 @@ mod tests {
         assert!(text.contains("NO SAVED PASSWORD"));
         assert!(text.contains("No saved password"));
         assert!(text.contains("Enter/Esc close"));
+    }
+
+    #[test]
+    fn notices_render_as_a_transient_upper_right_toast_without_reserving_layout() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.notice = Some("Saved host demo.".into());
+        app.update_toast();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = format!("{}", terminal.backend());
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(lines[3].contains("Saved host demo."));
+        assert!(!lines[3].contains("┌"));
+        assert_eq!(
+            text.matches("Saved host demo.").count(),
+            1,
+            "notices should render once in the toast"
+        );
+        assert!(lines[22].contains("1-7 tabs"));
+        assert!(!lines[22].contains("Saved host demo."));
+    }
+
+    #[test]
+    fn ssh_config_errors_remain_in_the_hosts_page_not_the_toast() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.hosts.error = Some("Could not parse SSH config.".into());
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = format!("{}", terminal.backend());
+        assert_eq!(text.matches("Could not parse SSH config.").count(), 1);
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn expired_toasts_are_not_rendered() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.toast = Some(crate::app::ToastNotice {
+            message: "Saved host demo.".into(),
+            expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(!format!("{}", terminal.backend()).contains("Saved host demo."));
     }
 
     #[test]

@@ -83,7 +83,6 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
     };
     let rows = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(3),
         Constraint::Length(if inner.width < 84 { 4 } else { 2 }),
     ])
     .split(inner);
@@ -211,17 +210,6 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
             .block(panel(" DETAILS ")),
         content[1],
     );
-    let message = if state.deleting || state.confirm_upload.is_some() {
-        ""
-    } else {
-        state.message.as_deref().unwrap_or("")
-    };
-    frame.render_widget(
-        Paragraph::new(message)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(ACCENT)),
-        rows[1],
-    );
     let help = if state.ssh_key_only {
         format!(
             "Host: {}  Enter configure SSH key  u upload public key\nEsc back",
@@ -244,7 +232,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(help)
             .style(Style::default().fg(MUTED))
             .wrap(Wrap { trim: false }),
-        rows[2],
+        rows[1],
     );
 }
 

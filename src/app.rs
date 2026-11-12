@@ -216,6 +216,9 @@ pub struct App {
     pub searching: bool,
     pub should_quit: bool,
     pub notice: Option<String>,
+    pub toast: Option<ToastNotice>,
+    observed_toast_message: Option<String>,
+    observed_toast_from_credentials: bool,
     pub connection_dialog: Option<ConnectionDialog>,
     pub host_password_dialog: Option<HostPasswordDialog>,
     pending_host_password: Option<SubmittedHostPassword>,
@@ -297,6 +300,11 @@ pub struct App {
     next_snippet_run_id: u64,
     tunnel_errors: std::collections::HashMap<u64, String>,
     tunnel_retries: std::collections::HashMap<u64, TunnelRetry>,
+}
+
+pub struct ToastNotice {
+    pub message: String,
+    pub expires_at: Instant,
 }
 
 struct TunnelRetry {
@@ -533,6 +541,50 @@ pub enum InputAction {
 }
 
 impl App {
+    pub fn update_toast(&mut self) {
+        let credential_message = if self.credential_manager.open {
+            self.credential_manager.message.as_deref()
+        } else {
+            None
+        };
+        let (message, from_credentials) = credential_message
+            .map(|message| (Some(message), true))
+            .unwrap_or((self.notice.as_deref(), false));
+        match message {
+            Some(message)
+                if self.observed_toast_message.as_deref() != Some(message)
+                    || self.observed_toast_from_credentials != from_credentials =>
+            {
+                self.observed_toast_message = Some(message.to_string());
+                self.observed_toast_from_credentials = from_credentials;
+                self.toast = Some(ToastNotice {
+                    message: message.to_string(),
+                    expires_at: Instant::now() + Duration::from_secs(4),
+                });
+            }
+            None => {
+                self.observed_toast_message = None;
+                self.observed_toast_from_credentials = false;
+                self.toast = None;
+            }
+            _ => {}
+        }
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.expires_at <= Instant::now())
+        {
+            self.toast = None;
+            if !self.observed_toast_from_credentials
+                && self.notice.as_deref() == self.observed_toast_message.as_deref()
+            {
+                self.notice = None;
+                self.observed_toast_message = None;
+                self.observed_toast_from_credentials = false;
+            }
+        }
+    }
+
     pub fn new() -> Self {
         let mut app = Self::with_catalog(HostCatalog::load(), Metadata::load());
         app.reconcile_metadata();
@@ -581,6 +633,9 @@ impl App {
             searching: false,
             should_quit: false,
             notice,
+            toast: None,
+            observed_toast_message: None,
+            observed_toast_from_credentials: false,
             connection_dialog: None,
             host_password_dialog: None,
             pending_host_password: None,
@@ -5310,6 +5365,24 @@ mod tests {
         app.metadata_error = true;
         app.viewport_width = 32;
         app
+    }
+
+    #[test]
+    fn toast_reappears_when_the_same_message_changes_source() {
+        let mut app = app_fixture();
+        app.notice = Some("Saved.".into());
+        app.update_toast();
+        let global_expiry = app.toast.as_ref().unwrap().expires_at;
+
+        app.credential_manager.open = true;
+        app.credential_manager.message = Some("Saved.".into());
+        app.update_toast();
+        assert!(app.toast.as_ref().unwrap().expires_at > global_expiry);
+
+        let credential_expiry = app.toast.as_ref().unwrap().expires_at;
+        app.credential_manager.open = false;
+        app.update_toast();
+        assert!(app.toast.as_ref().unwrap().expires_at > credential_expiry);
     }
 
     #[test]
