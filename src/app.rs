@@ -265,7 +265,7 @@ pub struct App {
     pub runtime_kill_confirmation: Option<RuntimeEntry>,
     pub runtime_force_kill_confirmation: Option<RuntimeEntry>,
     pub selected_tunnel: usize,
-    pub tunnel_statuses: std::collections::HashMap<u64, TunnelStatus>,
+    pub tunnel_statuses: std::collections::HashMap<uuid::Uuid, TunnelStatus>,
     pub metadata: Metadata,
     pub metadata_error: bool,
     #[cfg(test)]
@@ -302,11 +302,11 @@ pub struct App {
     tunnel_receiver: Receiver<tunnel::TunnelEvent>,
     runtime_sender: Sender<RuntimeEvent>,
     runtime_receiver: Receiver<RuntimeEvent>,
-    tunnel_processes: std::collections::HashMap<u64, Child>,
+    tunnel_processes: std::collections::HashMap<uuid::Uuid, Child>,
     snippet_processes: std::collections::HashMap<u64, SnippetProcess>,
     next_snippet_run_id: u64,
-    tunnel_errors: std::collections::HashMap<u64, String>,
-    tunnel_retries: std::collections::HashMap<u64, TunnelRetry>,
+    tunnel_errors: std::collections::HashMap<uuid::Uuid, String>,
+    tunnel_retries: std::collections::HashMap<uuid::Uuid, TunnelRetry>,
 }
 
 fn configuration_export_bytes(
@@ -442,21 +442,21 @@ pub struct HostActionDialog {
 pub struct TunnelDialog {
     pub fields: [String; 8],
     pub kind: TunnelKind,
-    pub editing_id: Option<u64>,
+    pub editing_id: Option<uuid::Uuid>,
     pub selected_field: usize,
     pub deleting: bool,
 }
 
 pub struct SnippetDialog {
     pub fields: [String; 4],
-    pub package_id: u64,
-    pub editing_id: Option<u64>,
+    pub package_id: uuid::Uuid,
+    pub editing_id: Option<uuid::Uuid>,
     pub selected_field: usize,
 }
 
 pub struct PackageDialog {
     pub fields: [String; 2],
-    pub editing_id: Option<u64>,
+    pub editing_id: Option<uuid::Uuid>,
     pub selected_field: usize,
 }
 
@@ -571,12 +571,12 @@ pub struct PendingSnippetRun {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SnippetDeleteTarget {
     Package {
-        id: u64,
+        id: uuid::Uuid,
         name: String,
     },
     Snippet {
-        package_id: u64,
-        id: u64,
+        package_id: uuid::Uuid,
+        id: uuid::Uuid,
         name: String,
     },
 }
@@ -2410,7 +2410,7 @@ impl App {
         }
     }
 
-    fn stop_tunnel(&mut self, id: u64) {
+    fn stop_tunnel(&mut self, id: uuid::Uuid) {
         if let Some(mut child) = self.tunnel_processes.remove(&id) {
             let _ = child.kill();
             let _ = child.wait();
@@ -3847,9 +3847,17 @@ impl App {
         archive: CredentialImport,
         export_password: Zeroizing<String>,
     ) -> Result<usize, String> {
+        let imported_count = archive.credentials.len();
         let mut replacements: Vec<KeychainReplacement> = Vec::new();
         let mut updated_metadata = None;
         for mut record in archive.credentials {
+            if let Some(target) = self
+                .metadata
+                .credential_import_targets
+                .get(&record.reference)
+            {
+                record.reference = target.clone();
+            }
             if crate::project_credentials::valid_password_reference(&record.reference) {
                 let old = crate::project_credentials::read_optional_password(&record.reference)?;
                 replacements.push((
@@ -3866,10 +3874,10 @@ impl App {
                 );
             };
             let project_id = project_id
-                .parse::<u64>()
+                .parse::<uuid::Uuid>()
                 .map_err(|_| "Credential file contains an invalid Project reference.")?;
             let link_id = link_id
-                .parse::<u64>()
+                .parse::<uuid::Uuid>()
                 .map_err(|_| "Credential file contains an invalid Web Link reference.")?;
             let metadata = updated_metadata.get_or_insert_with(|| self.metadata.clone());
             let Some(link) = metadata
@@ -3966,7 +3974,7 @@ impl App {
                 };
             }
         }
-        Ok(replacements.len())
+        Ok(imported_count)
     }
 
     fn handle_credential_import_key(&mut self, key: KeyCode) {
@@ -4573,7 +4581,7 @@ impl App {
         InputAction::None
     }
 
-    fn open_snippet_form(&mut self, package_id: u64, snippet: Option<SnippetDefinition>) {
+    fn open_snippet_form(&mut self, package_id: uuid::Uuid, snippet: Option<SnippetDefinition>) {
         let editing_id = snippet.as_ref().map(|item| item.id);
         self.snippet_dialog = Some(SnippetDialog {
             fields: snippet.map_or_else(
@@ -4671,15 +4679,7 @@ impl App {
                     self.package_dialog = Some(dialog);
                     return;
                 }
-                let id = dialog.editing_id.unwrap_or_else(|| {
-                    self.metadata
-                        .snippet_packages
-                        .iter()
-                        .map(|package| package.id)
-                        .max()
-                        .unwrap_or_default()
-                        .saturating_add(1)
-                });
+                let id = dialog.editing_id.unwrap_or_else(uuid::Uuid::new_v4);
                 let package = SnippetPackage {
                     id,
                     name: name.to_string(),
@@ -4746,16 +4746,7 @@ impl App {
                     return;
                 }
                 let dangerous = dialog.fields[3].parse::<bool>().unwrap_or(false);
-                let id = dialog.editing_id.unwrap_or_else(|| {
-                    self.metadata
-                        .snippet_packages
-                        .iter()
-                        .flat_map(|package| package.snippets.iter())
-                        .map(|snippet| snippet.id)
-                        .max()
-                        .unwrap_or_default()
-                        .saturating_add(1)
-                });
+                let id = dialog.editing_id.unwrap_or_else(uuid::Uuid::new_v4);
                 let snippet = SnippetDefinition {
                     id,
                     name: name.to_string(),
@@ -4774,7 +4765,6 @@ impl App {
                     } else {
                         package.snippets.push(snippet);
                     }
-                    package.snippets.sort_by_key(|item| item.id);
                     self.notice = Some(format!("Saved snippet {name}."));
                     self.save_metadata();
                 }
@@ -5178,15 +5168,7 @@ impl App {
                     return;
                 }
                 let custom_host = !self.hosts.hosts.iter().any(|host| host.alias == host_alias);
-                let id = dialog.editing_id.unwrap_or_else(|| {
-                    self.metadata
-                        .tunnels
-                        .iter()
-                        .map(|tunnel| tunnel.id)
-                        .max()
-                        .unwrap_or_default()
-                        .saturating_add(1)
-                });
+                let id = dialog.editing_id.unwrap_or_else(uuid::Uuid::new_v4);
                 if dialog.editing_id.is_some() {
                     self.stop_tunnel(id);
                 }
@@ -5214,7 +5196,6 @@ impl App {
                 } else {
                     self.metadata.tunnels.push(tunnel);
                 }
-                self.metadata.tunnels.sort_by_key(|tunnel| tunnel.id);
                 self.selected_tunnel = self
                     .metadata
                     .tunnels
@@ -6149,6 +6130,50 @@ mod tests {
     }
 
     #[test]
+    fn credential_import_uses_link_targets_remapped_by_configuration_merge() {
+        let fixture = crate::projects::tests::Fixture::new("remapped-credential-import");
+        let mut app = app_fixture();
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("lazyterm/hosts.json"));
+        let mut project = fixture.project.clone();
+        project.id = uuid::Uuid::from_u128(10);
+        project.links.push(crate::projects::ProjectLink {
+            id: uuid::Uuid::from_u128(20),
+            name: "Home".into(),
+            url: "http://localhost:3000/".into(),
+            password_storage: crate::projects::PasswordStorage::Config,
+            ..Default::default()
+        });
+        let imported_project_id = project.id;
+        app.metadata.projects.push(project);
+        app.metadata.credential_import_targets.insert(
+            "config:1:1".into(),
+            format!(
+                "config:{}:{}",
+                imported_project_id,
+                uuid::Uuid::from_u128(20)
+            ),
+        );
+        let count = app
+            .apply_credential_archive(
+                CredentialImport {
+                    format_version: 1,
+                    credentials: vec![ImportedCredentialRecord {
+                        reference: "config:1:1".into(),
+                        password: "imported-test-secret".into(),
+                    }],
+                },
+                Zeroizing::new("archive-password".into()),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            app.metadata.projects[0].links[0].password.as_deref(),
+            Some("imported-test-secret")
+        );
+    }
+
+    #[test]
     fn credential_import_rejects_wrong_password_and_replaces_keychain_with_encrypted_backup() {
         let reference = format!("credential-{}", "a".repeat(64));
         crate::project_credentials::replace_password(&reference, "old-secret").unwrap();
@@ -6207,9 +6232,10 @@ mod tests {
         metadata
             .tags
             .insert("web".into(), vec!["production".into()]);
-        metadata.host_passwords.insert("web".into(), 7);
+        let credential_id = uuid::Uuid::from_u128(7);
+        metadata.host_passwords.insert("web".into(), credential_id);
         metadata.credentials.push(crate::credentials::Credential {
-            id: 7,
+            id: credential_id,
             name: "web password".into(),
             kind: crate::credentials::CredentialKind::Password,
             username: "deploy".into(),
@@ -6219,7 +6245,7 @@ mod tests {
             fingerprint: String::new(),
         });
         metadata.tunnels.push(crate::metadata::TunnelDefinition {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             label: "database".into(),
             host_alias: "web".into(),
             custom_host: false,
@@ -6236,11 +6262,11 @@ mod tests {
         metadata
             .snippet_packages
             .push(crate::metadata::SnippetPackage {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "Operations".into(),
                 description: String::new(),
                 snippets: vec![crate::metadata::SnippetDefinition {
-                    id: 1,
+                    id: uuid::Uuid::from_u128(1),
                     name: "Health".into(),
                     command: "uptime".into(),
                     description: String::new(),
@@ -6250,7 +6276,7 @@ mod tests {
         let mut project = fixture.project.clone();
         project.commands.push(fixture.command("npm run start"));
         project.links.push(crate::projects::ProjectLink {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Admin".into(),
             url: "https://example.invalid/admin".into(),
             username: "admin".into(),
@@ -6297,7 +6323,10 @@ mod tests {
         assert_eq!(json["ssh_config_files"][include_path], include_config);
         assert_eq!(json["hosts"][0]["proxy_jump"], "bastion");
         assert_eq!(json["metadata"]["host_groups"][0], "production");
-        assert_eq!(json["metadata"]["host_passwords"]["web"], 7);
+        assert_eq!(
+            json["metadata"]["host_passwords"]["web"],
+            credential_id.to_string()
+        );
         assert_eq!(
             json["metadata"]["credentials"][0]["password_ref"],
             "credential-reference"
@@ -6494,19 +6523,20 @@ mod tests {
             .unwrap();
         until(&mut app.project_service, |s| !s.active(key));
         let previous_run = app.project_service.tasks[&key].owner.run_id;
-        press(&mut app, KeyCode::F(6), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('6'), KeyModifiers::NONE);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         wait_for_workspace(&mut app, |app| !app.external_project_runs(key).is_empty());
         let (_, port) = external.fixture.ready().unwrap();
         assert!(app.project_is_running(key));
         assert!(app.external_project_runs(key)[0].ports.contains(&port));
+        app.viewport_width = 120;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         terminal
             .draw(|frame| crate::ui::render(frame, &app))
             .unwrap();
         let text = format!("{}", terminal.backend());
-        assert!(text.contains("external running"));
+        assert!(text.contains("external running"), "{text}");
         assert!(text.contains("last run: exit 1"));
         press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
         wait_for_workspace(&mut app, |app| {
@@ -6517,7 +6547,7 @@ mod tests {
         assert_eq!(app.project_service.tasks[&key].owner.run_id, previous_run);
         assert!(!app.project_service.active(key));
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
-        press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('5'), KeyModifiers::NONE);
         wait_for_workspace(&mut app, |app| !app.runtime_loading);
         app.selected_runtime = app
             .visible_runtime_entries()
@@ -6589,7 +6619,7 @@ mod tests {
             let mut project = fixture.project.clone();
             project.commands.push(command);
             app.metadata.projects.push(project);
-            press(&mut app, KeyCode::F(6), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('6'), KeyModifiers::NONE);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -6597,7 +6627,12 @@ mod tests {
                 app.poll_projects();
                 assert!(
                     Instant::now() < deadline,
-                    "Project start preflight timed out"
+                    "Project start preflight timed out: notice={:?}, checking={}, generation={}, completed={}, error={:?}",
+                    app.notice,
+                    app.workspace.monitor.checking,
+                    app.workspace.monitor.generation,
+                    app.workspace.monitor.completed,
+                    app.workspace.monitor.error
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -6620,7 +6655,7 @@ mod tests {
                 app.workspace.form.is_none(),
                 "Live commands must not be edited"
             );
-            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('5'), KeyModifiers::NONE);
             let deadline = Instant::now() + Duration::from_secs(30);
             while app.runtime_loading {
                 app.project_service.poll();
@@ -8421,19 +8456,19 @@ mod tests {
     fn snippets_queue_targets_and_confirm_dangerous_commands() {
         let mut app = app_fixture();
         app.metadata.snippet_packages.push(SnippetPackage {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Ops".into(),
             description: String::new(),
             snippets: vec![
                 SnippetDefinition {
-                    id: 1,
+                    id: uuid::Uuid::from_u128(1),
                     name: "status".into(),
                     command: "uptime".into(),
                     description: String::new(),
                     dangerous: false,
                 },
                 SnippetDefinition {
-                    id: 2,
+                    id: uuid::Uuid::from_u128(2),
                     name: "restart".into(),
                     command: "sudo reboot".into(),
                     description: String::new(),
@@ -8476,11 +8511,11 @@ mod tests {
     fn snippets_can_delete_a_snippet_and_a_package_after_confirmation() {
         let mut app = app_fixture();
         app.metadata.snippet_packages.push(SnippetPackage {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Ops".into(),
             description: String::new(),
             snippets: vec![SnippetDefinition {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "status".into(),
                 command: "uptime".into(),
                 description: String::new(),

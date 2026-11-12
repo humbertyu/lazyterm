@@ -33,7 +33,7 @@ pub fn configure_host_auth(command: &mut Command, auth: &HostAuth, alias: &str) 
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Credential {
-    pub id: u64,
+    pub id: crate::projects::EntityId,
     pub name: String,
     pub kind: CredentialKind,
     #[serde(default)]
@@ -51,7 +51,10 @@ pub struct Credential {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CredentialSource {
     Managed,
-    ProjectLink { project_id: u64, link_id: u64 },
+    ProjectLink {
+        project_id: crate::projects::EntityId,
+        link_id: crate::projects::EntityId,
+    },
     DiscoveredKey,
 }
 
@@ -77,7 +80,7 @@ pub fn same_path(left: &Path, right: &Path) -> bool {
         == fs::canonicalize(right).unwrap_or_else(|_| right.into())
 }
 
-pub fn import_key(path: &Path, id: u64, name: String) -> Result<Credential, String> {
+pub fn import_key(path: &Path, id: uuid::Uuid, name: String) -> Result<Credential, String> {
     if !path.is_file() {
         return Err("Private key file does not exist.".into());
     }
@@ -140,7 +143,7 @@ pub fn discover_keys_in(directory: &Path) -> Vec<Credential> {
             validate_public_key(&public_key).ok()?;
             let fingerprint = key_fingerprint(&public_path).ok()?;
             Some(Credential {
-                id: 0,
+                id: uuid::Uuid::nil(),
                 name: private_name.to_string(),
                 kind: CredentialKind::SshKey,
                 username: String::new(),
@@ -174,7 +177,7 @@ fn key_fingerprint(path: &Path) -> Result<String, String> {
 }
 
 // Reserve a new private directory so ssh-keygen can never overwrite an existing key.
-pub fn generate_key(directory: &Path, id: u64, name: String) -> Result<Credential, String> {
+pub fn generate_key(directory: &Path, id: uuid::Uuid, name: String) -> Result<Credential, String> {
     if !directory.is_absolute() {
         return Err("Use an absolute directory or ~/path.".into());
     }
@@ -499,11 +502,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let key = generate_key(&root, 1, "test".into()).unwrap();
+        let key = generate_key(&root, uuid::Uuid::from_u128(1), "test".into()).unwrap();
         assert!(key.fingerprint.starts_with("SHA256:"));
         assert!(key.public_key.starts_with("ssh-ed25519 "));
         let original = fs::read(key.private_key_path.as_ref().unwrap()).unwrap();
-        assert!(generate_key(&root, 2, "replace".into()).is_err());
+        assert!(generate_key(&root, uuid::Uuid::from_u128(2), "replace".into()).is_err());
         assert_eq!(
             fs::read(key.private_key_path.as_ref().unwrap()).unwrap(),
             original
@@ -524,9 +527,21 @@ mod tests {
                 0o600
             );
         }
-        let other = generate_key(&root.join("other"), 2, "other".into()).unwrap();
+        let other = generate_key(
+            &root.join("other"),
+            uuid::Uuid::from_u128(2),
+            "other".into(),
+        )
+        .unwrap();
         fs::write(root.join("id_ed25519.pub"), other.public_key).unwrap();
-        assert!(import_key(key.private_key_path.as_ref().unwrap(), 3, "mismatch".into()).is_err());
+        assert!(
+            import_key(
+                key.private_key_path.as_ref().unwrap(),
+                uuid::Uuid::from_u128(3),
+                "mismatch".into()
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -544,7 +559,7 @@ mod tests {
         assert!(discover_keys_in(&root).is_empty());
 
         let key_directory = root.join("first");
-        let first = generate_key(&key_directory, 1, "first".into()).unwrap();
+        let first = generate_key(&key_directory, uuid::Uuid::from_u128(1), "first".into()).unwrap();
         let first_private = first.private_key_path.unwrap();
         fs::copy(
             first_private.with_extension("pub"),

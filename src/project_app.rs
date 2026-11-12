@@ -16,8 +16,8 @@ pub struct WorkspaceState {
     pub selected_project: usize,
     pub selected_command: usize,
     pub selected_item: usize,
-    collapsed_groups: std::collections::HashSet<(u64, String)>,
-    collapsed_links: std::collections::HashSet<u64>,
+    collapsed_groups: std::collections::HashSet<(uuid::Uuid, String)>,
+    collapsed_links: std::collections::HashSet<uuid::Uuid>,
     pub flat: bool,
     pub project_open: bool,
     pub output_open: bool,
@@ -60,8 +60,8 @@ struct ExternalStop {
 }
 
 pub struct WorkspaceForm {
-    pub project_id: Option<u64>,
-    pub editing_id: Option<u64>,
+    pub project_id: Option<uuid::Uuid>,
+    pub editing_id: Option<uuid::Uuid>,
     pub fields: Vec<String>,
     pub selected: usize,
     pub error: Option<String>,
@@ -111,7 +111,7 @@ impl Drop for WorkspaceForm {
 
 pub enum WorkspaceDelete {
     Project {
-        id: u64,
+        id: uuid::Uuid,
         name: String,
     },
     Command {
@@ -119,12 +119,12 @@ pub enum WorkspaceDelete {
         name: String,
     },
     Group {
-        project_id: u64,
+        project_id: uuid::Uuid,
         name: String,
     },
     Link {
-        project_id: u64,
-        id: u64,
+        project_id: uuid::Uuid,
+        id: uuid::Uuid,
         name: String,
     },
 }
@@ -1433,9 +1433,7 @@ impl App {
                 return Err("Enter the password when changing its storage.".into());
             }
             let link = ProjectLink {
-                id: form.editing_id.unwrap_or_else(|| {
-                    project.links.iter().map(|link| link.id).max().unwrap_or(0) + 1
-                }),
+                id: form.editing_id.unwrap_or_else(uuid::Uuid::new_v4),
                 name: name.clone(),
                 url: value,
                 username: form.fields.get(2).map_or("", String::as_str).trim().into(),
@@ -1511,9 +1509,7 @@ impl App {
                 .find(|project| project.id == project_id)
                 .ok_or("Project no longer exists.")?;
             let command = ProjectCommand {
-                id: form.editing_id.unwrap_or_else(|| {
-                    project.commands.iter().map(|c| c.id).max().unwrap_or(0) + 1
-                }),
+                id: form.editing_id.unwrap_or_else(uuid::Uuid::new_v4),
                 name: name.clone(),
                 command: form.fields[1].trim().to_string(),
                 working_directory: (!form.fields[2].trim().is_empty())
@@ -1569,15 +1565,7 @@ impl App {
                 .parse_project_target(form.fields.get(2).map(String::as_str).unwrap_or("Local"))?
                 .unwrap_or_default();
             let project = ProjectDefinition {
-                id: form.editing_id.unwrap_or_else(|| {
-                    self.metadata
-                        .projects
-                        .iter()
-                        .map(|p| p.id)
-                        .max()
-                        .unwrap_or(0)
-                        + 1
-                }),
+                id: form.editing_id.unwrap_or_else(uuid::Uuid::new_v4),
                 name: name.clone(),
                 base_path: form.fields[1].trim().into(),
                 commands: form
@@ -1776,7 +1764,7 @@ mod tests {
             (3, "other", None, CommandKind::Task),
         ] {
             project.commands.push(ProjectCommand {
-                id,
+                id: uuid::Uuid::from_u128(id),
                 name: name.into(),
                 command: "printf fixture".into(),
                 group: group.map(String::from),
@@ -1808,10 +1796,16 @@ mod tests {
         assert!(app.selected_project_command().is_none());
         app.handle_projects_key(KeyCode::Down);
         app.handle_projects_key(KeyCode::Enter);
-        assert_eq!(app.selected_project_key(), Some((fixture.project.id, 1)));
+        assert_eq!(
+            app.selected_project_key(),
+            Some((fixture.project.id, uuid::Uuid::from_u128(1)))
+        );
         assert!(app.workspace.output_open);
         app.handle_projects_key(KeyCode::Char(']'));
-        assert_eq!(app.selected_project_key(), Some((fixture.project.id, 2)));
+        assert_eq!(
+            app.selected_project_key(),
+            Some((fixture.project.id, uuid::Uuid::from_u128(2)))
+        );
         assert!(app.project_service.tasks.is_empty());
         app.handle_projects_key(KeyCode::Esc);
         assert!(app.workspace.project_open);
@@ -1825,7 +1819,10 @@ mod tests {
             ]
         );
         app.handle_projects_key(KeyCode::Down);
-        assert_eq!(app.selected_project_key(), Some((fixture.project.id, 2)));
+        assert_eq!(
+            app.selected_project_key(),
+            Some((fixture.project.id, uuid::Uuid::from_u128(2)))
+        );
         app.handle_projects_key(KeyCode::Char('e'));
         let form = app.workspace.form.as_mut().unwrap();
         assert_eq!(form.fields[3], "Checks");
@@ -1833,7 +1830,10 @@ mod tests {
         form.selected = 6;
         app.handle_workspace_dialog(KeyCode::Enter);
         assert!(app.workspace.form.is_none());
-        assert_eq!(app.selected_project_key(), Some((fixture.project.id, 2)));
+        assert_eq!(
+            app.selected_project_key(),
+            Some((fixture.project.id, uuid::Uuid::from_u128(2)))
+        );
         assert!(app.project_groups().contains(&"Diagnostics".into()));
     }
 
@@ -1887,13 +1887,16 @@ mod tests {
         let fixture = Fixture::new("group-batch");
         let mut app = grouped_app(&fixture);
         let mut listener = fixture.listener_command(false);
-        listener.id = 1;
+        listener.id = uuid::Uuid::from_u128(1);
         listener.group = Some("Services".into());
         listener.kind = CommandKind::Service;
         app.metadata.projects[0].commands[0] = listener;
         app.metadata.projects[0].commands[1].kind = CommandKind::Service;
         app.handle_projects_key(KeyCode::Enter);
-        assert_eq!(app.project_service_keys(), vec![(fixture.project.id, 1)]);
+        assert_eq!(
+            app.project_service_keys(),
+            vec![(fixture.project.id, uuid::Uuid::from_u128(1))]
+        );
         app.handle_projects_key(KeyCode::Char('A'));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while fixture.ready().is_none() {
@@ -1905,9 +1908,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(app.project_service.tasks.len(), 1);
-        assert!(app.project_service.active((fixture.project.id, 1)));
+        assert!(
+            app.project_service
+                .active((fixture.project.id, uuid::Uuid::from_u128(1)))
+        );
         app.handle_projects_key(KeyCode::Char('X'));
-        while app.project_service.active((fixture.project.id, 1)) {
+        while app
+            .project_service
+            .active((fixture.project.id, uuid::Uuid::from_u128(1)))
+        {
             app.poll_projects();
             assert!(std::time::Instant::now() < deadline, "Service did not stop");
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1978,8 +1987,8 @@ mod tests {
     fn legacy_commands_default_to_ungrouped_tasks_and_local_execution() {
         let project: ProjectDefinition = serde_json::from_str(
             r#"{
-            "id": 1, "name": "Old", "base_path": "/tmp",
-            "commands": [{"id": 1, "name": "check", "command": "true", "working_directory": null}]
+            "id": "00000000-0000-0000-0000-000000000001", "name": "Old", "base_path": "/tmp",
+            "commands": [{"id": "00000000-0000-0000-0000-000000000001", "name": "check", "command": "true", "working_directory": null}]
         }"#,
         )
         .unwrap();
@@ -2038,7 +2047,7 @@ mod tests {
         let fixture = Fixture::new("persistent-delete");
         let mut app = grouped_app(&fixture);
         let mut command = fixture.command("printf 'saved output\\n'");
-        command.id = 1;
+        command.id = uuid::Uuid::from_u128(1);
         command.group = Some("Services".into());
         command.lifecycle = ProjectLifecycle::Persistent;
         let key = (fixture.project.id, command.id);
@@ -2187,7 +2196,7 @@ mod tests {
         let fixture = Fixture::new("account-shortcuts");
         let mut app = grouped_app(&fixture);
         app.metadata.projects[0].links.push(ProjectLink {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Preview".into(),
             url: "http://localhost:3000/".into(),
             ..Default::default()
@@ -2231,7 +2240,7 @@ mod tests {
             let fixture = Fixture::new("password-render");
             let mut app = grouped_app(&fixture);
             app.metadata.projects[0].links.push(ProjectLink {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "Preview".into(),
                 url: "http://localhost:3000".into(),
                 username: "admin".into(),
@@ -2333,14 +2342,14 @@ mod tests {
         prepared.commit();
         app.metadata.projects[0].links = vec![
             ProjectLink {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "Home".into(),
                 url: "http://localhost:3000".into(),
                 password_ref: Some(reference.clone()),
                 ..Default::default()
             },
             ProjectLink {
-                id: 2,
+                id: uuid::Uuid::from_u128(2),
                 name: "Buy".into(),
                 url: "http://localhost:3000/buy".into(),
                 password_ref: Some(reference.clone()),
@@ -2409,7 +2418,7 @@ mod tests {
         app.handle_workspace_dialog(KeyCode::Enter);
         let link = app.selected_project_link().unwrap().clone();
         assert_eq!(link.name, "Admin");
-        assert_eq!(link.id, 1);
+        assert_ne!(link.id, uuid::Uuid::nil());
         app.handle_projects_key(KeyCode::Esc);
         app.handle_projects_key(KeyCode::Char('e'));
         let form = app.workspace.form.as_mut().unwrap();
@@ -2535,7 +2544,7 @@ mod tests {
         let mut app = grouped_app(&fixture);
         // Imported metadata is validated again before handing it to the browser.
         app.metadata.projects[0].links.push(ProjectLink {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Invalid".into(),
             url: "javascript:alert(1)".into(),
             ..Default::default()
@@ -2567,13 +2576,13 @@ mod tests {
         let mut app = grouped_app(&fixture);
         app.metadata.projects[0].links = vec![
             ProjectLink {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "Home".into(),
                 url: "http://localhost:3000/".into(),
                 ..Default::default()
             },
             ProjectLink {
-                id: 2,
+                id: uuid::Uuid::from_u128(2),
                 name: "Buy".into(),
                 url: "http://localhost:3000/buy".into(),
                 ..Default::default()
@@ -2636,7 +2645,7 @@ mod tests {
             app.metadata.projects[0].commands.clear();
             app.metadata.projects[0].groups.clear();
             app.metadata.projects[0].links.push(ProjectLink {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "Preview".into(),
                 url: "http://localhost:3000/".into(),
                 ..Default::default()
@@ -2674,13 +2683,13 @@ mod tests {
             let mut app = grouped_app(&fixture);
             app.metadata.projects[0].links = vec![
                 ProjectLink {
-                    id: 1,
+                    id: uuid::Uuid::from_u128(1),
                     name: "Home".into(),
                     url: "http://localhost:3000/".into(),
                     ..Default::default()
                 },
                 ProjectLink {
-                    id: 2,
+                    id: uuid::Uuid::from_u128(2),
                     name: "Buy".into(),
                     url: "http://localhost:3000/buy".into(),
                     ..Default::default()
@@ -2745,7 +2754,10 @@ mod tests {
         app.handle_projects_key(KeyCode::Right);
         assert!(!app.project_group_collapsed("Services"));
         app.handle_projects_key(KeyCode::Down);
-        assert_eq!(app.selected_project_key(), Some((fixture.project.id, 1)));
+        assert_eq!(
+            app.selected_project_key(),
+            Some((fixture.project.id, uuid::Uuid::from_u128(1)))
+        );
         app.handle_projects_key(KeyCode::Left);
         assert_eq!(app.workspace.selected_item, 0);
         assert!(!app.project_group_collapsed("Services"));
@@ -2759,7 +2771,7 @@ mod tests {
         app.handle_projects_key(KeyCode::Enter);
         assert!(app.project_group_collapsed("Services"));
         let mut other = app.metadata.projects[0].clone();
-        other.id += 1;
+        other.id = uuid::Uuid::new_v4();
         app.metadata.projects.push(other);
         app.handle_projects_key(KeyCode::Esc);
         app.handle_projects_key(KeyCode::Down);

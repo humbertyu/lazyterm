@@ -1047,7 +1047,7 @@ mod tests {
         let fixture = create_fixture(&sshd, &ssh_keygen, &ssh_keyscan, &sftp_server);
         let new_key = crate::credentials::generate_key(
             &fixture.root.join("generated-key"),
-            1,
+            uuid::Uuid::from_u128(1),
             "fixture".into(),
         )
         .expect("generate upload key");

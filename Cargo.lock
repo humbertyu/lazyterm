@@ -1956,6 +1956,7 @@ dependencies = [
  "tokio",
  "unicode-width",
  "url",
+ "uuid",
  "vte",
  "webbrowser",
  "zeroize",

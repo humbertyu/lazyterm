@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hosts::HostCatalog;
 
-const CURRENT_METADATA_VERSION: u32 = 2;
+const CURRENT_METADATA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TunnelKind {
@@ -24,7 +24,7 @@ pub enum TunnelLifecycle {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TunnelDefinition {
-    pub id: u64,
+    pub id: crate::projects::EntityId,
     pub label: String,
     pub host_alias: String,
     #[serde(default)]
@@ -44,7 +44,7 @@ pub struct TunnelDefinition {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnippetDefinition {
-    pub id: u64,
+    pub id: crate::projects::EntityId,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -55,7 +55,7 @@ pub struct SnippetDefinition {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnippetPackage {
-    pub id: u64,
+    pub id: crate::projects::EntityId,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -101,13 +101,15 @@ pub struct Metadata {
     #[serde(default)]
     pub hidden_tabs: Vec<String>,
     pub credentials: Vec<crate::credentials::Credential>,
-    pub host_passwords: BTreeMap<String, u64>,
+    pub host_passwords: BTreeMap<String, uuid::Uuid>,
     #[serde(default)]
     pub uploaded_keys: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub host_public_key_auth: std::collections::BTreeSet<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+    #[serde(skip)]
+    pub(crate) credential_import_targets: BTreeMap<String, String>,
     #[serde(skip)]
     snapshot: RefCell<Option<Vec<u8>>>,
 }
@@ -200,12 +202,25 @@ impl Default for Metadata {
             uploaded_keys: BTreeMap::new(),
             host_public_key_auth: std::collections::BTreeSet::new(),
             extra: BTreeMap::new(),
+            credential_import_targets: BTreeMap::new(),
             snapshot: RefCell::new(None),
         }
     }
 }
 
 impl Metadata {
+    pub(crate) fn merged_document(
+        &self,
+        document: serde_json::Value,
+        credential_import_targets: BTreeMap<String, String>,
+    ) -> io::Result<Self> {
+        let mut merged: Self = serde_json::from_value(document)?;
+        merged.version = CURRENT_METADATA_VERSION;
+        merged.snapshot = self.snapshot.clone();
+        merged.credential_import_targets = credential_import_targets;
+        Ok(merged)
+    }
+
     pub fn normalize_host_groups(&mut self) -> bool {
         let mut groups = self
             .host_groups
@@ -229,9 +244,17 @@ impl Metadata {
     }
 
     pub(crate) fn read_from(path: &std::path::Path) -> io::Result<Self> {
+        Self::read_document(path, true)
+    }
+
+    pub(crate) fn read_for_import(path: &std::path::Path) -> io::Result<Self> {
+        Self::read_document(path, false)
+    }
+
+    fn read_document(path: &std::path::Path, migrate: bool) -> io::Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
-                let document: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
                 let version = match document.get("version") {
                     None => 1,
                     Some(value) => value
@@ -242,10 +265,21 @@ impl Metadata {
                 if version == 0 || version > CURRENT_METADATA_VERSION {
                     return Err(io::Error::other("Unsupported host metadata version"));
                 }
+                if version < CURRENT_METADATA_VERSION {
+                    let legacy_runner_ids = migrate_entity_ids_inner(&mut document)?;
+                    if !legacy_runner_ids.is_empty() && migrate {
+                        crate::project_runner::save_legacy_ids(
+                            path.parent()
+                                .unwrap_or_else(|| std::path::Path::new("."))
+                                .join("project-logs"),
+                            &legacy_runner_ids,
+                        )?;
+                    }
+                }
                 let mut metadata: Self = serde_json::from_value(document)?;
                 metadata.version = version;
                 *metadata.snapshot.borrow_mut() = Some(bytes);
-                if version < CURRENT_METADATA_VERSION {
+                if migrate && version < CURRENT_METADATA_VERSION {
                     metadata.version = CURRENT_METADATA_VERSION;
                     metadata.save_to(path)?;
                 }
@@ -254,18 +288,6 @@ impl Metadata {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error),
         }
-    }
-
-    pub(crate) fn save_imported(path: &std::path::Path, mut imported: Self) -> io::Result<Self> {
-        let current = match fs::read(path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        *imported.snapshot.borrow_mut() = current;
-        imported.version = CURRENT_METADATA_VERSION;
-        imported.save_to(path)?;
-        Ok(imported)
     }
 
     #[cfg(not(test))]
@@ -421,6 +443,122 @@ impl Metadata {
     }
 }
 
+pub(crate) fn migrate_entity_ids(document: &mut serde_json::Value) -> io::Result<()> {
+    migrate_entity_ids_inner(document).map(|_| ())
+}
+
+fn migrate_entity_ids_inner(
+    document: &mut serde_json::Value,
+) -> io::Result<Vec<crate::project_runner::LegacyTaskId>> {
+    let mut legacy_runner_ids = Vec::new();
+    let mut credential_ids = BTreeMap::new();
+    if let Some(credentials) = document
+        .get_mut("credentials")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in credentials {
+            let previous = item["id"].to_string();
+            let id = uuid::Uuid::new_v4().to_string();
+            item["id"] = id.clone().into();
+            credential_ids.insert(previous, id);
+        }
+    }
+    if let Some(associations) = document
+        .get_mut("host_passwords")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for id in associations.values_mut() {
+            if let Some(mapped) = credential_ids.get(&id.to_string()) {
+                *id = mapped.clone().into();
+            }
+        }
+    }
+
+    let mut link_references = BTreeMap::new();
+    if let Some(projects) = document
+        .get_mut("projects")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for project in projects {
+            let old_project_id = project["id"].as_u64();
+            let old_project = project["id"].to_string();
+            let new_project = uuid::Uuid::new_v4().to_string();
+            project["id"] = new_project.clone().into();
+            if let Some(commands) = project
+                .get_mut("commands")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for command in commands {
+                    let old_command_id = command["id"].as_u64();
+                    let new_command = uuid::Uuid::new_v4();
+                    command["id"] = new_command.to_string().into();
+                    if let (Some(project_id), Some(command_id)) = (old_project_id, old_command_id) {
+                        legacy_runner_ids.push(crate::project_runner::LegacyTaskId {
+                            project_id,
+                            command_id,
+                            project_uuid: new_project.parse().map_err(io::Error::other)?,
+                            command_uuid: new_command,
+                        });
+                    }
+                }
+            }
+            if let Some(links) = project
+                .get_mut("links")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for link in links {
+                    let old_link = link["id"].to_string();
+                    let new_link = uuid::Uuid::new_v4().to_string();
+                    link["id"] = new_link.clone().into();
+                    link_references.insert(
+                        format!("config:{old_project}:{}", old_link.trim_matches('"')),
+                        format!("config:{new_project}:{}", new_link),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(projects) = document
+        .get_mut("projects")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for project in projects {
+            if let Some(links) = project
+                .get_mut("links")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for link in links {
+                    if let Some(reference) = link["password_ref"].as_str()
+                        && let Some(mapped) = link_references.get(reference)
+                    {
+                        link["password_ref"] = mapped.clone().into();
+                    }
+                }
+            }
+        }
+    }
+    for field in ["tunnels", "snippet_packages"] {
+        if let Some(items) = document
+            .get_mut(field)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for item in items {
+                item["id"] = uuid::Uuid::new_v4().to_string().into();
+                if field == "snippet_packages"
+                    && let Some(snippets) = item
+                        .get_mut("snippets")
+                        .and_then(serde_json::Value::as_array_mut)
+                {
+                    for snippet in snippets {
+                        snippet["id"] = uuid::Uuid::new_v4().to_string().into();
+                    }
+                }
+            }
+        }
+    }
+    Ok(legacy_runner_ids)
+}
+
 pub fn parse_tags(value: &str) -> Vec<String> {
     let mut tags = Vec::new();
     for tag in value
@@ -451,7 +589,10 @@ mod tests {
 
             let restored: Metadata = serde_json::from_value(value).unwrap();
             assert_eq!(restored.theme, Theme::Forest);
-            assert_eq!(restored.projects, [fixture.project.clone()]);
+            assert_eq!(
+                restored.projects.as_slice(),
+                std::slice::from_ref(&fixture.project)
+            );
         }
     }
 
@@ -466,7 +607,7 @@ mod tests {
         let mut project = fixture.project.clone();
         project.commands.push(fixture.command("printf ready"));
         project.links.push(crate::projects::ProjectLink {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Home".into(),
             url: "http://localhost:3000/".into(),
             password_storage: crate::projects::PasswordStorage::Config,
@@ -475,7 +616,7 @@ mod tests {
         });
         current.projects.push(project);
         current.credentials.push(crate::credentials::Credential {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Fixture password".into(),
             kind: crate::credentials::CredentialKind::Password,
             username: String::new(),
@@ -606,11 +747,11 @@ mod tests {
         let mut metadata = Metadata::read_from(&path).unwrap();
         assert!(metadata.projects.is_empty());
         let project = ProjectDefinition {
-            id: 41,
+            id: uuid::Uuid::from_u128(41),
             name: "Demo".into(),
             base_path: fixture.root.clone(),
             commands: vec![ProjectCommand {
-                id: 7,
+                id: uuid::Uuid::from_u128(7),
                 name: "Tests".into(),
                 command: "cargo test".into(),
                 working_directory: Some("sub directory".into()),
@@ -622,7 +763,7 @@ mod tests {
             groups: vec!["Development".into(), "Empty".into()],
             target: ProjectTarget::Host("fixture".into()),
             links: vec![ProjectLink {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "Preview".into(),
                 url: "http://localhost:3000/".into(),
                 ..Default::default()
@@ -677,7 +818,7 @@ mod tests {
         metadata.host_public_key_auth.insert("web".into());
         metadata.show_hidden_files = true;
         metadata.tunnels.push(TunnelDefinition {
-            id: 7,
+            id: uuid::Uuid::from_u128(7),
             label: "web-db".into(),
             host_alias: "web".into(),
             custom_host: false,
@@ -721,7 +862,7 @@ mod tests {
         let mut metadata = Metadata {
             tunnels: vec![
                 TunnelDefinition {
-                    id: 1,
+                    id: uuid::Uuid::from_u128(1),
                     label: "saved".into(),
                     host_alias: "web".into(),
                     custom_host: false,
@@ -736,7 +877,7 @@ mod tests {
                     keepalive_interval_secs: 30,
                 },
                 TunnelDefinition {
-                    id: 2,
+                    id: uuid::Uuid::from_u128(2),
                     label: "custom".into(),
                     host_alias: "192.0.2.10".into(),
                     custom_host: true,
@@ -806,12 +947,70 @@ mod tests {
         let restored = Metadata::read_from(&path).unwrap();
         assert_eq!(restored.tags["web"], ["prod", "work"]);
         assert_eq!(restored.view, HostView::Hosts);
-        fs::write(&path, r#"{"version":3}"#).unwrap();
+        fs::write(&path, r#"{"version":4}"#).unwrap();
         assert!(Metadata::read_from(&path).is_err());
         fs::write(&path, r#"{"version":"old"}"#).unwrap();
         assert!(Metadata::read_from(&path).is_err());
         fs::write(&path, "{").unwrap();
         assert!(Metadata::read_from(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v2_numeric_entity_ids_migrate_to_uuids_and_rewrite_references() {
+        let root = env::temp_dir().join(format!(
+            "lazyterm-uuid-migration-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("hosts.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "credentials": [{
+                    "id": 17, "name": "prod password", "kind": "Password"
+                }],
+                "host_passwords": {"prod": 17},
+                "projects": [{
+                    "id": 1, "name": "Demo", "base_path": "/tmp",
+                    "commands": [{"id": 2, "name": "start", "command": "true"}],
+                    "links": [{"id": 3, "name": "Home", "url": "https://example.com",
+                        "password_ref": "config:1:3"}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let metadata = Metadata::read_from(&path).unwrap();
+        assert_eq!(metadata.version, CURRENT_METADATA_VERSION);
+        assert_ne!(metadata.credentials[0].id, uuid::Uuid::from_u128(17));
+        assert_eq!(metadata.host_passwords["prod"], metadata.credentials[0].id);
+        let project = &metadata.projects[0];
+        assert_ne!(project.id, uuid::Uuid::from_u128(1));
+        assert_ne!(project.commands[0].id, uuid::Uuid::from_u128(2));
+        assert_ne!(project.links[0].id, uuid::Uuid::from_u128(3));
+        assert_eq!(
+            project.links[0].password_ref.as_deref(),
+            Some(format!("config:{}:{}", project.id, project.links[0].id).as_str())
+        );
+        let runner_ids: Vec<crate::project_runner::LegacyTaskId> = serde_json::from_slice(
+            &fs::read(root.join("project-logs/legacy-runner-ids.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(runner_ids.len(), 1);
+        assert_eq!(runner_ids[0].project_id, 1);
+        assert_eq!(runner_ids[0].command_id, 2);
+        assert_eq!(runner_ids[0].project_uuid, project.id);
+        assert_eq!(runner_ids[0].command_uuid, project.commands[0].id);
+        assert_eq!(
+            fs::read_dir(root.join("hosts.json.backups"))
+                .unwrap()
+                .count(),
+            1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

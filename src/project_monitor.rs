@@ -642,7 +642,7 @@ pub(crate) mod tests {
             .is_empty()
         );
         let mut ambiguous = project.clone();
-        ambiguous.id += 1;
+        ambiguous.id = uuid::Uuid::new_v4();
         assert!(
             associate(
                 &[project, ambiguous],
@@ -714,7 +714,7 @@ pub(crate) mod tests {
         assert!(!monitor.poll(&changed, &[]));
         assert!(!monitor.matches(&changed));
         let owner = ProjectOwner {
-            key: (1, 2),
+            key: (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)),
             run_id: 1,
             process_group: 99,
             project_name: "Demo".into(),

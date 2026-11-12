@@ -141,7 +141,10 @@ impl HostCatalog {
         Self::snapshot_from(&config_path, ssh_dir)
     }
 
-    fn snapshot_from(config_path: &Path, ssh_dir: &Path) -> io::Result<BTreeMap<String, String>> {
+    pub(crate) fn snapshot_from(
+        config_path: &Path,
+        ssh_dir: &Path,
+    ) -> io::Result<BTreeMap<String, String>> {
         let mut visited = HashSet::new();
         let mut files = BTreeMap::new();
         snapshot_file(config_path, ssh_dir, &mut visited, &mut files)?;
@@ -980,7 +983,7 @@ fn expand_include(include: &str, ssh_dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let mut quoted = false;
     let mut escaped = false;
     for (index, character) in line.char_indices() {

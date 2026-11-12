@@ -56,7 +56,7 @@ pub struct RuntimeEntry {
     pub origin_reason: String,
     pub project: Option<ProjectOwner>,
     pub external_project: Option<crate::project_monitor::ExternalRun>,
-    pub tunnel: Option<u64>,
+    pub tunnel: Option<uuid::Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -808,7 +808,7 @@ mod tests {
             "10 1 10 ?? sh -c serve\n11 10 10 ?? server\n12 1 12 ?? server /same/path\n",
         );
         let owner = ProjectOwner {
-            key: (1, 2),
+            key: (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)),
             run_id: 3,
             process_group: 10,
             project_name: "Demo".into(),

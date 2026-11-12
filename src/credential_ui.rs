@@ -557,7 +557,7 @@ mod tests {
     fn credential_list_separates_keychain_and_ssh_key_groups() {
         let mut metadata = Metadata::default();
         metadata.credentials.push(Credential {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Saved password".into(),
             kind: CredentialKind::Password,
             username: String::new(),
@@ -579,7 +579,7 @@ mod tests {
         });
         app.credential_manager.discovered_keys.clear();
         app.credential_manager.discovered_keys.push(Credential {
-            id: 0,
+            id: uuid::Uuid::nil(),
             name: "id_ed25519".into(),
             kind: CredentialKind::SshKey,
             username: String::new(),
@@ -614,7 +614,7 @@ mod tests {
     fn host_ssh_key_selector_renders_as_a_single_panel() {
         let mut metadata = Metadata::default();
         metadata.credentials.push(Credential {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Deploy key".into(),
             kind: CredentialKind::SshKey,
             username: String::new(),
@@ -651,7 +651,7 @@ mod tests {
     fn credential_removal_confirmation_is_a_centered_dialog() {
         let mut metadata = Metadata::default();
         metadata.credentials.push(Credential {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Deploy password".into(),
             kind: CredentialKind::Password,
             username: "deploy".into(),
@@ -660,7 +660,9 @@ mod tests {
             public_key: String::new(),
             fingerprint: String::new(),
         });
-        metadata.host_passwords.insert("web".into(), 1);
+        metadata
+            .host_passwords
+            .insert("web".into(), uuid::Uuid::from_u128(1));
         let mut app = App::with_catalog(
             HostCatalog {
                 hosts: vec![crate::hosts::Host {

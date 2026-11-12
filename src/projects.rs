@@ -10,12 +10,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub type TaskKey = (u64, u64);
+pub type EntityId = uuid::Uuid;
+pub type TaskKey = (EntityId, EntityId);
 const OUTPUT_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectDefinition {
-    pub id: u64,
+    pub id: EntityId,
     pub name: String,
     pub base_path: PathBuf,
     #[serde(default)]
@@ -30,7 +31,7 @@ pub struct ProjectDefinition {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectLink {
-    pub id: u64,
+    pub id: EntityId,
     pub name: String,
     pub url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -146,7 +147,7 @@ impl ProjectLifecycle {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectCommand {
-    pub id: u64,
+    pub id: EntityId,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -929,7 +930,7 @@ pub(crate) mod tests {
             fs::create_dir_all(root.join("sub directory")).unwrap();
             Self {
                 project: ProjectDefinition {
-                    id: 17,
+                    id: uuid::Uuid::from_u128(17),
                     name: "Fixture project".into(),
                     base_path: root.clone(),
                     commands: Vec::new(),
@@ -945,7 +946,7 @@ pub(crate) mod tests {
 
         pub fn command(&self, command: &str) -> ProjectCommand {
             ProjectCommand {
-                id: 29,
+                id: uuid::Uuid::from_u128(29),
                 name: "Fixture command".into(),
                 command: command.into(),
                 working_directory: None,
@@ -1118,7 +1119,7 @@ pub(crate) mod tests {
     #[test]
     fn remote_projects_build_a_quoted_remote_working_directory() {
         let project = ProjectDefinition {
-            id: 7,
+            id: uuid::Uuid::from_u128(7),
             name: "Remote".into(),
             base_path: "~/apps/demo".into(),
             target: ProjectTarget::Host("fixture".into()),
@@ -1175,7 +1176,7 @@ pub(crate) mod tests {
         let mut service = fixture.service();
         let server = fixture.listener_command(false);
         let mut one_shot = fixture.command("printf 'one shot\\n'");
-        one_shot.id += 1;
+        one_shot.id = uuid::Uuid::new_v4();
         service.start(&fixture.project, &server).unwrap();
         service.start(&fixture.project, &one_shot).unwrap();
         until(&mut service, |s| {

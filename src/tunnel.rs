@@ -10,7 +10,7 @@ use crate::metadata::{TunnelDefinition, TunnelKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TunnelEvent {
-    Stderr { id: u64, message: String },
+    Stderr { id: uuid::Uuid, message: String },
 }
 
 pub fn spawn_forward(
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn forward_specs_use_expected_ssh_arguments() {
         let tunnel = TunnelDefinition {
-            id: 4,
+            id: uuid::Uuid::from_u128(4),
             label: "database".into(),
             host_alias: "web".into(),
             custom_host: false,
@@ -159,7 +159,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let tunnel = TunnelDefinition {
-            id: 9,
+            id: uuid::Uuid::from_u128(9),
             label: "conflict".into(),
             host_alias: "web".into(),
             custom_host: false,

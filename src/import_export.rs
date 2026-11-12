@@ -12,7 +12,6 @@ use crate::metadata::Metadata;
 
 #[derive(Deserialize)]
 struct ConfigurationArchive {
-    format_version: u32,
     ssh_config_path: Option<PathBuf>,
     #[serde(default)]
     ssh_config: String,
@@ -29,18 +28,279 @@ pub struct ConfigurationImport {
     pub ssh_root: PathBuf,
 }
 
+fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata> {
+    use serde_json::Value;
+    fn merge(local: &mut Value, incoming: Value, field: &str) {
+        match (local, incoming) {
+            (Value::Object(local), Value::Object(incoming)) => {
+                let keep_password_storage = field == "links"
+                    && ["password", "password_ref"]
+                        .iter()
+                        .any(|key| local.get(*key).is_some_and(|value| !value.is_null()));
+                for (key, value) in incoming {
+                    let child_field =
+                        if (field.is_empty() && key == "tags") || field == "tags_by_alias" {
+                            "tags_by_alias"
+                        } else {
+                            &key
+                        };
+                    // Ordinary configuration import must not clear local secrets.
+                    if matches!(key.as_str(), "password" | "password_ref")
+                        && local.contains_key(&key)
+                    {
+                        continue;
+                    }
+                    if key == "password_storage" && keep_password_storage {
+                        continue;
+                    }
+                    merge(
+                        local.entry(key.clone()).or_insert(Value::Null),
+                        value,
+                        child_field,
+                    );
+                }
+            }
+            (Value::Array(local), Value::Array(incoming))
+                if matches!(
+                    field,
+                    "projects"
+                        | "commands"
+                        | "links"
+                        | "snippet_packages"
+                        | "snippets"
+                        | "tunnels"
+                        | "credentials"
+                ) =>
+            {
+                let key = if field == "tunnels" { "label" } else { "name" };
+                for mut item in incoming {
+                    if let Some(existing) = local.iter_mut().find(|existing| {
+                        let same_identity = existing["id"].is_string()
+                            && item["id"].is_string()
+                            && existing["id"] == item["id"];
+                        same_identity
+                            || (existing[key] == item[key]
+                                && (field != "credentials" || existing["kind"] == item["kind"]))
+                    }) {
+                        item["id"] = existing["id"].clone();
+                        merge(existing, item, field);
+                    } else {
+                        local.push(item);
+                    }
+                }
+            }
+            (Value::Array(local), Value::Array(incoming)) if field != "hidden_tabs" => {
+                if field == "tags_by_alias" {
+                    *local = incoming;
+                    return;
+                }
+                for value in incoming {
+                    if !local.contains(&value) {
+                        local.push(value);
+                    }
+                }
+            }
+            (local, incoming) => *local = incoming,
+        }
+    }
+    let mut document = serde_json::to_value(&current)?;
+    let mut incoming = serde_json::to_value(incoming)?;
+    let source = incoming.clone();
+    // Merge credentials first so Host references use the destination's IDs.
+    let credentials = incoming["credentials"].take();
+    let source_credentials = credentials.clone();
+    merge(&mut document["credentials"], credentials, "credentials");
+    if let Some(associations) = incoming["host_passwords"].as_object_mut() {
+        for id in associations.values_mut() {
+            if let Some(source) = source_credentials
+                .as_array()
+                .and_then(|items| items.iter().find(|item| item["id"] == *id))
+                && let Some(destination) = document["credentials"].as_array().and_then(|items| {
+                    items.iter().find(|item| {
+                        item["id"] == source["id"]
+                            || (item["name"] == source["name"] && item["kind"] == source["kind"])
+                    })
+                })
+            {
+                *id = destination["id"].clone();
+            }
+        }
+    }
+    incoming.as_object_mut().unwrap().remove("credentials");
+    merge(&mut document, incoming, "");
+    let mut targets = BTreeMap::new();
+    if let Some(projects) = source["projects"].as_array() {
+        for project in projects {
+            let destination = document["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == project["id"] || item["name"] == project["name"])
+                .unwrap();
+            for link in project["links"].as_array().into_iter().flatten() {
+                let target = destination["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"] == link["id"] || item["name"] == link["name"])
+                    .unwrap();
+                let source_ref = format!(
+                    "config:{}:{}",
+                    project["id"].as_str().unwrap_or_default(),
+                    link["id"].as_str().unwrap_or_default()
+                );
+                targets.insert(
+                    source_ref,
+                    format!(
+                        "config:{}:{}",
+                        destination["id"].as_str().unwrap_or_default(),
+                        target["id"].as_str().unwrap_or_default()
+                    ),
+                );
+                if let Some(reference) = link["password_ref"].as_str() {
+                    let target_ref = target["password_ref"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "config:{}:{}",
+                                destination["id"].as_str().unwrap_or_default(),
+                                target["id"].as_str().unwrap_or_default()
+                            )
+                        });
+                    targets.insert(reference.into(), target_ref);
+                }
+            }
+        }
+    }
+    for credential in source["credentials"].as_array().into_iter().flatten() {
+        if let Some(reference) = credential["password_ref"].as_str() {
+            let target = document["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["id"] == credential["id"]
+                        || (item["name"] == credential["name"]
+                            && item["kind"] == credential["kind"])
+                })
+                .unwrap();
+            if let Some(target_ref) = target["password_ref"].as_str() {
+                targets.insert(reference.into(), target_ref.into());
+            }
+        }
+    }
+    current.merged_document(document, targets)
+}
+
+// Keep complete SSH stanza bodies, including comments and unsupported directives.
+// An incoming alias replaces its old stanza; aliases absent from the archive survive.
+type SshSections = Vec<(Option<Vec<String>>, String)>;
+
+fn ssh_sections(text: &str) -> io::Result<SshSections> {
+    let mut result = vec![(None, String::new())];
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let end = trimmed
+            .find(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or(trimmed.len());
+        let keyword = &trimmed[..end];
+        if keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match") {
+            let values = trimmed[end..]
+                .trim_start()
+                .trim_start_matches('=')
+                .trim_start();
+            let values = shell_words::split(crate::hosts::strip_comment(values))
+                .map_err(io::Error::other)?;
+            let aliases = keyword.eq_ignore_ascii_case("host").then_some(values);
+            result.push((aliases, String::new()));
+        }
+        result.last_mut().unwrap().1.push_str(line);
+    }
+    Ok(result)
+}
+
+fn merge_ssh_config(
+    local: &str,
+    incoming: &str,
+    aliases: &std::collections::HashSet<String>,
+) -> io::Result<String> {
+    let incoming_sections = ssh_sections(incoming)?;
+    let mut output = incoming.trim_end().to_string();
+    for (index, (local_aliases, body)) in ssh_sections(local)?.into_iter().enumerate() {
+        if body.trim().is_empty()
+            || incoming_sections
+                .iter()
+                .any(|(_, text)| text.trim() == body.trim())
+        {
+            continue;
+        }
+        let retained = match local_aliases {
+            Some(names) => {
+                let remaining = names
+                    .iter()
+                    .filter(|name| !aliases.contains(name.as_str()))
+                    .collect::<Vec<_>>();
+                if remaining.is_empty() {
+                    continue;
+                }
+                if remaining.len() == names.len() {
+                    body
+                } else {
+                    let rest = body.split_once('\n').map_or("", |(_, rest)| rest);
+                    format!("Host {}\n{rest}", shell_words::join(remaining))
+                }
+            }
+            None if index == 0 && !output.is_empty() => {
+                // A preamble appended after a Host/Match needs a global scope reset.
+                format!("Host *\n{body}")
+            }
+            None => body,
+        };
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(retained.trim_end());
+        output.push('\n');
+    }
+    if !output.ends_with('\n') && !output.is_empty() {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 pub fn parse_configuration(bytes: &[u8], home: &Path) -> io::Result<ConfigurationImport> {
-    let archive: ConfigurationArchive = serde_json::from_slice(bytes)?;
-    if archive.format_version != 1 {
+    let mut document: serde_json::Value = serde_json::from_slice(bytes)?;
+    let format_version = document["format_version"]
+        .as_u64()
+        .ok_or_else(|| invalid("Invalid configuration export version."))?;
+    if format_version != 1 {
         return Err(invalid("Unsupported configuration export version."));
     }
+    let metadata = document
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| invalid("Configuration archive is missing LazyTerm metadata."))?;
+    let metadata_version = metadata
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if metadata_version == 0 || metadata_version > 3 {
+        return Err(invalid("Unsupported LazyTerm metadata version."));
+    }
+    if metadata_version < 3 {
+        crate::metadata::migrate_entity_ids(
+            document
+                .get_mut("metadata")
+                .ok_or_else(|| invalid("Configuration archive is missing metadata."))?,
+        )?;
+        document["metadata"]["version"] = 3.into();
+    }
+    let archive: ConfigurationArchive = serde_json::from_value(document)?;
     if archive.passwords_included {
         return Err(invalid(
             "This configuration archive unexpectedly contains password data.",
         ));
-    }
-    if archive.metadata.version == 0 || archive.metadata.version > 2 {
-        return Err(invalid("Unsupported LazyTerm metadata version."));
     }
     if archive
         .metadata
@@ -126,9 +386,63 @@ pub fn parse_configuration(bytes: &[u8], home: &Path) -> io::Result<Configuratio
 }
 
 pub fn apply_configuration(
-    import: ConfigurationImport,
+    mut import: ConfigurationImport,
     metadata_path: &Path,
 ) -> io::Result<Metadata> {
+    let current = Metadata::read_for_import(metadata_path)?;
+    import.metadata = merge_metadata(current, import.metadata)?;
+    let config = import.ssh_root.join("config");
+    let canonical_root = fs::canonicalize(&import.ssh_root).unwrap_or(import.ssh_root.clone());
+    let snapshot = if import.ssh_files.is_empty() {
+        BTreeMap::new()
+    } else {
+        crate::hosts::HostCatalog::snapshot_from(&config, &import.ssh_root)?
+    };
+    let mut existing = snapshot
+        .into_iter()
+        .map(|(path, contents)| {
+            let path = PathBuf::from(path);
+            let relative = path
+                .strip_prefix(&canonical_root)
+                .map_err(|_| invalid("Local SSH Include points outside the SSH directory."))?;
+            Ok((
+                import.ssh_root.join(relative).display().to_string(),
+                contents,
+            ))
+        })
+        .collect::<io::Result<BTreeMap<_, _>>>()?;
+    for path in import.ssh_files.keys() {
+        ensure_no_symlink_components(&import.ssh_root, path)?;
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            existing.entry(path.display().to_string())
+        {
+            match fs::read_to_string(path) {
+                Ok(contents) => {
+                    entry.insert(contents);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let mut aliases = std::collections::HashSet::new();
+    for contents in import.ssh_files.values() {
+        let text = std::str::from_utf8(contents)
+            .map_err(|_| invalid("SSH config files must be valid UTF-8."))?;
+        for (names, _) in ssh_sections(text)? {
+            aliases.extend(names.into_iter().flatten());
+        }
+    }
+    for (path, contents) in &existing {
+        let path = PathBuf::from(path);
+        if !import.ssh_files.is_empty() {
+            let incoming = import.ssh_files.entry(path).or_default();
+            let incoming_text = std::str::from_utf8(incoming)
+                .map_err(|_| invalid("SSH config files must be valid UTF-8."))?;
+            *incoming = merge_ssh_config(contents, incoming_text, &aliases)?.into_bytes();
+        }
+    }
+    preflight_ssh_files(&import.ssh_files, &config, &import.ssh_root)?;
     let mut originals = BTreeMap::new();
     let ssh_root = import.ssh_root.clone();
     for path in import.ssh_files.keys() {
@@ -150,6 +464,16 @@ pub fn apply_configuration(
         }
     }
 
+    for (path, original) in &originals {
+        let expected = existing
+            .get(&path.display().to_string())
+            .map(|value| value.as_bytes());
+        if original.as_deref() != expected {
+            return Err(io::Error::other(
+                "SSH configuration changed while preparing import; retry the import.",
+            ));
+        }
+    }
     let backup_dir = import_backup_dir(metadata_path)?;
     let mut manifest_entries = Vec::new();
     for (index, (path, original)) in originals.iter().enumerate() {
@@ -166,16 +490,30 @@ pub fn apply_configuration(
 
     let mut changed = Vec::new();
     for (path, contents) in import.ssh_files {
-        ensure_secure_parent_dirs(&path)?;
-        if let Err(error) = crate::hosts::safe_write(&path, &contents) {
+        let current = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return combine_rollback(error, rollback_ssh_files(&changed, &originals));
+            }
+        };
+        if current.as_ref() != originals.get(&path).and_then(Option::as_ref) {
+            return combine_rollback(
+                io::Error::other("SSH configuration changed during import; retry the import."),
+                rollback_ssh_files(&changed, &originals),
+            );
+        }
+        if let Err(error) = ensure_secure_parent_dirs(&path)
+            .and_then(|()| crate::hosts::safe_write(&path, &contents))
+        {
             let rollback = rollback_ssh_files(&changed, &originals);
             return combine_rollback(error, rollback);
         }
         changed.push(path);
     }
 
-    match Metadata::save_imported(metadata_path, import.metadata) {
-        Ok(metadata) => Ok(metadata),
+    match import.metadata.save_to(metadata_path) {
+        Ok(()) => Ok(import.metadata),
         Err(error) => {
             let rollback = rollback_ssh_files(&changed, &originals);
             combine_rollback(error, rollback)
@@ -563,8 +901,9 @@ mod tests {
         let imported =
             parse_configuration(&serde_json::to_vec(&bundle).unwrap(), &target_home).unwrap();
         let metadata = apply_configuration(imported, &metadata_path).unwrap();
-        assert_eq!(metadata.version, 2);
+        assert_eq!(metadata.version, 3);
         assert!(fs::read_to_string(&config).unwrap().contains("imported"));
+        assert!(fs::read_to_string(&config).unwrap().contains("previous"));
         assert!(metadata_path.with_file_name("hosts.json.backups").exists());
         let backups = fs::read_dir(root.join("lazyterm/import-backups"))
             .unwrap()
@@ -572,5 +911,218 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!backups.is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incoming_hosts_win_across_includes_and_repeated_import_is_idempotent() {
+        let root = fixture("merge-includes");
+        let _cleanup = TemporaryDirectory(root.clone());
+        let home = root.join("home");
+        let ssh = home.join(".ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::write(
+            ssh.join("config"),
+            "Include local.conf\nHost desktop\n  HostName 192.0.2.1\n",
+        )
+        .unwrap();
+        fs::write(
+            ssh.join("local.conf"),
+            "# local shared block\nHost app spare\n  HostName old.internal\n  User localuser\n",
+        )
+        .unwrap();
+        let metadata_path = root.join("data/hosts.json");
+        let bundle = archive(&root.join("source"));
+        let bytes = serde_json::to_vec(&bundle).unwrap();
+        apply_configuration(parse_configuration(&bytes, &home).unwrap(), &metadata_path).unwrap();
+        let catalog = crate::hosts::HostCatalog::load_from(&ssh.join("config"), &ssh);
+        assert!(catalog.error.is_none(), "{:?}", catalog.error);
+        assert_eq!(catalog.hosts.len(), 3);
+        assert_eq!(
+            catalog
+                .hosts
+                .iter()
+                .find(|host| host.alias == "app")
+                .unwrap()
+                .hostname
+                .as_deref(),
+            Some("app.internal")
+        );
+        assert_eq!(
+            catalog
+                .hosts
+                .iter()
+                .find(|host| host.alias == "spare")
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("localuser")
+        );
+        let resolved = std::process::Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(ssh.join("config"))
+            .arg("app")
+            .output()
+            .unwrap();
+        assert!(resolved.status.success());
+        assert!(String::from_utf8_lossy(&resolved.stdout).contains("hostname app.internal"));
+        let first = crate::hosts::HostCatalog::snapshot_from(&ssh.join("config"), &ssh).unwrap();
+        apply_configuration(parse_configuration(&bytes, &home).unwrap(), &metadata_path).unwrap();
+        let second = crate::hosts::HostCatalog::snapshot_from(&ssh.join("config"), &ssh).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn metadata_merge_keeps_local_projects_and_secrets_and_remaps_colliding_ids() {
+        let id = |value: u128| uuid::Uuid::from_u128(value).to_string();
+        let mut local = serde_json::to_value(Metadata::default()).unwrap();
+        local["projects"] = serde_json::json!([
+            {"id":id(1), "name":"local", "base_path":"/local"},
+            {"id":id(2), "name":"shared", "base_path":"/old", "commands":[
+                {"id":id(3),"name":"local-task","command":"local"},
+                {"id":id(4),"name":"start","command":"old"}
+            ], "links":[{"id":id(5),"name":"Home","url":"http://localhost:3000",
+                "password_storage":"Config","password":"local-only-secret"}]}
+        ]);
+        local["credentials"] = serde_json::json!([{
+            "id":id(6),"name":"local password","kind":"Password","password_ref":"local-ref"
+        }]);
+        local["host_passwords"] = serde_json::json!({"local":id(6)});
+        local["tags"] = serde_json::json!({"local-host":["local-tag"],"shared-host":["old-tag"]});
+        let mut incoming = serde_json::to_value(Metadata::default()).unwrap();
+        incoming["projects"] = serde_json::json!([
+            {"id":id(7),"name":"remote","base_path":"/remote"},
+            {"id":id(8),"name":"shared","base_path":"/updated","commands":[
+                {"id":id(9),"name":"start","command":"updated"},
+                {"id":id(10),"name":"remote-task","command":"new"}
+            ],"links":[{"id":id(11),"name":"Home","url":"http://localhost:4000"}]}
+        ]);
+        incoming["credentials"] = serde_json::json!([{
+            "id":id(12),"name":"remote password","kind":"Password","password_ref":"remote-ref"
+        }]);
+        incoming["host_passwords"] = serde_json::json!({"remote":id(12)});
+        incoming["tags"] = serde_json::json!({"shared-host":["new-tag"]});
+        let local: Metadata = serde_json::from_value(local).unwrap();
+        let incoming: Metadata = serde_json::from_value(incoming).unwrap();
+        let result = merge_metadata(local, incoming.clone()).unwrap();
+        assert_eq!(result.projects.len(), 3);
+        assert_eq!(result.projects[0].name, "local");
+        assert_eq!(result.projects[1].id, uuid::Uuid::from_u128(2));
+        assert_eq!(result.projects[1].base_path, PathBuf::from("/updated"));
+        assert_eq!(result.projects[1].commands.len(), 3);
+        assert_eq!(result.projects[1].commands[1].id, uuid::Uuid::from_u128(4));
+        assert_eq!(result.projects[1].commands[1].command, "updated");
+        assert_eq!(
+            result.projects[1].links[0].password.as_deref(),
+            Some("local-only-secret")
+        );
+        assert_eq!(
+            result.projects[1].links[0].password_storage,
+            crate::projects::PasswordStorage::Config
+        );
+        assert_eq!(
+            result.credential_import_targets[&format!("config:{}:{}", id(8), id(11))],
+            format!("config:{}:{}", id(2), id(5))
+        );
+        assert_ne!(result.projects[2].id, result.projects[0].id);
+        assert_ne!(
+            result.host_passwords["local"],
+            result.host_passwords["remote"]
+        );
+        assert_eq!(result.tags["shared-host"], ["new-tag"]);
+        assert_eq!(result.tags["local-host"], ["local-tag"]);
+        let once = serde_json::to_value(&result).unwrap();
+        let twice = serde_json::to_value(merge_metadata(result, incoming).unwrap()).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn metadata_merge_uses_matching_uuids_before_names() {
+        let project_id = uuid::Uuid::new_v4();
+        let command_id = uuid::Uuid::new_v4();
+        let mut local = Metadata::default();
+        local.projects.push(crate::projects::ProjectDefinition {
+            id: project_id,
+            name: "Old project name".into(),
+            base_path: "/old".into(),
+            commands: vec![crate::projects::ProjectCommand {
+                id: command_id,
+                name: "Old command name".into(),
+                command: "old".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut incoming = Metadata::default();
+        incoming.projects.push(crate::projects::ProjectDefinition {
+            id: project_id,
+            name: "Renamed project".into(),
+            base_path: "/new".into(),
+            commands: vec![crate::projects::ProjectCommand {
+                id: command_id,
+                name: "Renamed command".into(),
+                command: "new".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let merged = merge_metadata(local, incoming).unwrap();
+        assert_eq!(merged.projects.len(), 1);
+        assert_eq!(merged.projects[0].id, project_id);
+        assert_eq!(merged.projects[0].name, "Renamed project");
+        assert_eq!(merged.projects[0].commands[0].id, command_id);
+        assert_eq!(merged.projects[0].commands[0].name, "Renamed command");
+        assert_eq!(merged.projects[0].commands[0].command, "new");
+    }
+
+    #[test]
+    fn configuration_import_migrates_legacy_numeric_ids() {
+        let root = fixture("legacy-ids");
+        let value = serde_json::json!({
+            "format_version": 1,
+            "ssh_config_path": null,
+            "ssh_config": "",
+            "ssh_config_files": {},
+            "hosts": [],
+            "passwords_included": false,
+            "metadata": {
+                "version": 2,
+                "projects": [{
+                    "id": 1,
+                    "name": "Legacy",
+                    "base_path": "/tmp",
+                    "commands": [{"id": 2, "name": "run", "command": "true"}]
+                }]
+            }
+        });
+        let imported = parse_configuration(&serde_json::to_vec(&value).unwrap(), &root).unwrap();
+        assert_ne!(imported.metadata.projects[0].id, uuid::Uuid::from_u128(1));
+        assert_ne!(
+            imported.metadata.projects[0].commands[0].id,
+            uuid::Uuid::from_u128(2)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_local_metadata_aborts_before_any_ssh_write() {
+        let root = fixture("bad-local");
+        let _cleanup = TemporaryDirectory(root.clone());
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        let original = "Host local\n  HostName 192.0.2.1\n";
+        fs::write(home.join(".ssh/config"), original).unwrap();
+        let metadata_path = root.join("hosts.json");
+        fs::write(&metadata_path, "broken").unwrap();
+        let bytes = serde_json::to_vec(&archive(&root.join("source"))).unwrap();
+        assert!(
+            apply_configuration(parse_configuration(&bytes, &home).unwrap(), &metadata_path)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(home.join(".ssh/config")).unwrap(),
+            original
+        );
+        assert!(!root.join("import-backups").exists());
     }
 }

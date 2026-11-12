@@ -14,6 +14,38 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct LegacyTaskId {
+    pub project_id: u64,
+    pub command_id: u64,
+    pub project_uuid: uuid::Uuid,
+    pub command_uuid: uuid::Uuid,
+}
+
+const LEGACY_IDS_FILE: &str = "legacy-runner-ids.json";
+
+pub(crate) fn save_legacy_ids(root: PathBuf, ids: &[LegacyTaskId]) -> io::Result<()> {
+    fs::create_dir_all(&root)?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let path = root.join(LEGACY_IDS_FILE);
+    let mut all = if path.exists() {
+        read_json::<Vec<LegacyTaskId>>(&path)?
+    } else {
+        Vec::new()
+    };
+    for id in ids {
+        if let Some(saved) = all
+            .iter_mut()
+            .find(|saved| saved.project_id == id.project_id && saved.command_id == id.command_id)
+        {
+            *saved = id.clone();
+        } else {
+            all.push(id.clone());
+        }
+    }
+    write_json(&path, &all)
+}
+
 use crate::projects::{
     ProjectCommand, ProjectDefinition, ProjectLifecycle, ProjectOwner, ProjectService, TaskKey,
     TaskStatus,
@@ -42,6 +74,7 @@ impl Snapshot {
 pub(crate) struct Handle {
     pub snapshot: Snapshot,
     record: PathBuf,
+    legacy_key: Option<(u64, u64)>,
     checked: Option<Instant>,
     pending: Option<Receiver<io::Result<Snapshot>>>,
     error: Option<String>,
@@ -52,23 +85,29 @@ impl Handle {
         self.snapshot.active()
     }
 
-    fn new(snapshot: Snapshot, record: PathBuf) -> Self {
+    fn new(snapshot: Snapshot, record: PathBuf, legacy_key: Option<(u64, u64)>) -> Self {
         Self {
             snapshot,
             record,
+            legacy_key,
             checked: None,
             pending: None,
             error: None,
         }
     }
 
-    fn request(expected: &Snapshot, action: &str) -> io::Result<Snapshot> {
+    fn request(
+        expected: &Snapshot,
+        action: &str,
+        legacy_key: Option<(u64, u64)>,
+    ) -> io::Result<Snapshot> {
         let mut stream = UnixStream::connect(&expected.socket)?;
         stream.set_read_timeout(Some(Duration::from_millis(500)))?;
         stream.set_write_timeout(Some(Duration::from_millis(500)))?;
         serde_json::to_writer(&mut stream, &(expected.token.as_str(), action))?;
         stream.write_all(b"\n")?;
-        let snapshot: Snapshot = serde_json::from_reader(stream)?;
+        let value: serde_json::Value = serde_json::from_reader(stream)?;
+        let snapshot = parse_snapshot(value, expected.owner.key, legacy_key)?;
         if snapshot.token != expected.token || snapshot.owner != expected.owner {
             return Err(io::Error::other("Background run identity changed."));
         }
@@ -78,7 +117,7 @@ impl Handle {
     pub fn stop(&mut self) -> io::Result<()> {
         if self.active() {
             self.pending = None;
-            self.snapshot = Self::request(&self.snapshot, "stop")?;
+            self.snapshot = Self::request(&self.snapshot, "stop", self.legacy_key)?;
             self.error = None;
         }
         Ok(())
@@ -113,18 +152,19 @@ impl Handle {
             self.checked = Some(Instant::now());
             let snapshot = self.snapshot.clone();
             let record = self.record.clone();
+            let legacy_key = self.legacy_key;
             let (sender, receiver) = mpsc::channel();
             self.pending = Some(receiver);
             std::thread::spawn(move || {
-                let result = Self::request(&snapshot, "status").or_else(|error| {
-                    let saved: Snapshot = read_json(&record)?;
+                let result = Self::request(&snapshot, "status", legacy_key).or_else(|error| {
+                    let saved = read_record(&record, snapshot.owner.key, legacy_key)?;
                     if saved.owner.key != snapshot.owner.key {
                         return Err(io::Error::other("Background record identity changed."));
                     }
                     if !saved.active() {
                         Ok(saved)
                     } else if saved.token != snapshot.token {
-                        Self::request(&saved, "status")
+                        Self::request(&saved, "status", legacy_key)
                     } else {
                         Err(error)
                     }
@@ -136,6 +176,37 @@ impl Handle {
             .as_ref()
             .map_or(Ok(()), |error| Err(io::Error::other(error.clone())))
     }
+}
+
+fn parse_snapshot(
+    mut value: serde_json::Value,
+    key: TaskKey,
+    legacy_key: Option<(u64, u64)>,
+) -> io::Result<Snapshot> {
+    if let Some(old_key) = legacy_key {
+        let stored = value
+            .pointer("/owner/key")
+            .and_then(serde_json::Value::as_array)
+            .filter(|parts| parts.len() == 2)
+            .and_then(|parts| Some((parts[0].as_u64()?, parts[1].as_u64()?)));
+        if stored == Some(old_key)
+            && let Some(owner) = value.get_mut("owner")
+        {
+            owner["key"] = serde_json::json!([key.0, key.1]);
+        }
+    }
+    let snapshot: Snapshot = serde_json::from_value(value)?;
+    if snapshot.owner.key != key {
+        return Err(io::Error::other(
+            "Background record identity does not match its command.",
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn read_record(path: &Path, key: TaskKey, legacy_key: Option<(u64, u64)>) -> io::Result<Snapshot> {
+    let value = read_json::<serde_json::Value>(path)?;
+    parse_snapshot(value, key, legacy_key)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -180,13 +251,18 @@ fn lock_run(root: &Path, key: TaskKey) -> io::Result<File> {
 }
 
 pub(crate) fn forget(root: &Path, key: TaskKey) -> io::Result<()> {
-    let record = record_path(root, key);
-    if !record.try_exists()? {
+    let current_record = record_path(root, key);
+    let (record, legacy_key) = if current_record.exists() {
+        (current_record, None)
+    } else if let Some((old_key, old_record)) = legacy_record_path(root, key)? {
+        (old_record, Some(old_key))
+    } else {
         return Ok(());
-    }
-    let _lock = lock_run(root, key)?;
-    let snapshot: Snapshot = read_json(&record)?;
-    if snapshot.active() || snapshot.owner.key != key {
+    };
+    let _lock = try_lock_legacy_or_current(root, key, legacy_key)?
+        .ok_or_else(|| io::Error::other("This command still has a background runner."))?;
+    let snapshot = read_record(&record, key, legacy_key)?;
+    if snapshot.active() {
         return Err(io::Error::other(
             "Background record is still active or unavailable.",
         ));
@@ -217,19 +293,17 @@ fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 }
 
 pub(crate) fn recover(root: &Path, key: TaskKey) -> io::Result<Option<Handle>> {
-    let record = record_path(root, key);
-    let mut snapshot: Snapshot = match read_json(&record) {
-        Ok(snapshot) => snapshot,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let current_record = record_path(root, key);
+    let (record, legacy_key) = if current_record.exists() {
+        (current_record, None)
+    } else if let Some((old_key, old_record)) = legacy_record_path(root, key)? {
+        (old_record, Some(old_key))
+    } else {
+        return Ok(None);
     };
-    if snapshot.owner.key != key {
-        return Err(io::Error::other(
-            "Background record identity does not match its command.",
-        ));
-    }
+    let mut snapshot = read_record(&record, key, legacy_key)?;
     if snapshot.active()
-        && let Some(_lock) = try_lock_run(root, key)?
+        && let Some(_lock) = try_lock_legacy_or_current(root, key, legacy_key)?
         && !crate::projects::group_has_live_processes(snapshot.owner.process_group)
     {
         snapshot.running = false;
@@ -238,10 +312,59 @@ pub(crate) fn recover(root: &Path, key: TaskKey) -> io::Result<Option<Handle>> {
         );
         write_json(&record, &snapshot)?;
     }
-    let mut handle = Handle::new(snapshot, record);
+    let mut handle = Handle::new(snapshot, record, legacy_key);
     // An active lock means the runner may still own a live process group.
     let _ = handle.refresh();
     Ok(Some(handle))
+}
+
+fn legacy_record_path(root: &Path, key: TaskKey) -> io::Result<Option<((u64, u64), PathBuf)>> {
+    let map_path = root.join(LEGACY_IDS_FILE);
+    let ids = match read_json::<Vec<LegacyTaskId>>(&map_path) {
+        Ok(ids) => ids,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(id) = ids
+        .iter()
+        .find(|id| (id.project_uuid, id.command_uuid) == key)
+    else {
+        return Ok(None);
+    };
+    let old_key = (id.project_id, id.command_id);
+    let record = root.join(format!("persistent-{}-{}.json", old_key.0, old_key.1));
+    Ok(record.exists().then_some((old_key, record)))
+}
+
+fn try_lock_legacy_or_current(
+    root: &Path,
+    key: TaskKey,
+    legacy_key: Option<(u64, u64)>,
+) -> io::Result<Option<File>> {
+    if let Some((project_id, command_id)) = legacy_key {
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(root.join(format!("persistent-{project_id}-{command_id}.lock")))?;
+        if unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Ok(Some(lock))
+    } else {
+        try_lock_run(root, key)
+    }
 }
 
 pub(crate) fn start(
@@ -308,7 +431,7 @@ pub(crate) fn start(
             if let Ok(snapshot) = read_json::<Snapshot>(&record)
                 && snapshot.token == token
             {
-                break Ok(Handle::new(snapshot, record));
+                break Ok(Handle::new(snapshot, record, None));
             }
             if let Some(status) = child.try_wait()? {
                 let detail = fs::read_to_string(spec.with_extension("error"))
@@ -569,5 +692,93 @@ mod tests {
         assert!(recover(&root, key).unwrap().unwrap().active());
         service.stop(key).unwrap();
         until(&mut service, |s| !s.active(key));
+    }
+
+    #[test]
+    fn migrated_numeric_runner_is_recovered_refreshed_and_stopped() {
+        use crate::projects::tests::Fixture;
+        use std::os::fd::AsRawFd;
+
+        let fixture = Fixture::new("legacy-runner-compatibility");
+        let root = fixture.root.join("logs");
+        fs::create_dir_all(&root).unwrap();
+        let old_key = (41_u64, 73_u64);
+        let key = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        save_legacy_ids(
+            root.clone(),
+            &[LegacyTaskId {
+                project_id: old_key.0,
+                command_id: old_key.1,
+                project_uuid: key.0,
+                command_uuid: key.1,
+            }],
+        )
+        .unwrap();
+
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(format!("persistent-{}-{}.lock", old_key.0, old_key.1)))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let socket_dir = std::env::temp_dir().join(format!(
+            "lt-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        fs::create_dir(&socket_dir).unwrap();
+        let socket = socket_dir.join("control");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let legacy_snapshot = serde_json::json!({
+            "owner": {
+                "key": [old_key.0, old_key.1],
+                "run_id": 5,
+                "process_group": std::process::id(),
+                "project_name": "Legacy project",
+                "command_name": "Legacy command"
+            },
+            "directory": fixture.root,
+            "command": "sleep 30",
+            "status": "Running",
+            "running": true,
+            "output": "",
+            "stdout_log": root.join("stdout.log"),
+            "stderr_log": root.join("stderr.log"),
+            "socket": socket,
+            "token": "old-runner-token"
+        });
+        write_json(
+            &root.join(format!("persistent-{}-{}.json", old_key.0, old_key.1)),
+            &legacy_snapshot,
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let (_, action): (String, String) = serde_json::from_str(&request).unwrap();
+                let mut response = legacy_snapshot.clone();
+                if action == "stop" {
+                    response["running"] = false.into();
+                    response["status"] = serde_json::json!("Stopped");
+                }
+                serde_json::to_writer(&mut stream, &response).unwrap();
+            }
+        });
+
+        let mut handle = recover(&root, key).unwrap().unwrap();
+        assert!(handle.active());
+        handle.stop().unwrap();
+        assert!(!handle.active());
+        server.join().unwrap();
+        fs::remove_dir_all(socket_dir).unwrap();
     }
 }

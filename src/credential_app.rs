@@ -253,13 +253,13 @@ mod tests {
         let fixture = Fixture::new("project-keychain-list");
         let mut app = app(&fixture);
         let mut project = crate::projects::ProjectDefinition {
-            id: 17,
+            id: uuid::Uuid::from_u128(17),
             name: "Dashboard".into(),
             ..Default::default()
         };
         project.links = vec![
             crate::projects::ProjectLink {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 name: "Home".into(),
                 url: "https://example.com/".into(),
                 username: "admin".into(),
@@ -268,7 +268,7 @@ mod tests {
                 password: None,
             },
             crate::projects::ProjectLink {
-                id: 2,
+                id: uuid::Uuid::from_u128(2),
                 name: "Admin".into(),
                 url: "https://example.com/admin".into(),
                 username: "admin".into(),
@@ -285,13 +285,13 @@ mod tests {
             .filter(|item| matches!(item.source, CredentialSource::ProjectLink { .. }))
             .collect::<Vec<_>>();
         assert_eq!(project_items.len(), 1);
-        assert!(matches!(
+        assert_eq!(
             project_items[0].source,
             CredentialSource::ProjectLink {
-                project_id: 17,
-                link_id: 1
+                project_id: uuid::Uuid::from_u128(17),
+                link_id: uuid::Uuid::from_u128(1)
             }
-        ));
+        );
         assert_eq!(
             project_items[0].credential.password_ref.as_deref(),
             Some("project-password-ref")
@@ -305,16 +305,20 @@ mod tests {
     fn scanned_keys_deduplicate_registered_paths_and_refresh_on_entry() {
         let fixture = Fixture::new("key-refresh");
         let mut app = app(&fixture);
-        let mut key =
-            credentials::generate_key(&fixture.root.join("key"), 42, "Saved".into()).unwrap();
+        let mut key = credentials::generate_key(
+            &fixture.root.join("key"),
+            uuid::Uuid::from_u128(42),
+            "Saved".into(),
+        )
+        .unwrap();
         app.metadata.credentials.push(key.clone());
-        key.id = 0;
+        key.id = uuid::Uuid::nil();
         key.public_key = "updated public key".into();
         key.fingerprint = "updated fingerprint".into();
         app.credential_manager.discovered_keys = vec![key];
         let items = app.visible_credentials();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].credential.id, 42);
+        assert_eq!(items[0].credential.id, uuid::Uuid::from_u128(42));
         assert_eq!(items[0].credential.public_key, "updated public key");
 
         // A new entry replaces the scan cache instead of retaining deleted discoveries.
@@ -363,7 +367,9 @@ mod tests {
         let fixture = Fixture::new("edit-key-name");
         let mut app = app(&fixture);
         let key_path = fixture.root.join("managed-key");
-        let key = credentials::generate_key(&key_path, 12, "Original name".into()).unwrap();
+        let key =
+            credentials::generate_key(&key_path, uuid::Uuid::from_u128(12), "Original name".into())
+                .unwrap();
         app.metadata.credentials.push(key);
         app.credential_manager.selected = 0;
 
@@ -407,7 +413,7 @@ mod tests {
 
     fn upload_test_key() -> Credential {
         Credential {
-            id: 12,
+            id: uuid::Uuid::from_u128(12),
             name: "Fixture key".into(),
             kind: CredentialKind::SshKey,
             username: String::new(),
@@ -629,9 +635,12 @@ mod tests {
         let fixture = Fixture::new("host-ssh-key-selector");
         let mut app = app(&fixture);
         save_password(&mut app, "server password");
-        let key =
-            credentials::generate_key(&fixture.root.join("ssh-key"), 12, "Fixture key".into())
-                .unwrap();
+        let key = credentials::generate_key(
+            &fixture.root.join("ssh-key"),
+            uuid::Uuid::from_u128(12),
+            "Fixture key".into(),
+        )
+        .unwrap();
         app.metadata.credentials.push(key);
 
         app.open_host_ssh_key_selector("web".into());
@@ -755,7 +764,7 @@ fn upload_authentication_failed(error: &str) -> bool {
 
 pub struct CredentialForm {
     pub kind: FormKind,
-    pub id: Option<u64>,
+    pub id: Option<uuid::Uuid>,
     pub fields: Vec<String>,
     pub selected: usize,
     pub error: Option<String>,
@@ -893,12 +902,6 @@ impl App {
             .filter_map(|item| item.credential.password_ref.as_deref())
             .map(str::to_string)
             .collect::<std::collections::HashSet<_>>();
-        let mut next_id = credentials
-            .iter()
-            .map(|item| item.credential.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
         for project in &self.metadata.projects {
             for link in &project.links {
                 if link.password_storage != crate::projects::PasswordStorage::Keychain {
@@ -912,7 +915,7 @@ impl App {
                 }
                 credentials.push(CredentialItem {
                     credential: Credential {
-                        id: next_id,
+                        id: uuid::Uuid::new_v4(),
                         name: format!("{}/{}", project.name, link.name),
                         kind: CredentialKind::Password,
                         username: link.username.clone(),
@@ -926,7 +929,6 @@ impl App {
                         link_id: link.id,
                     },
                 });
-                next_id = next_id.saturating_add(1);
             }
         }
         for credential in &self.credential_manager.discovered_keys {
@@ -1034,14 +1036,7 @@ impl App {
                 .credentials
                 .retain(|credential| credential.id != id);
         }
-        let id = self
-            .metadata
-            .credentials
-            .iter()
-            .map(|credential| credential.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let id = uuid::Uuid::new_v4();
         self.metadata.credentials.push(Credential {
             id,
             name: format!("{alias} password"),
@@ -1436,16 +1431,7 @@ impl App {
             vec![
                 String::new(),
                 if kind == FormKind::Generate {
-                    format!(
-                        "~/.ssh/lazyterm-key-{}",
-                        self.metadata
-                            .credentials
-                            .iter()
-                            .map(|item| item.id)
-                            .max()
-                            .unwrap_or(0)
-                            + 1
-                    )
+                    format!("~/.ssh/lazyterm-key-{}", uuid::Uuid::new_v4())
                 } else {
                     "~/.ssh/".into()
                 },
@@ -1468,15 +1454,7 @@ impl App {
             form.error = Some("Name is required.".into());
             return;
         }
-        let id = form.id.unwrap_or_else(|| {
-            self.metadata
-                .credentials
-                .iter()
-                .map(|item| item.id)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1)
-        });
+        let id = form.id.unwrap_or_else(uuid::Uuid::new_v4);
         let name = form.fields[0].trim().to_string();
         let kind = form.kind;
         let path = form

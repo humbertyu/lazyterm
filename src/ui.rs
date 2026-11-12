@@ -4230,7 +4230,7 @@ fn render_import_confirmation(frame: &mut Frame, app: &App, kind: crate::app::Im
         crate::app::ImportKind::Configuration => (
             "IMPORT CONFIGURATION",
             format!(
-                "This replaces LazyTerm metadata and {} SSH hosts. Current files will be backed up first. Keychain passwords are imported separately.",
+                "Merge {} SSH hosts and LazyTerm data. Incoming same-name entries take priority; local-only entries remain. Current files will be backed up first. Keychain passwords are imported separately.",
                 app.pending_configuration_import
                     .as_ref()
                     .map_or(0, |pending| pending.import.host_count)
@@ -4733,7 +4733,7 @@ mod tests {
         fixture.project.groups = vec!["Services".into()];
         fixture.project.commands.push(command);
         fixture.project.links.push(crate::projects::ProjectLink {
-            id: 1,
+            id: uuid::Uuid::from_u128(1),
             name: "Home".into(),
             url: "http://localhost/".into(),
             ..Default::default()
@@ -4788,7 +4788,7 @@ mod tests {
             origin: RuntimeOrigin::Project,
             origin_reason: "Managed command: Demo / Dev server".into(),
             project: Some(crate::projects::ProjectOwner {
-                key: (1, 2),
+                key: (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)),
                 run_id: 3,
                 process_group: 42,
                 project_name: "Demo".into(),
@@ -5012,7 +5012,7 @@ mod tests {
         app.metadata
             .tunnels
             .push(crate::metadata::TunnelDefinition {
-                id: 1,
+                id: uuid::Uuid::from_u128(1),
                 label: "web-db".into(),
                 host_alias: "web".into(),
                 custom_host: false,
@@ -5159,7 +5159,7 @@ mod tests {
             let mut metadata = Metadata::default();
             metadata.tags.insert("web".into(), parse_tags("prod,work"));
             metadata.credentials.push(crate::credentials::Credential {
-                id: 9,
+                id: uuid::Uuid::from_u128(9),
                 name: "web password".into(),
                 kind: crate::credentials::CredentialKind::Password,
                 username: "deploy".into(),
@@ -5168,7 +5168,9 @@ mod tests {
                 public_key: String::new(),
                 fingerprint: String::new(),
             });
-            metadata.host_passwords.insert("web".into(), 9);
+            metadata
+                .host_passwords
+                .insert("web".into(), uuid::Uuid::from_u128(9));
             metadata
                 .uploaded_keys
                 .insert("web".into(), vec!["SHA256:fixture".into()]);
