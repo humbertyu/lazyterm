@@ -13,7 +13,11 @@ pub enum TunnelEvent {
     Stderr { id: u64, message: String },
 }
 
-pub fn spawn_forward(tunnel: &TunnelDefinition, events: Sender<TunnelEvent>) -> io::Result<Child> {
+pub fn spawn_forward(
+    tunnel: &TunnelDefinition,
+    events: Sender<TunnelEvent>,
+    auth: &crate::credentials::HostAuth,
+) -> io::Result<Child> {
     check_local_bind(tunnel)?;
     let (option, forward) = forward_spec(tunnel)?;
     let mut command = Command::new("ssh");
@@ -35,10 +39,11 @@ pub fn spawn_forward(tunnel: &TunnelDefinition, events: Sender<TunnelEvent>) -> 
         .arg("ServerAliveCountMax=3")
         .arg(option)
         .arg(forward)
-        .arg(&tunnel.host_alias)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    crate::credentials::configure_host_auth(&mut command, auth, &tunnel.host_alias)?;
+    command.arg(&tunnel.host_alias);
     let mut child = command.spawn()?;
     if let Some(mut stderr) = child.stderr.take() {
         let id = tunnel.id;
@@ -47,7 +52,7 @@ pub fn spawn_forward(tunnel: &TunnelDefinition, events: Sender<TunnelEvent>) -> 
             .spawn(move || {
                 let mut output = String::new();
                 let _ = stderr.read_to_string(&mut output);
-                let message = output.trim().to_string();
+                let message = crate::diagnostics::redact_sensitive_text(output.trim());
                 if !message.is_empty() {
                     let _ = events.send(TunnelEvent::Stderr { id, message });
                 }

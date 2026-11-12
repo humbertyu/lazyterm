@@ -14,6 +14,23 @@ pub enum CredentialKind {
     SshKey,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostAuth {
+    pub username: Option<String>,
+    pub password_ref: Option<String>,
+}
+
+pub fn configure_host_auth(command: &mut Command, auth: &HostAuth, alias: &str) -> io::Result<()> {
+    if let Some(username) = auth.username.as_deref() {
+        command.args(["-l", username]);
+    }
+    if let Some(reference) = auth.password_ref.as_deref() {
+        command.args(["-o", "BatchMode=no"]);
+        configure_password_for(command, reference, alias, auth.username.as_deref())?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Credential {
     pub id: u64,
@@ -221,9 +238,20 @@ pub fn upload_command(key: &str) -> Result<String, String> {
     ))
 }
 
-pub fn configure_password(command: &mut Command, reference: &str, alias: &str) -> io::Result<()> {
-    let output = Command::new("ssh")
-        .args(["-G", "--", alias])
+pub fn configure_password_for(
+    command: &mut Command,
+    reference: &str,
+    alias: &str,
+    username: Option<&str>,
+) -> io::Result<()> {
+    let mut resolver = Command::new("ssh");
+    resolver.args(["-G"]);
+    if let Some(username) = username {
+        resolver.args(["-l", username]);
+    }
+    let output = resolver
+        .arg("--")
+        .arg(alias)
         .stdin(Stdio::null())
         .output()?;
     if !output.status.success() {
@@ -346,7 +374,7 @@ fn run_upload(
     ]);
     if let Some(reference) = password_ref {
         command.args(["-o", "BatchMode=no"]);
-        configure_password(&mut command, reference, alias)
+        configure_password_for(&mut command, reference, alias, username)
             .map_err(|_| "Could not prepare password authentication.")?;
     } else {
         command.args(["-o", "BatchMode=yes"]);
@@ -439,6 +467,26 @@ mod tests {
         ] {
             assert!(!password_prompt_matches(prompt, expected));
         }
+    }
+
+    #[test]
+    fn host_auth_adds_username_without_exposing_secret_material() {
+        let auth = HostAuth {
+            username: Some("deploy".into()),
+            password_ref: None,
+        };
+        let mut command = Command::new("ssh");
+        configure_host_auth(&mut command, &auth, "web").unwrap();
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["-l", "deploy"]);
+        assert!(
+            command
+                .get_envs()
+                .all(|(name, _)| name != std::ffi::OsStr::new("LAZYTERM_ASKPASS_REFERENCE"))
+        );
     }
 
     #[test]

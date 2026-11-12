@@ -17,6 +17,7 @@ const CLIPBOARD_LIFETIME: Duration = Duration::from_secs(30);
 trait PasswordStore: Send + Sync {
     fn set(&self, reference: &str, password: &str) -> Result<(), String>;
     fn get(&self, reference: &str) -> Result<Zeroizing<String>, String>;
+    fn get_optional(&self, reference: &str) -> Result<Option<Zeroizing<String>>, String>;
     fn delete(&self, reference: &str) -> Result<(), String>;
 }
 
@@ -64,6 +65,22 @@ fn valid_reference(reference: &str) -> bool {
         })
 }
 
+pub fn valid_password_reference(reference: &str) -> bool {
+    valid_reference(reference)
+}
+
+pub fn replace_password(reference: &str, password: &str) -> Result<(), String> {
+    store().set(reference, password)
+}
+
+pub fn read_optional_password(reference: &str) -> Result<Option<Zeroizing<String>>, String> {
+    store().get_optional(reference)
+}
+
+pub fn delete_password(reference: &str) -> Result<(), String> {
+    store().delete(reference)
+}
+
 impl PasswordStore for SystemStore {
     fn set(&self, reference: &str, password: &str) -> Result<(), String> {
         entry(reference)?
@@ -76,6 +93,14 @@ impl PasswordStore for SystemStore {
             .get_password()
             .map(Zeroizing::new)
             .map_err(|_| "Could not read saved password; unlock the keychain or replace it.".into())
+    }
+
+    fn get_optional(&self, reference: &str) -> Result<Option<Zeroizing<String>>, String> {
+        match entry(reference)?.get_password() {
+            Ok(password) => Ok(Some(Zeroizing::new(password))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("Could not read system keychain; unlock it and retry.".into()),
+        }
     }
 
     fn delete(&self, reference: &str) -> Result<(), String> {
@@ -413,6 +438,15 @@ pub(crate) mod tests {
                 .cloned()
                 .map(Zeroizing::new)
                 .ok_or("missing".into())
+        }
+        fn get_optional(&self, reference: &str) -> Result<Option<Zeroizing<String>>, String> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(reference)
+                .cloned()
+                .map(Zeroizing::new))
         }
         fn delete(&self, reference: &str) -> Result<(), String> {
             self.0.lock().unwrap().remove(reference);

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::hosts::HostCatalog;
 
+const CURRENT_METADATA_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TunnelKind {
     #[default]
@@ -124,15 +126,29 @@ pub struct ExportBundle<'a> {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Theme {
     #[default]
-    Dark,
-    Light,
+    #[serde(alias = "Dark", alias = "Light")]
+    Forest,
+    Ocean,
+    Amber,
+    Rose,
 }
 
 impl Theme {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Dark => "Dark",
-            Self::Light => "Light",
+            Self::Forest => "Forest",
+            Self::Ocean => "Ocean",
+            Self::Amber => "Amber",
+            Self::Rose => "Rose",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Forest => Self::Ocean,
+            Self::Ocean => Self::Amber,
+            Self::Amber => Self::Rose,
+            Self::Rose => Self::Forest,
         }
     }
 }
@@ -142,6 +158,7 @@ pub enum Language {
     #[default]
     English,
     Chinese,
+    Japanese,
 }
 
 impl Language {
@@ -149,6 +166,15 @@ impl Language {
         match self {
             Self::English => "English",
             Self::Chinese => "中文",
+            Self::Japanese => "日本語",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::English => Self::Chinese,
+            Self::Chinese => Self::Japanese,
+            Self::Japanese => Self::English,
         }
     }
 }
@@ -156,7 +182,7 @@ impl Language {
 impl Default for Metadata {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: CURRENT_METADATA_VERSION,
             view: HostView::Groups,
             tags: BTreeMap::new(),
             host_groups: Vec::new(),
@@ -166,7 +192,7 @@ impl Default for Metadata {
             tunnels: Vec::new(),
             snippet_packages: Vec::new(),
             projects: Vec::new(),
-            theme: Theme::Dark,
+            theme: Theme::Forest,
             language: Language::English,
             hidden_tabs: Vec::new(),
             credentials: Vec::new(),
@@ -205,16 +231,41 @@ impl Metadata {
     pub(crate) fn read_from(path: &std::path::Path) -> io::Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
-                let metadata: Self = serde_json::from_slice(&bytes)?;
-                if metadata.version != 1 {
+                let document: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let version = match document.get("version") {
+                    None => 1,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|version| u32::try_from(version).ok())
+                        .ok_or_else(|| io::Error::other("Invalid host metadata version"))?,
+                };
+                if version == 0 || version > CURRENT_METADATA_VERSION {
                     return Err(io::Error::other("Unsupported host metadata version"));
                 }
+                let mut metadata: Self = serde_json::from_value(document)?;
+                metadata.version = version;
                 *metadata.snapshot.borrow_mut() = Some(bytes);
+                if version < CURRENT_METADATA_VERSION {
+                    metadata.version = CURRENT_METADATA_VERSION;
+                    metadata.save_to(path)?;
+                }
                 Ok(metadata)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn save_imported(path: &std::path::Path, mut imported: Self) -> io::Result<Self> {
+        let current = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        *imported.snapshot.borrow_mut() = current;
+        imported.version = CURRENT_METADATA_VERSION;
+        imported.save_to(path)?;
+        Ok(imported)
     }
 
     #[cfg(not(test))]
@@ -390,6 +441,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_theme_values_load_as_forest_without_dropping_projects() {
+        let fixture = crate::projects::tests::Fixture::new("legacy-theme");
+        for legacy_theme in ["Dark", "Light"] {
+            let mut metadata = Metadata::default();
+            metadata.projects.push(fixture.project.clone());
+            let mut value = serde_json::to_value(metadata).unwrap();
+            value["theme"] = serde_json::Value::String(legacy_theme.into());
+
+            let restored: Metadata = serde_json::from_value(value).unwrap();
+            assert_eq!(restored.theme, Theme::Forest);
+            assert_eq!(restored.projects, [fixture.project.clone()]);
+        }
+    }
+
+    #[test]
     fn stale_writer_cannot_erase_projects_credentials_or_unknown_fields() {
         let fixture = crate::projects::tests::Fixture::new("stale-metadata-writer");
         let path = fixture.root.join("hosts.json");
@@ -423,7 +489,7 @@ mod tests {
             .insert("future_field".into(), serde_json::json!({"keep": true}));
         current.save_to(&path).unwrap();
         let saved = fs::read(&path).unwrap();
-        stale.theme = Theme::Light;
+        stale.theme = Theme::Ocean;
         let error = stale.save_to(&path).unwrap_err();
         assert!(error.to_string().contains("Configuration changed on disk"));
         assert_eq!(fs::read(&path).unwrap(), saved);
@@ -431,7 +497,7 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), saved);
 
         let mut reloaded = Metadata::read_from(&path).unwrap();
-        reloaded.theme = Theme::Light;
+        reloaded.theme = Theme::Amber;
         reloaded.save_to(&path).unwrap();
         reloaded.language = Language::Chinese;
         reloaded.save_to(&path).unwrap();
@@ -566,14 +632,23 @@ mod tests {
         assert!(metadata.reconcile(&HostCatalog::default()));
         assert_eq!(metadata.projects.as_slice(), std::slice::from_ref(&project));
         metadata.save_to(&path).unwrap();
-        assert_eq!(
-            fs::read(path.with_extension("config.lazyterm.bak")).unwrap(),
-            original
+        let dated_backups = path.with_file_name("hosts.json.backups");
+        assert!(
+            fs::read_dir(&dated_backups)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| fs::read(entry.path()).is_ok_and(|backup| backup == original))
         );
         let restored = Metadata::read_from(&path).unwrap();
         assert_eq!(restored.projects, [project]);
-        assert_eq!(restored.version, 1);
+        assert_eq!(restored.version, CURRENT_METADATA_VERSION);
         assert!(restored.tags.is_empty());
+        let backups = fs::read_dir(path.with_file_name("hosts.json.backups"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| fs::read(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(backups.iter().any(|backup| backup == &original));
     }
 
     #[test]
@@ -587,7 +662,7 @@ mod tests {
     #[test]
     fn metadata_round_trips_tags_and_view() {
         let mut metadata = Metadata {
-            version: 1,
+            version: CURRENT_METADATA_VERSION,
             view: HostView::Hosts,
             ..Metadata::default()
         };
@@ -718,7 +793,10 @@ mod tests {
     fn metadata_persists_and_rejects_corrupt_or_future_files() {
         let root = env::temp_dir().join(format!("lazyterm-metadata-{}", std::process::id()));
         let path = root.join("hosts.json");
-        assert_eq!(Metadata::read_from(&path).unwrap().version, 1);
+        assert_eq!(
+            Metadata::read_from(&path).unwrap().version,
+            CURRENT_METADATA_VERSION
+        );
         let mut metadata = Metadata {
             view: HostView::Hosts,
             ..Metadata::default()
@@ -728,7 +806,9 @@ mod tests {
         let restored = Metadata::read_from(&path).unwrap();
         assert_eq!(restored.tags["web"], ["prod", "work"]);
         assert_eq!(restored.view, HostView::Hosts);
-        fs::write(&path, r#"{"version":2}"#).unwrap();
+        fs::write(&path, r#"{"version":3}"#).unwrap();
+        assert!(Metadata::read_from(&path).is_err());
+        fs::write(&path, r#"{"version":"old"}"#).unwrap();
         assert!(Metadata::read_from(&path).is_err());
         fs::write(&path, "{").unwrap();
         assert!(Metadata::read_from(&path).is_err());

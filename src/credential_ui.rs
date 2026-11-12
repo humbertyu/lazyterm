@@ -11,16 +11,27 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-const ACCENT: Color = Color::Rgb(133, 196, 159);
-const TEXT: Color = Color::Rgb(215, 228, 218);
-const MUTED: Color = Color::Rgb(140, 156, 151);
-const BG: Color = Color::Rgb(18, 23, 23);
+const ACCENT: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Accent);
+const TEXT: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Text);
+const MUTED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Muted);
+const BG: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Panel);
 fn panel(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(BG).fg(TEXT))
+        .border_style(Style::default().fg(ACCENT.into()))
+        .style(Style::default().bg(BG.into()).fg(TEXT.into()))
+}
+
+fn panel_l(app: &App, title: &str) -> Block<'static> {
+    Block::default()
+        .title(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, title)
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT.into()))
+        .style(Style::default().bg(BG.into()).fg(TEXT.into()))
 }
 
 fn action_panel<'a>(title: &'a str, footer: &str) -> Block<'a> {
@@ -28,11 +39,11 @@ fn action_panel<'a>(title: &'a str, footer: &str) -> Block<'a> {
         .title(title)
         .title_bottom(Span::styled(
             format!(" {footer} "),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED.into()),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(BG).fg(TEXT))
+        .border_style(Style::default().fg(ACCENT.into()))
+        .style(Style::default().bg(BG.into()).fg(TEXT.into()))
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -63,6 +74,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
+    crate::theme::set_active(app.metadata.theme);
     let state = &app.credential_manager;
     if state.ssh_key_only {
         render_host_key_selector(frame, app);
@@ -109,7 +121,9 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
             };
             list_rows.push(ListItem::new(Line::from(Span::styled(
                 format!("{label}  ({count})"),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(ACCENT.into())
+                    .add_modifier(Modifier::BOLD),
             ))));
             previous_kind = Some(kind);
         }
@@ -133,7 +147,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
                     (CredentialKind::SshKey, _) => "  SSH key / file",
                     (CredentialKind::Password, CredentialSource::DiscoveredKey) => "  Password",
                 },
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED.into()),
             )),
         ]));
     }
@@ -141,14 +155,22 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(
         List::new(list_rows)
             .highlight_symbol("> ")
-            .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-            .block(panel(" KEYCHAIN & SSH KEYS ")),
+            .highlight_style(
+                Style::default()
+                    .fg(ACCENT.into())
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(panel_l(app, "KEYCHAIN & SSH KEYS")),
         content[0],
         &mut selection,
     );
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new("No credentials found. Managed credentials and Project Keychain links appear here; local ~/.ssh keys are discovered on entry. Press r to refresh.")
+            Paragraph::new(match app.metadata.language {
+                crate::metadata::Language::English => "No credentials found. Managed credentials and Project Keychain links appear here; local ~/.ssh keys are discovered on entry. Press r to refresh.",
+                crate::metadata::Language::Chinese => "没有找到凭据。此处显示 LazyTerm 凭据和项目钥匙串链接；进入此页时会扫描本地 ~/.ssh 密钥。按 r 刷新。",
+                crate::metadata::Language::Japanese => "認証情報がありません。LazyTerm の認証情報とプロジェクトのキーチェーンリンクを表示します。ローカルの ~/.ssh 鍵はこの画面を開くと検出されます。r で更新します。",
+            })
                 .wrap(Wrap { trim: false }),
             content[0].inner(Margin::new(1, 1)),
         );
@@ -207,7 +229,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(details)
             .wrap(Wrap { trim: false })
-            .block(panel(" DETAILS ")),
+            .block(panel_l(app, "DETAILS")),
         content[1],
     );
     let help = if state.ssh_key_only {
@@ -230,7 +252,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(help)
-            .style(Style::default().fg(MUTED))
+            .style(Style::default().fg(MUTED.into()))
             .wrap(Wrap { trim: false }),
         rows[1],
     );
@@ -261,7 +283,7 @@ fn render_host_key_selector(frame: &mut Frame, app: &App) {
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default(),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED.into()),
             )),
         ])
     });
@@ -271,7 +293,11 @@ fn render_host_key_selector(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(
         List::new(rows_content)
             .highlight_symbol("> ")
-            .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            .highlight_style(
+                Style::default()
+                    .fg(ACCENT.into())
+                    .add_modifier(Modifier::BOLD),
+            ),
         rows[0],
         &mut selection,
     );
@@ -284,7 +310,7 @@ fn render_host_key_selector(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(
         Paragraph::new("↑↓ select  Enter set IdentityFile  Esc cancel")
-            .style(Style::default().fg(MUTED)),
+            .style(Style::default().fg(MUTED.into())),
         rows[1],
     );
 }
@@ -348,7 +374,7 @@ fn render_overlays(frame: &mut Frame, app: &App) {
                 .style(Style::default().fg(if form.kind == FormKind::Generate {
                     Color::Yellow
                 } else {
-                    MUTED
+                    MUTED.into()
                 })),
             rows[0],
         );
@@ -374,12 +400,12 @@ fn render_overlays(frame: &mut Frame, app: &App) {
                             .title(*label)
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(if focused {
-                                ACCENT
+                                ACCENT.into()
                             } else {
-                                MUTED
+                                MUTED.into()
                             })),
                     )
-                    .style(Style::default().fg(TEXT)),
+                    .style(Style::default().fg(TEXT.into())),
                 field_rows[index],
             );
         }
@@ -395,7 +421,7 @@ fn render_overlays(frame: &mut Frame, app: &App) {
         );
         frame.render_widget(
             Paragraph::new("Tab / Up / Down field   Enter save   Esc cancel")
-                .style(Style::default().fg(MUTED)),
+                .style(Style::default().fg(MUTED.into())),
             rows[3],
         );
     }

@@ -3,24 +3,26 @@ use std::process::{Child, ExitStatus};
 use std::{
     collections::VecDeque,
     fs,
+    fs::OpenOptions,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::AtomicBool,
         mpsc::{Receiver, Sender, TryRecvError},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use age::{Encryptor, secrecy::SecretString};
+use age::{Decryptor, Encryptor, secrecy::SecretString};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::hosts::{Host, HostCatalog};
 use crate::metadata::{
-    ExportBundle, HostView, Language, Metadata, SnippetDefinition, SnippetPackage, Theme,
-    TunnelDefinition, TunnelKind, TunnelLifecycle, parse_tags,
+    ExportBundle, HostView, Metadata, SnippetDefinition, SnippetPackage, TunnelDefinition,
+    TunnelKind, TunnelLifecycle, parse_tags,
 };
 use crate::runtime::{self, RuntimeEntry, RuntimeEvent, RuntimeFilter, RuntimeTarget};
 use crate::sftp::{
@@ -229,6 +231,11 @@ pub struct App {
     pub snippet_dialog: Option<SnippetDialog>,
     pub package_dialog: Option<PackageDialog>,
     pub credential_export_dialog: Option<CredentialExportDialog>,
+    pub credential_import_dialog: Option<CredentialImportDialog>,
+    pub import_confirmation: Option<ImportKind>,
+    pub pending_configuration_import: Option<PendingConfigurationImport>,
+    pending_credential_import_path: Option<PathBuf>,
+    pending_credential_import: Option<PendingCredentialImport>,
     pub tunnel_host_picker_open: bool,
     pub snippet_host_picker_open: bool,
     pub snippet_host_picker_group: Option<HostGroup>,
@@ -300,6 +307,85 @@ pub struct App {
     next_snippet_run_id: u64,
     tunnel_errors: std::collections::HashMap<u64, String>,
     tunnel_retries: std::collections::HashMap<u64, TunnelRetry>,
+}
+
+fn configuration_export_bytes(
+    source: &Metadata,
+    hosts: &[Host],
+    ssh_config_path: Option<String>,
+    ssh_config: String,
+    ssh_config_files: std::collections::BTreeMap<String, String>,
+) -> io::Result<Vec<u8>> {
+    let mut metadata = source.clone();
+    for project in &mut metadata.projects {
+        for link in &mut project.links {
+            link.password = None;
+        }
+    }
+    let bundle = ExportBundle {
+        format_version: 1,
+        ssh_config_path,
+        ssh_config,
+        ssh_config_files,
+        hosts,
+        metadata: &metadata,
+        passwords_included: false,
+    };
+    serde_json::to_vec_pretty(&bundle).map_err(io::Error::other)
+}
+
+fn write_private_export(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("Export path has no file name."))?
+        .to_string_lossy();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let temporary = path.with_file_name(format!(".{name}.{}-{nonce}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+type KeychainReplacement = (String, Zeroizing<String>, Option<Zeroizing<String>>);
+
+fn restore_imported_keychain(
+    replacements: &[KeychainReplacement],
+    changed: &[String],
+) -> Result<(), String> {
+    let mut first_error = None;
+    for reference in changed.iter().rev() {
+        let previous = replacements
+            .iter()
+            .find(|(candidate, _, _)| candidate == reference)
+            .and_then(|(_, _, previous)| previous.as_deref());
+        let result = match previous {
+            Some(password) => crate::project_credentials::replace_password(reference, password),
+            None => crate::project_credentials::delete_password(reference),
+        };
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 pub struct ToastNotice {
@@ -380,6 +466,46 @@ pub struct CredentialExportDialog {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImportKind {
+    Configuration,
+    Credentials,
+}
+
+pub struct CredentialImportDialog {
+    pub password: String,
+    pub error: Option<String>,
+}
+
+pub struct PendingConfigurationImport {
+    pub import: crate::import_export::ConfigurationImport,
+    pub source_path: PathBuf,
+}
+
+pub struct PendingCredentialImport {
+    archive: CredentialImport,
+    export_password: Zeroizing<String>,
+}
+
+fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Selected import file is too large.",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Selected import file is too large.",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[derive(Serialize)]
 struct CredentialExport {
     format_version: u32,
@@ -390,6 +516,24 @@ struct CredentialExport {
 struct CredentialRecord {
     reference: String,
     password: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CredentialImport {
+    format_version: u32,
+    credentials: Vec<ImportedCredentialRecord>,
+}
+
+#[derive(serde::Deserialize)]
+struct ImportedCredentialRecord {
+    reference: String,
+    password: String,
+}
+
+impl Drop for ImportedCredentialRecord {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
 }
 
 impl Drop for CredentialRecord {
@@ -464,6 +608,11 @@ fn spawn_snippet_reader<R: Read + Send + 'static>(
                 }
                 Ok(size) => {
                     let text = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                    let text = if stderr {
+                        crate::diagnostics::redact_sensitive_text(&text)
+                    } else {
+                        text
+                    };
                     if sender
                         .send(SnippetProcessEvent::Output(text, stderr))
                         .is_err()
@@ -648,6 +797,11 @@ impl App {
             snippet_dialog: None,
             package_dialog: None,
             credential_export_dialog: None,
+            credential_import_dialog: None,
+            import_confirmation: None,
+            pending_configuration_import: None,
+            pending_credential_import_path: None,
+            pending_credential_import: None,
             tunnel_host_picker_open: false,
             snippet_host_picker_open: false,
             snippet_host_picker_group: None,
@@ -2217,7 +2371,8 @@ impl App {
         }
         self.tunnel_errors.remove(&tunnel.id);
         self.tunnel_retries.remove(&tunnel.id);
-        match tunnel::spawn_forward(&tunnel, self.tunnel_sender.clone()) {
+        let auth = self.host_password_auth(&tunnel.host_alias);
+        match tunnel::spawn_forward(&tunnel, self.tunnel_sender.clone(), &auth) {
             Ok(child) => {
                 self.tunnel_processes.insert(tunnel.id, child);
                 self.tunnel_statuses
@@ -2896,18 +3051,36 @@ impl App {
             .map(|run| run.id)
             .collect::<Vec<_>>();
         for id in queued {
+            let Some(host_alias) = self
+                .snippet_runs
+                .iter()
+                .find(|run| run.id == id)
+                .map(|run| run.host_alias.clone())
+            else {
+                continue;
+            };
+            let auth = self.host_password_auth(&host_alias);
             let Some(run) = self.snippet_runs.iter_mut().find(|run| run.id == id) else {
                 continue;
             };
-            match std::process::Command::new("ssh")
-                .args([
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "RequestTTY=no",
-                    "-o",
-                    "ConnectTimeout=10",
-                ])
+            let mut command = std::process::Command::new("ssh");
+            command.args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "RequestTTY=no",
+                "-o",
+                "ConnectTimeout=10",
+            ]);
+            if let Err(error) =
+                crate::credentials::configure_host_auth(&mut command, &auth, &host_alias)
+            {
+                run.status = SnippetRunStatus::ConnectionFailed(format!(
+                    "Could not prepare saved Host credentials: {error}"
+                ));
+                continue;
+            }
+            match command
                 .arg(&run.host_alias)
                 .arg(&run.command)
                 .stdin(std::process::Stdio::null())
@@ -3147,6 +3320,8 @@ impl App {
             || self.snippet_dialog.is_some()
             || self.package_dialog.is_some()
             || self.credential_export_dialog.is_some()
+            || self.credential_import_dialog.is_some()
+            || self.import_confirmation.is_some()
             || self.snippet_confirmation.is_some()
             || self.snippet_delete_confirmation.is_some()
             || self.runtime_host_picker_open
@@ -3211,6 +3386,10 @@ impl App {
             self.handle_host_action_dialog_key(key.code);
         } else if self.credential_export_dialog.is_some() {
             self.handle_credential_export_key(key.code);
+        } else if self.credential_import_dialog.is_some() {
+            self.handle_credential_import_key(key.code);
+        } else if self.import_confirmation.is_some() {
+            self.handle_import_confirmation_key(key.code);
         } else if self.snippet_confirmation.is_some() {
             return self.handle_snippet_confirmation_key(key.code);
         } else if self.snippet_delete_confirmation.is_some() {
@@ -3302,12 +3481,6 @@ impl App {
             self.notice = Some("Configuration export cancelled.".into());
             return;
         };
-        let (ssh_config_path, ssh_config) = HostCatalog::config_path()
-            .map(|config_path| {
-                let contents = fs::read_to_string(&config_path).unwrap_or_default();
-                (Some(config_path.display().to_string()), contents)
-            })
-            .unwrap_or((None, String::new()));
         let ssh_config_files = match HostCatalog::config_snapshot() {
             Ok(files) => files,
             Err(error) => {
@@ -3315,24 +3488,21 @@ impl App {
                 return;
             }
         };
-        let mut metadata = self.metadata.clone();
-        for project in &mut metadata.projects {
-            for link in &mut project.links {
-                link.password = None;
-            }
-        }
-        let bundle = ExportBundle {
-            format_version: 1,
-            ssh_config_path,
+        let ssh_config_path = HostCatalog::config_path();
+        let ssh_config = ssh_config_path
+            .as_ref()
+            .and_then(|config_path| fs::canonicalize(config_path).ok())
+            .and_then(|config_path| ssh_config_files.get(&config_path.display().to_string()))
+            .cloned()
+            .unwrap_or_default();
+        let result = configuration_export_bytes(
+            &self.metadata,
+            &self.hosts.hosts,
+            ssh_config_path.map(|path| path.display().to_string()),
             ssh_config,
             ssh_config_files,
-            hosts: &self.hosts.hosts,
-            metadata: &metadata,
-            passwords_included: false,
-        };
-        let result = serde_json::to_vec_pretty(&bundle)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| fs::write(&path, bytes));
+        )
+        .and_then(|bytes| write_private_export(&path, &bytes));
         self.notice = Some(match result {
             Ok(()) => format!("Configuration exported to {}.", path.display()),
             Err(error) => format!("Could not export configuration: {error}"),
@@ -3342,17 +3512,11 @@ impl App {
     fn toggle_setting(&mut self) {
         match self.selected_setting {
             0 => {
-                self.metadata.theme = match self.metadata.theme {
-                    Theme::Dark => Theme::Light,
-                    Theme::Light => Theme::Dark,
-                };
+                self.metadata.theme = self.metadata.theme.next();
                 self.save_metadata();
             }
             1 => {
-                self.metadata.language = match self.metadata.language {
-                    Language::English => Language::Chinese,
-                    Language::Chinese => Language::English,
-                };
+                self.metadata.language = self.metadata.language.next();
                 self.save_metadata();
             }
             2..=8 => {
@@ -3378,6 +3542,8 @@ impl App {
                     error: None,
                 })
             }
+            11 => self.import_configuration(),
+            12 => self.import_credentials(),
             _ => {}
         }
     }
@@ -3530,7 +3696,7 @@ impl App {
                 return;
             }
         };
-        match fs::write(&path, encrypted) {
+        match write_private_export(&path, &encrypted) {
             Ok(()) => {
                 self.notice = Some(format!(
                     "Encrypted credentials exported to {}.",
@@ -3557,8 +3723,359 @@ impl App {
         Ok(output)
     }
 
+    fn metadata_path(&self) -> io::Result<PathBuf> {
+        #[cfg(test)]
+        {
+            self.metadata_save_path
+                .clone()
+                .ok_or_else(|| io::Error::other("Tests must set an isolated metadata_save_path"))
+        }
+        #[cfg(not(test))]
+        {
+            Metadata::data_dir().map(|directory| directory.join("hosts.json"))
+        }
+    }
+
+    fn import_configuration(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import LazyTerm configuration")
+            .add_filter("LazyTerm configuration", &["json"])
+            .pick_file()
+        else {
+            self.notice = Some("Configuration import cancelled.".into());
+            return;
+        };
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let parsed = read_limited(&path, 64 * 1024 * 1024)
+            .and_then(|bytes| crate::import_export::parse_configuration(&bytes, &home));
+        match parsed {
+            Ok(import) => {
+                self.pending_configuration_import = Some(PendingConfigurationImport {
+                    import,
+                    source_path: path,
+                });
+                self.import_confirmation = Some(ImportKind::Configuration);
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "Configuration import rejected; no files were changed: {}",
+                    crate::diagnostics::redact_sensitive_text(&error.to_string())
+                ));
+            }
+        }
+    }
+
+    fn import_credentials(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import encrypted credentials")
+            .add_filter("Age encrypted credentials", &["age"])
+            .pick_file()
+        else {
+            self.notice = Some("Credential import cancelled.".into());
+            return;
+        };
+        self.credential_import_dialog = Some(CredentialImportDialog {
+            password: String::new(),
+            error: None,
+        });
+        self.pending_credential_import_path = Some(path);
+    }
+
+    fn decrypt_credential_archive(
+        bytes: &[u8],
+        password: Zeroizing<String>,
+    ) -> io::Result<CredentialImport> {
+        let decryptor = Decryptor::new(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid age file."))?;
+        let identity = age::scrypt::Identity::new(SecretString::from(password.to_string()));
+        let reader = decryptor
+            .decrypt(std::iter::once(&identity as _))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Could not decrypt credentials; check the export password.",
+                )
+            })?;
+        let mut plaintext = Zeroizing::new(Vec::new());
+        reader
+            .take(32 * 1024 * 1024 + 1)
+            .read_to_end(&mut plaintext)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Encrypted credential file is incomplete.",
+                )
+            })?;
+        if plaintext.len() > 32 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Decrypted credential file is too large.",
+            ));
+        }
+        let archive: CredentialImport = serde_json::from_slice(&plaintext)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid credential data."))?;
+        if archive.format_version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported credential export version.",
+            ));
+        }
+        let mut references = std::collections::BTreeSet::new();
+        for record in &archive.credentials {
+            if !references.insert(record.reference.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Credential file contains duplicate references.",
+                ));
+            }
+            if !crate::project_credentials::valid_password_reference(&record.reference)
+                && !record.reference.starts_with("config:")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Credential file contains an invalid reference.",
+                ));
+            }
+        }
+        Ok(archive)
+    }
+
+    fn apply_credential_archive(
+        &mut self,
+        archive: CredentialImport,
+        export_password: Zeroizing<String>,
+    ) -> Result<usize, String> {
+        let mut replacements: Vec<KeychainReplacement> = Vec::new();
+        let mut updated_metadata = None;
+        for mut record in archive.credentials {
+            if crate::project_credentials::valid_password_reference(&record.reference) {
+                let old = crate::project_credentials::read_optional_password(&record.reference)?;
+                replacements.push((
+                    std::mem::take(&mut record.reference),
+                    Zeroizing::new(std::mem::take(&mut record.password)),
+                    old,
+                ));
+                continue;
+            }
+            let parts = record.reference.split(':').collect::<Vec<_>>();
+            let [_, project_id, link_id] = parts.as_slice() else {
+                return Err(
+                    "Credential file contains an invalid Project password reference.".into(),
+                );
+            };
+            let project_id = project_id
+                .parse::<u64>()
+                .map_err(|_| "Credential file contains an invalid Project reference.")?;
+            let link_id = link_id
+                .parse::<u64>()
+                .map_err(|_| "Credential file contains an invalid Web Link reference.")?;
+            let metadata = updated_metadata.get_or_insert_with(|| self.metadata.clone());
+            let Some(link) = metadata
+                .projects
+                .iter_mut()
+                .find(|project| project.id == project_id)
+                .and_then(|project| project.links.iter_mut().find(|link| link.id == link_id))
+            else {
+                return Err(
+                    "Import the matching configuration first; a Project Web Link was not found."
+                        .into(),
+                );
+            };
+            link.password = Some(std::mem::take(&mut record.password));
+            link.password_ref = None;
+            link.password_storage = crate::projects::PasswordStorage::Config;
+        }
+
+        let previous_credential_records = replacements
+            .iter()
+            .filter_map(|(reference, _, previous)| {
+                previous.as_ref().map(|password| CredentialRecord {
+                    reference: reference.clone(),
+                    password: password.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !previous_credential_records.is_empty() {
+            let directory = self
+                .metadata_path()
+                .map_err(|error| error.to_string())?
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("import-backups");
+            fs::create_dir_all(&directory)
+                .map_err(|_| "Could not create private credential backup directory.".to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "Could not secure credential backup directory.".to_string())?;
+            }
+            let backup = CredentialExport {
+                format_version: 1,
+                credentials: previous_credential_records,
+            };
+            let plaintext = Zeroizing::new(
+                serde_json::to_vec(&backup)
+                    .map_err(|_| "Could not prepare credential backup.".to_string())?,
+            );
+            let encrypted = Self::encrypt_credentials(&plaintext, export_password)
+                .map_err(|_| "Could not encrypt credential backup.".to_string())?;
+            let path = directory.join(format!(
+                "credentials-{}.age",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| "System clock is invalid.")?
+                    .as_nanos()
+            ));
+            write_private_export(&path, &encrypted)
+                .map_err(|_| "Could not save encrypted credential backup.".to_string())?;
+        }
+
+        let mut changed = Vec::new();
+        for (reference, password, _) in &replacements {
+            if let Err(error) =
+                crate::project_credentials::replace_password(reference, password.as_str())
+            {
+                let rollback = restore_imported_keychain(&replacements, &changed);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(format!(
+                        "{error}; credential rollback also failed: {rollback_error}"
+                    )),
+                };
+            }
+            changed.push(reference.clone());
+        }
+
+        if let Some(metadata) = updated_metadata {
+            let previous = std::mem::replace(&mut self.metadata, metadata);
+            if !self.save_metadata() {
+                let error = self
+                    .notice
+                    .take()
+                    .unwrap_or_else(|| "Could not save imported credentials.".into());
+                self.metadata = previous;
+                let rollback = restore_imported_keychain(&replacements, &changed);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(format!(
+                        "{error}; credential rollback also failed: {rollback_error}"
+                    )),
+                };
+            }
+        }
+        Ok(replacements.len())
+    }
+
+    fn handle_credential_import_key(&mut self, key: KeyCode) {
+        let Some(dialog) = self.credential_import_dialog.as_mut() else {
+            return;
+        };
+        match key {
+            KeyCode::Esc => {
+                dialog.password.zeroize();
+                self.credential_import_dialog = None;
+                self.pending_credential_import_path = None;
+            }
+            KeyCode::Backspace => {
+                dialog.password.pop();
+                dialog.error = None;
+            }
+            KeyCode::Enter => {
+                let Some(mut dialog) = self.credential_import_dialog.take() else {
+                    return;
+                };
+                let password = Zeroizing::new(std::mem::take(&mut dialog.password));
+                let Some(path) = self.pending_credential_import_path.take() else {
+                    self.notice = Some("Credential import was cancelled.".into());
+                    return;
+                };
+                let result = read_limited(&path, 16 * 1024 * 1024)
+                    .and_then(|bytes| Self::decrypt_credential_archive(&bytes, password.clone()))
+                    .map_err(|error| error.to_string());
+                match result {
+                    Ok(archive) => {
+                        self.pending_credential_import = Some(PendingCredentialImport {
+                            archive,
+                            export_password: password,
+                        });
+                        self.import_confirmation = Some(ImportKind::Credentials);
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!(
+                            "Credential import rejected: {}",
+                            crate::diagnostics::redact_sensitive_text(&error)
+                        ));
+                    }
+                }
+            }
+            KeyCode::Char(value) if !value.is_control() => {
+                dialog.password.push(value);
+                dialog.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_import_confirmation_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.import_confirmation = None;
+                self.pending_configuration_import = None;
+                self.pending_credential_import = None;
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let Some(kind) = self.import_confirmation.take() else {
+                    return;
+                };
+                if kind == ImportKind::Configuration {
+                    let Some(pending) = self.pending_configuration_import.take() else {
+                        return;
+                    };
+                    let result = self.metadata_path().and_then(|path| {
+                        crate::import_export::apply_configuration(pending.import, &path)
+                    });
+                    match result {
+                        Ok(metadata) => {
+                            self.metadata = metadata;
+                            self.metadata_error = false;
+                            self.hosts = HostCatalog::load();
+                            self.clamp_selection();
+                            self.notice = Some(format!(
+                                "Configuration imported from {}. Previous files are backed up beside LazyTerm data.",
+                                pending.source_path.display()
+                            ));
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!(
+                                "Configuration import failed: {}",
+                                crate::diagnostics::redact_sensitive_text(&error.to_string())
+                            ));
+                        }
+                    }
+                } else if let Some(pending) = self.pending_credential_import.take() {
+                    match self.apply_credential_archive(pending.archive, pending.export_password) {
+                        Ok(count) => {
+                            self.notice =
+                                Some(format!("Imported {count} encrypted credential entries."));
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!(
+                                "Credential import failed: {}",
+                                crate::diagnostics::redact_sensitive_text(&error)
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_settings_key(&mut self, key: KeyCode) {
-        let count = 11;
+        let count = 13;
         match key {
             KeyCode::Up => {
                 self.selected_setting = self.selected_setting.saturating_sub(1);
@@ -5437,6 +5954,7 @@ fn host_field_index(display_index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::Theme;
 
     fn app_fixture() -> App {
         let mut app = App::with_catalog(HostCatalog::default(), Ok(Metadata::default()));
@@ -5628,6 +6146,197 @@ mod tests {
         let mut decrypted = Vec::new();
         reader.read_to_end(&mut decrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn credential_import_rejects_wrong_password_and_replaces_keychain_with_encrypted_backup() {
+        let reference = format!("credential-{}", "a".repeat(64));
+        crate::project_credentials::replace_password(&reference, "old-secret").unwrap();
+        let payload = CredentialExport {
+            format_version: 1,
+            credentials: vec![CredentialRecord {
+                reference: reference.clone(),
+                password: "new-secret".into(),
+            }],
+        };
+        let plaintext = Zeroizing::new(serde_json::to_vec(&payload).unwrap());
+        let password = Zeroizing::new("archive-password".to_string());
+        let encrypted = App::encrypt_credentials(&plaintext, password.clone()).unwrap();
+        assert!(
+            App::decrypt_credential_archive(&encrypted, Zeroizing::new("wrong-password".into()))
+                .is_err()
+        );
+        let archive = App::decrypt_credential_archive(&encrypted, password.clone()).unwrap();
+
+        let fixture = crate::projects::tests::Fixture::new("credential-import");
+        let mut app = app_fixture();
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("lazyterm/hosts.json"));
+        let count = app.apply_credential_archive(archive, password).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            &**crate::project_credentials::read_password(&reference).unwrap(),
+            "new-secret"
+        );
+        let backup_dir = fixture.root.join("lazyterm/import-backups");
+        let backup = fs::read_dir(backup_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "age")
+            })
+            .unwrap();
+        let bytes = fs::read(backup.path()).unwrap();
+        assert!(bytes.starts_with(b"age-encryption.org/v1"));
+        let archive =
+            App::decrypt_credential_archive(&bytes, Zeroizing::new("archive-password".into()))
+                .unwrap();
+        assert_eq!(archive.credentials.len(), 1);
+        assert_eq!(archive.credentials[0].password, "old-secret");
+        crate::project_credentials::delete_password(&reference).unwrap();
+    }
+
+    #[test]
+    fn configuration_export_keeps_current_features_and_excludes_inline_passwords() {
+        let fixture = crate::projects::tests::Fixture::new("configuration-export");
+        let mut metadata = Metadata::default();
+        metadata.host_groups.push("production".into());
+        metadata
+            .tags
+            .insert("web".into(), vec!["production".into()]);
+        metadata.host_passwords.insert("web".into(), 7);
+        metadata.credentials.push(crate::credentials::Credential {
+            id: 7,
+            name: "web password".into(),
+            kind: crate::credentials::CredentialKind::Password,
+            username: "deploy".into(),
+            password_ref: Some("credential-reference".into()),
+            private_key_path: None,
+            public_key: String::new(),
+            fingerprint: String::new(),
+        });
+        metadata.tunnels.push(crate::metadata::TunnelDefinition {
+            id: 1,
+            label: "database".into(),
+            host_alias: "web".into(),
+            custom_host: false,
+            kind: crate::metadata::TunnelKind::Local,
+            bind_address: "127.0.0.1".into(),
+            local_port: 13306,
+            remote_host: Some("db.internal".into()),
+            remote_port: Some(3306),
+            lifecycle: crate::metadata::TunnelLifecycle::App,
+            auto_reconnect: false,
+            connect_timeout_secs: 10,
+            keepalive_interval_secs: 30,
+        });
+        metadata
+            .snippet_packages
+            .push(crate::metadata::SnippetPackage {
+                id: 1,
+                name: "Operations".into(),
+                description: String::new(),
+                snippets: vec![crate::metadata::SnippetDefinition {
+                    id: 1,
+                    name: "Health".into(),
+                    command: "uptime".into(),
+                    description: String::new(),
+                    dangerous: false,
+                }],
+            });
+        let mut project = fixture.project.clone();
+        project.commands.push(fixture.command("npm run start"));
+        project.links.push(crate::projects::ProjectLink {
+            id: 1,
+            name: "Admin".into(),
+            url: "https://example.invalid/admin".into(),
+            username: "admin".into(),
+            password: Some("inline-web-secret".into()),
+            ..Default::default()
+        });
+        metadata.projects.push(project);
+        let host = Host {
+            alias: "web".into(),
+            hostname: Some("192.0.2.10".into()),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            identity_file: Some("~/.ssh/id_ed25519".into()),
+            proxy_jump: Some("bastion".into()),
+            managed: true,
+        };
+        let include_path = fixture.root.join("work.conf").display().to_string();
+        let ssh_config = "Host web\n  HostName 192.0.2.10\n".to_string();
+        let include_config = "Host bastion\n  HostName bastion.example.invalid\n".to_string();
+        let bytes = configuration_export_bytes(
+            &metadata,
+            std::slice::from_ref(&host),
+            Some(fixture.root.join("config").display().to_string()),
+            ssh_config.clone(),
+            [(include_path.clone(), include_config.clone())]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut expected_metadata = metadata.clone();
+        for project in &mut expected_metadata.projects {
+            for link in &mut project.links {
+                link.password = None;
+            }
+        }
+        assert_eq!(
+            json["metadata"],
+            serde_json::to_value(expected_metadata).unwrap()
+        );
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["passwords_included"], false);
+        assert_eq!(json["ssh_config"], ssh_config);
+        assert_eq!(json["ssh_config_files"][include_path], include_config);
+        assert_eq!(json["hosts"][0]["proxy_jump"], "bastion");
+        assert_eq!(json["metadata"]["host_groups"][0], "production");
+        assert_eq!(json["metadata"]["host_passwords"]["web"], 7);
+        assert_eq!(
+            json["metadata"]["credentials"][0]["password_ref"],
+            "credential-reference"
+        );
+        assert_eq!(
+            json["metadata"]["snippet_packages"][0]["snippets"][0]["command"],
+            "uptime"
+        );
+        assert_eq!(
+            json["metadata"]["projects"][0]["commands"][0]["command"],
+            "npm run start"
+        );
+        assert_eq!(
+            json["metadata"]["projects"][0]["links"][0]["url"],
+            "https://example.invalid/admin"
+        );
+        assert!(json["metadata"]["projects"][0]["links"][0]["password"].is_null());
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("inline-web-secret")
+        );
+    }
+
+    #[test]
+    fn exports_are_written_atomically_with_private_permissions() {
+        let fixture = crate::projects::tests::Fixture::new("private-export");
+        let path = fixture.root.join("export.age");
+        write_private_export(&path, b"first").unwrap();
+        write_private_export(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
@@ -6045,7 +6754,21 @@ mod tests {
         app.section = NavSection::Settings;
         app.selected_setting = 0;
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.metadata.theme, Theme::Light);
+        assert_eq!(app.metadata.theme, Theme::Ocean);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.theme, Theme::Amber);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.theme, Theme::Rose);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.theme, Theme::Forest);
+
+        app.selected_setting = 1;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.language, crate::metadata::Language::Chinese);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.language, crate::metadata::Language::Japanese);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.metadata.language, crate::metadata::Language::English);
 
         app.selected_setting = 2;
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);

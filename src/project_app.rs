@@ -618,9 +618,23 @@ impl App {
                     messages.push(format!("{} already running.", command.name));
                     continue;
                 }
-                ProjectAction::Start => self.project_service.start(&project, command),
+                ProjectAction::Start => match execution_target(&project, command) {
+                    crate::projects::ProjectTarget::Host(alias) => self
+                        .project_service
+                        .start_with_auth(&project, command, &self.host_password_auth(alias)),
+                    crate::projects::ProjectTarget::Local => {
+                        self.project_service.start(&project, command)
+                    }
+                },
                 ProjectAction::Stop => self.project_service.stop(key),
-                ProjectAction::Restart => self.project_service.restart(&project, command),
+                ProjectAction::Restart => match execution_target(&project, command) {
+                    crate::projects::ProjectTarget::Host(alias) => self
+                        .project_service
+                        .restart_with_auth(&project, command, &self.host_password_auth(alias)),
+                    crate::projects::ProjectTarget::Local => {
+                        self.project_service.restart(&project, command)
+                    }
+                },
             };
             messages.push(match result {
                 Ok(()) => format!(

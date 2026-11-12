@@ -282,7 +282,11 @@ pub struct ProjectTask {
     closed_readers: usize,
     stop_deadline: Option<Instant>,
     user_stopped: bool,
-    restart: Option<(ProjectDefinition, ProjectCommand)>,
+    restart: Option<(
+        ProjectDefinition,
+        ProjectCommand,
+        crate::credentials::HostAuth,
+    )>,
 }
 
 impl ProjectTask {
@@ -444,6 +448,15 @@ impl ProjectService {
         project: &ProjectDefinition,
         command: &ProjectCommand,
     ) -> io::Result<()> {
+        self.start_with_auth(project, command, &crate::credentials::HostAuth::default())
+    }
+
+    pub fn start_with_auth(
+        &mut self,
+        project: &ProjectDefinition,
+        command: &ProjectCommand,
+        auth: &crate::credentials::HostAuth,
+    ) -> io::Result<()> {
         let target = execution_target(project, command);
         if *target == ProjectTarget::Local {
             working_directory(project, command)?;
@@ -471,13 +484,22 @@ impl ProjectService {
             self.attach_runner(handle, command.lifecycle);
             return Ok(());
         }
-        self.start_app(project, command)
+        self.start_app_with_auth(project, command, auth)
     }
 
     pub(crate) fn start_app(
         &mut self,
         project: &ProjectDefinition,
         command: &ProjectCommand,
+    ) -> io::Result<()> {
+        self.start_app_with_auth(project, command, &crate::credentials::HostAuth::default())
+    }
+
+    pub(crate) fn start_app_with_auth(
+        &mut self,
+        project: &ProjectDefinition,
+        command: &ProjectCommand,
+        auth: &crate::credentials::HostAuth,
     ) -> io::Result<()> {
         let key = (project.id, command.id);
         if self.active(key) {
@@ -520,15 +542,16 @@ impl ProjectService {
         let stderr_file = private_log(&stderr_log)?;
         let mut process = if let ProjectTarget::Host(alias) = &target {
             let mut process = Command::new("ssh");
+            process.args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "RequestTTY=no",
+                "-o",
+                "ConnectTimeout=10",
+            ]);
+            crate::credentials::configure_host_auth(&mut process, auth, alias)?;
             process
-                .args([
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "RequestTTY=no",
-                    "-o",
-                    "ConnectTimeout=10",
-                ])
                 .arg(alias)
                 .arg(remote_shell_command(&directory, &command.command));
             process
@@ -603,6 +626,15 @@ impl ProjectService {
         project: &ProjectDefinition,
         command: &ProjectCommand,
     ) -> io::Result<()> {
+        self.restart_with_auth(project, command, &crate::credentials::HostAuth::default())
+    }
+
+    pub fn restart_with_auth(
+        &mut self,
+        project: &ProjectDefinition,
+        command: &ProjectCommand,
+        auth: &crate::credentials::HostAuth,
+    ) -> io::Result<()> {
         if *execution_target(project, command) == ProjectTarget::Local {
             working_directory(project, command)?;
         } else {
@@ -613,10 +645,10 @@ impl ProjectService {
             && task.active()
         {
             task.request_stop()?;
-            task.restart = Some((project.clone(), command.clone()));
+            task.restart = Some((project.clone(), command.clone(), auth.clone()));
             Ok(())
         } else {
-            self.start(project, command)
+            self.start_with_auth(project, command, auth)
         }
     }
 
@@ -717,8 +749,8 @@ impl ProjectService {
                 }
             }
         }
-        for (project, command) in restarts {
-            if let Err(error) = self.start(&project, &command)
+        for (project, command, auth) in restarts {
+            if let Err(error) = self.start_with_auth(&project, &command, &auth)
                 && let Some(task) = self.tasks.get_mut(&(project.id, command.id))
             {
                 task.status = TaskStatus::Failed(error.to_string());

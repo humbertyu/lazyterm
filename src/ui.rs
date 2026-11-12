@@ -16,37 +16,34 @@ use crate::{
     sftp::SftpEntryKind,
 };
 
-const BG: Color = Color::Rgb(13, 16, 17);
-const PANEL: Color = Color::Rgb(18, 23, 23);
-const BORDER: Color = Color::Rgb(49, 65, 61);
-const GREEN: Color = Color::Rgb(133, 196, 159);
-const TEXT: Color = Color::Rgb(215, 228, 218);
-const MUTED: Color = Color::Rgb(107, 126, 116);
-const DISABLED: Color = Color::Rgb(76, 91, 82);
-const LIGHT_BG: Color = Color::Rgb(238, 242, 239);
+const BG: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Background);
+const PANEL: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Panel);
+const BORDER: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Border);
+const GREEN: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Accent);
+const TEXT: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Text);
+const MUTED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Muted);
+const DISABLED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Disabled);
+const SELECTED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Selection);
+const SELECTED_ROW: crate::theme::ThemeColor =
+    crate::theme::color(crate::theme::Role::SelectionStrong);
 
 fn runtime_origin_color(origin: crate::runtime::RuntimeOrigin) -> Color {
     use crate::runtime::RuntimeOrigin;
     match origin {
-        RuntimeOrigin::Project => GREEN,
+        RuntimeOrigin::Project => GREEN.into(),
         RuntimeOrigin::ExternalProject => Color::Rgb(103, 211, 211),
         RuntimeOrigin::Tunnel => Color::Rgb(190, 145, 255),
         RuntimeOrigin::Agent => Color::Rgb(239, 192, 101),
         RuntimeOrigin::CommandLine => Color::Rgb(103, 211, 211),
         RuntimeOrigin::Desktop => Color::Rgb(160, 171, 190),
-        RuntimeOrigin::Unknown => MUTED,
+        RuntimeOrigin::Unknown => MUTED.into(),
     }
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
+    crate::theme::set_active(app.metadata.theme);
     frame.render_widget(
-        Block::default().style(Style::default().bg(
-            if app.metadata.theme == crate::metadata::Theme::Light {
-                LIGHT_BG
-            } else {
-                BG
-            },
-        )),
+        Block::default().style(Style::default().bg(BG.into())),
         frame.area(),
     );
     let page = page_layout().split(frame.area());
@@ -111,12 +108,12 @@ fn render_toast(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("  • ", Style::default().fg(MUTED)),
-            Span::styled(toast.message.as_str(), Style::default().fg(TEXT)),
+            Span::styled("  • ", Style::default().fg(MUTED.into())),
+            Span::styled(toast.message.as_str(), Style::default().fg(TEXT.into())),
             Span::raw("  "),
         ]))
-        .style(Style::default().bg(PANEL))
-        .block(Block::default().style(Style::default().bg(PANEL)))
+        .style(Style::default().bg(PANEL.into()))
+        .block(Block::default().style(Style::default().bg(PANEL.into())))
         .wrap(Wrap { trim: true }),
         area,
     );
@@ -159,6 +156,12 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
     if let Some(dialog) = &app.credential_export_dialog {
         render_credential_export_dialog(frame, dialog);
     }
+    if let Some(dialog) = &app.credential_import_dialog {
+        render_credential_import_dialog(frame, dialog);
+    }
+    if let Some(kind) = app.import_confirmation {
+        render_import_confirmation(frame, app, kind);
+    }
     if let Some(pending) = &app.snippet_confirmation {
         render_snippet_confirmation(frame, pending);
     }
@@ -183,10 +186,10 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "Comma-separated tags   Enter save   Esc cancel",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 )),
             ])
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .block(panel(&format!(" TAGS / {alias} ")))
             .wrap(Wrap { trim: true }),
             area,
@@ -210,8 +213,8 @@ fn render_host_action_dialog(frame: &mut Frame, dialog: &crate::app::HostActionD
     frame.render_widget(Clear, area);
     let title = format!(" {} ", dialog.title);
     let text = Paragraph::new(vec![Line::from(dialog.message.as_str())])
-        .style(Style::default().fg(TEXT))
-        .block(action_panel(&title, "Enter/Esc close", BORDER))
+        .style(Style::default().fg(TEXT.into()))
+        .block(action_panel(&title, "Enter/Esc close", BORDER.into()))
         .wrap(Wrap { trim: true });
     frame.render_widget(text, area);
 }
@@ -231,7 +234,7 @@ fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
                         String::new()
                     }
                 ),
-                GREEN,
+                GREEN.into(),
             );
         }
         if app.workspace.monitor.matches(&app.metadata.projects)
@@ -240,7 +243,7 @@ fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
             return ("unknown / inspection failed".into(), Color::Yellow);
         }
         if !app.workspace.monitor.matches(&app.metadata.projects) {
-            return ("checking...".into(), MUTED);
+            return ("checking...".into(), MUTED.into());
         }
         return (
             if app.project_service.tasks.contains_key(&key) {
@@ -249,16 +252,16 @@ fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
                 "not started"
             }
             .into(),
-            MUTED,
+            MUTED.into(),
         );
     }
     app.project_service.tasks.get(&key).map_or_else(
-        || ("not started".into(), MUTED),
+        || ("not started".into(), MUTED.into()),
         |task| {
             let color = match task.status {
-                TaskStatus::Running => GREEN,
+                TaskStatus::Running => GREEN.into(),
                 TaskStatus::Stopping => Color::Yellow,
-                TaskStatus::Exited(0) | TaskStatus::Stopped => MUTED,
+                TaskStatus::Exited(0) | TaskStatus::Stopped => MUTED.into(),
                 TaskStatus::Exited(_) | TaskStatus::Failed(_) => Color::Red,
             };
             (
@@ -288,9 +291,9 @@ fn project_last_result(app: &App, key: crate::projects::TaskKey) -> Option<Strin
 fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
     let Some(project) = app.selected_project() else {
         frame.render_widget(
-            Paragraph::new("No projects.")
-                .style(Style::default().fg(MUTED))
-                .block(panel(" PROJECTS ")),
+            Paragraph::new(crate::i18n::text(app.metadata.language, "No projects."))
+                .style(Style::default().fg(MUTED.into()))
+                .block(panel_l(app, "PROJECTS")),
             area,
         );
         return;
@@ -312,17 +315,19 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     format!(" {} / {}   ", project.name, command.name),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(TEXT.into())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(status, Style::default().fg(color))),
                 Line::from(Span::styled(
                     format!(" {directory}"),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 )),
                 Line::from(Span::styled(
                     project_last_result(app, key)
                         .map_or_else(String::new, |result| format!(" Last managed run: {result}")),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 )),
             ]),
             sections[0],
@@ -347,7 +352,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
             |task| task.output.as_str(),
         );
         let paragraph = Paragraph::new(text)
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .wrap(Wrap { trim: false });
         let end = paragraph
             .line_count(inner.width)
@@ -397,7 +402,9 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                                 },
                                 project.links.len()
                             ),
-                            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(GREEN.into())
+                                .add_modifier(Modifier::BOLD),
                         )));
                     }
                     crate::project_app::WorkspaceItem::Link(index) => {
@@ -406,11 +413,11 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                         return ListItem::new(vec![
                             Line::from(Span::styled(
                                 format!("{indent}{}", link.name),
-                                Style::default().fg(TEXT),
+                                Style::default().fg(TEXT.into()),
                             )),
                             Line::from(vec![
                                 Span::styled(format!("{indent}  "), Style::default()),
-                                Span::styled(link.url.as_str(), Style::default().fg(MUTED)),
+                                Span::styled(link.url.as_str(), Style::default().fg(MUTED.into())),
                             ]),
                         ]);
                     }
@@ -434,7 +441,9 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                                 },
                                 commands.len()
                             ),
-                            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(GREEN.into())
+                                .add_modifier(Modifier::BOLD),
                         )));
                     }
                     crate::project_app::WorkspaceItem::Command(index) => &project.commands[*index],
@@ -448,7 +457,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                 let mut lines = vec![
                     Line::from(Span::styled(
                         format!("{indent}{}", command.name),
-                        Style::default().fg(TEXT),
+                        Style::default().fg(TEXT.into()),
                     )),
                     Line::from(Span::styled(
                         format!(
@@ -456,7 +465,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                             command.kind.label(),
                             crate::projects::execution_target(project, command).label()
                         ),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     )),
                     Line::from(Span::styled(
                         format!("{indent}  {status}"),
@@ -466,13 +475,13 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                 if let Some(result) = project_last_result(app, (project.id, command.id)) {
                     lines.push(Line::from(Span::styled(
                         format!("{indent}  last run: {result}"),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     )));
                 }
                 if !wide {
                     lines.push(Line::from(Span::styled(
                         format!("{indent}  {}", command.command),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     )));
                 }
                 ListItem::new(lines)
@@ -492,11 +501,11 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                 ListItem::new(vec![
                     Line::from(Span::styled(
                         project.name.as_str(),
-                        Style::default().fg(TEXT),
+                        Style::default().fg(TEXT.into()),
                     )),
                     Line::from(Span::styled(
                         format!("  {}", project.base_path.display()),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     )),
                     Line::from(Span::styled(
                         format!(
@@ -504,7 +513,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                             project.commands.len(),
                             project.links.len()
                         ),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     )),
                 ])
             })
@@ -513,7 +522,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new("No commands or links.")
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(MUTED.into()))
                 .block(panel(&title)),
             columns[0],
         );
@@ -524,7 +533,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
                 .highlight_symbol("> ")
                 .highlight_style(
                     Style::default()
-                        .bg(Color::Rgb(47, 78, 61))
+                        .bg(SELECTED.into())
                         .add_modifier(Modifier::BOLD),
                 ),
             columns[0],
@@ -650,7 +659,7 @@ fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(panel(" DETAILS "))
+            .block(panel_l(app, "DETAILS"))
             .wrap(Wrap { trim: false }),
         columns[1],
     );
@@ -661,7 +670,7 @@ pub(crate) fn project_output_end(app: &App) -> usize {
     let header_height = if page[2].height < 12 { 2 } else { 4 };
     let sections =
         Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).split(page[2]);
-    let inner = panel(" OUTPUT ").inner(sections[1]);
+    let inner = panel_l(app, "OUTPUT").inner(sections[1]);
     app.selected_project_key()
         .and_then(|key| app.project_service.tasks.get(&key))
         .map_or(0, |task| {
@@ -698,9 +707,9 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                 .block(action_panel(
                     " EXTERNAL PROCESS ",
                     "y/Enter yes  n/Esc no",
-                    BORDER,
+                    BORDER.into(),
                 ))
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT.into()))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -750,8 +759,9 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                     let fields = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
                         .split(rows[row_index]);
                     frame.render_widget(
-                        Paragraph::new(form.labels()[index])
-                            .style(Style::default().fg(if active { GREEN } else { MUTED })),
+                        Paragraph::new(form.labels()[index]).style(
+                            Style::default().fg(if active { GREEN.into() } else { MUTED.into() }),
+                        ),
                         fields[0],
                     );
                     fields[1]
@@ -759,7 +769,11 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                     let block = Block::default()
                         .borders(Borders::ALL)
                         .title(form.labels()[index])
-                        .border_style(Style::default().fg(if active { GREEN } else { BORDER }));
+                        .border_style(Style::default().fg(if active {
+                            GREEN.into()
+                        } else {
+                            BORDER.into()
+                        }));
                     let inner = block.inner(rows[row_index]);
                     frame.render_widget(block, rows[row_index]);
                     inner
@@ -796,7 +810,7 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             let width = line.width();
             frame.render_widget(
                 Paragraph::new(line)
-                    .style(Style::default().fg(TEXT))
+                    .style(Style::default().fg(TEXT.into()))
                     .scroll((
                         0,
                         width
@@ -833,8 +847,12 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(message)
-                .block(action_panel(" DELETE ", "y/Enter yes  n/Esc no", BORDER))
-                .style(Style::default().fg(TEXT))
+                .block(action_panel(
+                    " DELETE ",
+                    "y/Enter yes  n/Esc no",
+                    BORDER.into(),
+                ))
+                .style(Style::default().fg(TEXT.into()))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -845,16 +863,21 @@ fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
     let columns =
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
     let list_block = Block::default()
-        .title(" PORT FORWARDING ")
+        .title(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "PORT FORWARDING")
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL));
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()));
     let list_inner = list_block.inner(columns[0]);
     frame.render_widget(list_block, columns[0]);
 
     let mut rows = vec![ListItem::new(Line::from(Span::styled(
         "  + New forwarding    a add",
-        Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(GREEN.into())
+            .add_modifier(Modifier::BOLD),
     )))];
     rows.extend(app.metadata.tunnels.iter().map(|tunnel| {
         let selected = app
@@ -881,11 +904,11 @@ fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
         ListItem::new(Line::from(vec![
             Span::styled(
                 if selected { " > " } else { "   " },
-                Style::default().fg(if selected { GREEN } else { MUTED }),
+                Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
             ),
             Span::styled(
                 format!("{} ", tunnel_kind_label(tunnel.kind)),
-                Style::default().fg(if selected { GREEN } else { MUTED }),
+                Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
             ),
             Span::styled(
                 format!("{status_label:<9}"),
@@ -894,36 +917,39 @@ fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 format!("{:<18}", tunnel.label),
                 Style::default()
-                    .fg(if selected { TEXT } else { MUTED })
+                    .fg(if selected { TEXT.into() } else { MUTED.into() })
                     .add_modifier(if selected {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
                     }),
             ),
-            Span::styled(route, Style::default().fg(MUTED)),
+            Span::styled(route, Style::default().fg(MUTED.into())),
         ]))
     }));
     frame.render_widget(List::new(rows), list_inner);
 
     let detail_block = Block::default()
-        .title(" EDIT PORT FORWARDING ")
+        .title(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "EDIT PORT FORWARDING")
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL));
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()));
     let detail_inner = detail_block.inner(columns[1]);
     frame.render_widget(detail_block, columns[1]);
     let Some(tunnel) = app.selected_tunnel_definition() else {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "No forwarding selected.",
-                    Style::default().fg(TEXT),
+                    crate::i18n::text(app.metadata.language, "No forwarding selected."),
+                    Style::default().fg(TEXT.into()),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Press a to create a local forward.",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 )),
             ])
             .wrap(Wrap { trim: true }),
@@ -944,7 +970,9 @@ fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(Span::styled(
             format!("●  {}", tunnel.label),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(TEXT.into())
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(format!(
@@ -1008,7 +1036,7 @@ fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             "s/Space start/stop   r restart   A auto-reconnect   e edit   d delete",
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED.into()),
         )),
     ];
     frame.render_widget(
@@ -1078,21 +1106,29 @@ pub(crate) fn runtime_filter_areas(area: Rect, app: &App) -> Vec<Rect> {
 fn render_runtime(frame: &mut Frame, app: &App) {
     let layout = runtime_layout(frame.area());
     let active = Style::default()
-        .fg(GREEN)
-        .bg(Color::Rgb(47, 78, 61))
+        .fg(GREEN.into())
+        .bg(SELECTED.into())
         .add_modifier(Modifier::BOLD);
-    let inactive = Style::default().fg(MUTED);
+    let inactive = Style::default().fg(MUTED.into());
     let local = app.runtime_target == crate::runtime::RuntimeTarget::Local;
     frame.render_widget(
-        Paragraph::new(" Local ").style(if local { active } else { inactive }),
+        Paragraph::new(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "Local")
+        ))
+        .style(if local { active } else { inactive }),
         layout.local,
     );
     frame.render_widget(
-        Paragraph::new(" Hosts ▾ ").style(if local { inactive } else { active }),
+        Paragraph::new(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "Hosts ▾")
+        ))
+        .style(if local { inactive } else { active }),
         layout.hosts,
     );
     frame.render_widget(
-        Paragraph::new(app.runtime_target.label()).style(Style::default().fg(TEXT)),
+        Paragraph::new(app.runtime_target.label()).style(Style::default().fg(TEXT.into())),
         layout.target,
     );
     for (filter, area) in crate::runtime::RuntimeFilter::ALL
@@ -1117,10 +1153,11 @@ fn render_runtime(frame: &mut Frame, app: &App) {
     }
     let entries = app.visible_runtime_entries();
     let target = app.runtime_target.label();
+    let runtime_title = crate::i18n::text(app.metadata.language, "RUNTIME");
     let title = if app.runtime_loading {
-        format!(" RUNTIME / {target}  loading... ")
+        format!(" {runtime_title} / {target}  loading... ")
     } else {
-        format!(" RUNTIME / {target} ")
+        format!(" {runtime_title} / {target} ")
     };
     let block = panel(&title);
     let inner = block.inner(layout.listeners);
@@ -1130,21 +1167,26 @@ fn render_runtime(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "Port inspection failed",
-                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                    crate::i18n::text(app.metadata.language, "Port inspection failed"),
+                    Style::default()
+                        .fg(GREEN.into())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(error.as_str()),
                 Line::from("Press r to retry, l for Local, or s to choose a Host."),
             ])
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .wrap(Wrap { trim: false }),
             inner,
         );
     } else if entries.is_empty() && !app.runtime_loading {
         frame.render_widget(
-            Paragraph::new("No listeners in this category.")
-                .style(Style::default().fg(MUTED))
-                .wrap(Wrap { trim: true }),
+            Paragraph::new(crate::i18n::text(
+                app.metadata.language,
+                "No listeners in this category.",
+            ))
+            .style(Style::default().fg(MUTED.into()))
+            .wrap(Wrap { trim: true }),
             inner,
         );
     } else {
@@ -1154,16 +1196,16 @@ fn render_runtime(frame: &mut Frame, app: &App) {
                 .pid
                 .map_or_else(|| "-".to_string(), |pid| pid.to_string());
             let row_background = if selected {
-                Color::Rgb(47, 78, 61)
+                SELECTED.into()
             } else {
-                PANEL
+                PANEL.into()
             };
             let row_style = Style::default().bg(row_background);
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(
                         if selected { ">> " } else { "   " },
-                        row_style.fg(if selected { GREEN } else { MUTED }),
+                        row_style.fg(if selected { GREEN.into() } else { MUTED.into() }),
                     ),
                     Span::styled(
                         format!(
@@ -1174,7 +1216,7 @@ fn render_runtime(frame: &mut Frame, app: &App) {
                             entry.kind.label()
                         ),
                         row_style
-                            .fg(if selected { GREEN } else { TEXT })
+                            .fg(if selected { GREEN.into() } else { TEXT.into() })
                             .add_modifier(if selected {
                                 Modifier::BOLD
                             } else {
@@ -1215,7 +1257,7 @@ fn render_runtime(frame: &mut Frame, app: &App) {
             state.select(Some(app.selected_runtime));
         }
         frame.render_stateful_widget(
-            List::new(rows).block(panel(" LISTENERS ")),
+            List::new(rows).block(panel_l(app, "LISTENERS")),
             inner,
             &mut state,
         );
@@ -1226,7 +1268,7 @@ fn render_runtime(frame: &mut Frame, app: &App) {
         || {
             vec![Line::from(Span::styled(
                 "Select a listener to inspect it.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED.into()),
             ))]
         },
         |entry| {
@@ -1252,7 +1294,7 @@ fn render_runtime(frame: &mut Frame, app: &App) {
                 ),
                 detail_line("Class", entry.kind.label()),
                 Line::from(vec![
-                    Span::styled("Origin              ", Style::default().fg(MUTED)),
+                    Span::styled("Origin              ", Style::default().fg(MUTED.into())),
                     Span::styled(
                         entry.origin.label(),
                         Style::default().fg(runtime_origin_color(entry.origin)),
@@ -1279,7 +1321,7 @@ fn render_runtime(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(detail_lines)
-            .block(panel(" PROCESS "))
+            .block(panel_l(app, "PROCESS"))
             .wrap(Wrap { trim: false }),
         layout.details,
     );
@@ -1295,10 +1337,10 @@ fn render_runtime_host_picker(frame: &mut Frame, app: &App) {
     let items = app.runtime_host_picker_items_for_ui();
     let rows = items.iter().map(|item| match item {
         crate::app::HostPickerItem::Group(group) => {
-            ListItem::new(format!("> {}", group.title())).style(Style::default().fg(GREEN))
+            ListItem::new(format!("> {}", group.title())).style(Style::default().fg(GREEN.into()))
         }
         crate::app::HostPickerItem::Host(alias) => {
-            ListItem::new(format!("  {alias}")).style(Style::default().fg(TEXT))
+            ListItem::new(format!("  {alias}")).style(Style::default().fg(TEXT.into()))
         }
     });
     let mut state = ListState::default();
@@ -1311,8 +1353,8 @@ fn render_runtime_host_picker(frame: &mut Frame, app: &App) {
             .highlight_symbol("> ")
             .highlight_style(
                 Style::default()
-                    .fg(TEXT)
-                    .bg(Color::Rgb(34, 54, 47))
+                    .fg(TEXT.into())
+                    .bg(SELECTED_ROW.into())
                     .add_modifier(Modifier::BOLD),
             ),
         area,
@@ -1351,7 +1393,9 @@ fn render_runtime_kill_confirmation(
                         format!("Machine: Host / {alias}")
                     }
                 },
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(if force {
@@ -1382,7 +1426,7 @@ fn render_runtime_kill_confirmation(
                 )
             }),
         ])
-        .style(Style::default().fg(TEXT))
+        .style(Style::default().fg(TEXT.into()))
         .wrap(Wrap { trim: false }),
         inner,
     );
@@ -1390,9 +1434,9 @@ fn render_runtime_kill_confirmation(
 
 fn tunnel_status_display(status: &TunnelStatus) -> (&'static str, Color) {
     match status {
-        TunnelStatus::Stopped => ("Stopped", MUTED),
+        TunnelStatus::Stopped => ("Stopped", MUTED.into()),
         TunnelStatus::Starting => ("Starting", Color::Yellow),
-        TunnelStatus::Running => ("Running", GREEN),
+        TunnelStatus::Running => ("Running", GREEN.into()),
         TunnelStatus::Failed(_) => ("Failed", Color::Red),
     }
 }
@@ -1428,10 +1472,13 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App) {
 fn render_transfer_tasks(frame: &mut Frame, area: Rect, app: &App) {
     let tasks = app.transfer_tasks.iter().rev().take(4).collect::<Vec<_>>();
     let task_area = Block::default()
-        .title(" TRANSFERS ")
+        .title(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "TRANSFERS")
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL));
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()));
     let inner = task_area.inner(area);
     frame.render_widget(task_area, area);
     for (index, task) in tasks.into_iter().enumerate() {
@@ -1468,13 +1515,7 @@ fn render_transfer_tasks(frame: &mut Frame, area: Rect, app: &App) {
             .selected_transfer_task_id()
             .is_some_and(|task_id| task_id == task.id);
         let gauge = Gauge::default()
-            .gauge_style(
-                Style::default().fg(if task.status == TransferStatus::Completed {
-                    GREEN
-                } else {
-                    Color::Rgb(93, 159, 122)
-                }),
-            )
+            .gauge_style(Style::default().fg(GREEN.into()))
             .label(if selected {
                 format!("> {label}")
             } else {
@@ -1521,7 +1562,7 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
         if index > 0 {
             path_line.push(Span::styled(
                 LOCAL_BREADCRUMB_SEPARATOR,
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED.into()),
             ));
         }
         path_line.push(Span::styled(
@@ -1529,12 +1570,12 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
             Style::default()
                 .fg(if active {
                     if index + 1 == breadcrumbs.len() {
-                        TEXT
+                        TEXT.into()
                     } else {
-                        GREEN
+                        GREEN.into()
                     }
                 } else {
-                    MUTED
+                    MUTED.into()
                 })
                 .add_modifier(if index + 1 == breadcrumbs.len() {
                     Modifier::BOLD
@@ -1545,7 +1586,7 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_widget(
         Paragraph::new(Line::from(path_line))
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .scroll((0, 0)),
         rows[0],
     );
@@ -1560,12 +1601,12 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
             ))
             .style(Style::default().fg(if active {
                 if app.file_filter.is_empty() {
-                    MUTED
+                    MUTED.into()
                 } else {
-                    GREEN
+                    GREEN.into()
                 }
             } else {
-                DISABLED
+                DISABLED.into()
             })),
             rows[1],
         );
@@ -1576,13 +1617,16 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "Could not read this directory.",
-                    Style::default().fg(if active { TEXT } else { MUTED }),
+                    Style::default().fg(if active { TEXT.into() } else { MUTED.into() }),
                 )),
-                Line::from(Span::styled(error.as_str(), Style::default().fg(MUTED))),
+                Line::from(Span::styled(
+                    error.as_str(),
+                    Style::default().fg(MUTED.into()),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Press r to retry.",
-                    Style::default().fg(GREEN),
+                    Style::default().fg(GREEN.into()),
                 )),
             ])
             .wrap(Wrap { trim: true }),
@@ -1606,16 +1650,20 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 format!("  {name}"),
                 Style::default().fg(if active && entry.kind == LocalEntryKind::Directory {
-                    GREEN
+                    GREEN.into()
                 } else if active {
-                    TEXT
+                    TEXT.into()
                 } else {
-                    MUTED
+                    MUTED.into()
                 }),
             ),
             Span::styled(
                 format!("  {kind}{size}"),
-                Style::default().fg(if active { MUTED } else { DISABLED }),
+                Style::default().fg(if active {
+                    MUTED.into()
+                } else {
+                    DISABLED.into()
+                }),
             ),
         ]))
     });
@@ -1635,7 +1683,7 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
     if visible_entries.is_empty() && !app.file_filter.is_empty() {
         frame.render_widget(
             Paragraph::new("No matching local files or directories.")
-                .style(Style::default().fg(MUTED)),
+                .style(Style::default().fg(MUTED.into())),
             rows[2],
         );
     }
@@ -1660,7 +1708,7 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                 .alignment(Alignment::Center)
                 .style(
                     Style::default()
-                        .fg(if active { GREEN } else { MUTED })
+                        .fg(if active { GREEN.into() } else { MUTED.into() })
                         .add_modifier(Modifier::BOLD),
                 ),
             content[0],
@@ -1668,13 +1716,17 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new("Connect to host")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+                .style(
+                    Style::default()
+                        .fg(TEXT.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
             content[1],
         );
         frame.render_widget(
             Paragraph::new("Choose a saved SSH host to manage its files.")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(MUTED.into()))
                 .wrap(Wrap { trim: true }),
             content[2],
         );
@@ -1688,7 +1740,7 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                 .alignment(Alignment::Center)
                 .style(
                     Style::default()
-                        .fg(if active { GREEN } else { MUTED })
+                        .fg(if active { GREEN.into() } else { MUTED.into() })
                         .add_modifier(Modifier::BOLD),
                 ),
             content[3],
@@ -1707,12 +1759,16 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                     Line::from(Span::styled(
                         "Remote host selected.",
                         Style::default()
-                            .fg(if active { TEXT } else { MUTED })
+                            .fg(if active { TEXT.into() } else { MUTED.into() })
                             .add_modifier(Modifier::BOLD),
                     )),
                     Line::from(Span::styled(
                         "Press Enter to load its home directory.",
-                        Style::default().fg(if active { MUTED } else { DISABLED }),
+                        Style::default().fg(if active {
+                            MUTED.into()
+                        } else {
+                            DISABLED.into()
+                        }),
                     )),
                 ])
                 .alignment(Alignment::Center),
@@ -1782,12 +1838,12 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                     ))
                     .style(Style::default().fg(if active {
                         if app.file_filter.is_empty() {
-                            MUTED
+                            MUTED.into()
                         } else {
-                            GREEN
+                            GREEN.into()
                         }
                     } else {
-                        DISABLED
+                        DISABLED.into()
                     })),
                     rows[0],
                 );
@@ -1799,7 +1855,7 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                     } else {
                         "No matching remote files or directories."
                     })
-                    .style(Style::default().fg(MUTED)),
+                    .style(Style::default().fg(MUTED.into())),
                     rows[1],
                 );
                 return;
@@ -1818,16 +1874,20 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled(
                         format!("  {}{}", entry.name, marker),
                         Style::default().fg(if active && entry.kind == SftpEntryKind::Directory {
-                            GREEN
+                            GREEN.into()
                         } else if active {
-                            TEXT
+                            TEXT.into()
                         } else {
-                            MUTED
+                            MUTED.into()
                         }),
                     ),
                     Span::styled(
                         format!("{size}{metadata}"),
-                        Style::default().fg(if active { MUTED } else { DISABLED }),
+                        Style::default().fg(if active {
+                            MUTED.into()
+                        } else {
+                            DISABLED.into()
+                        }),
                     ),
                 ]))
             });
@@ -1906,12 +1966,12 @@ fn render_remote_status(
         Paragraph::new(vec![
             Line::from(Span::styled(
                 message,
-                Style::default().fg(if active { TEXT } else { MUTED }),
+                Style::default().fg(if active { TEXT.into() } else { MUTED.into() }),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 hint,
-                Style::default().fg(if active { GREEN } else { MUTED }),
+                Style::default().fg(if active { GREEN.into() } else { MUTED.into() }),
             )),
         ])
         .alignment(Alignment::Center)
@@ -1935,7 +1995,7 @@ fn render_host_picker(frame: &mut Frame, area: Rect, app: &App) {
     if items.is_empty() {
         frame.render_widget(
             Paragraph::new("No SSH hosts found in ~/.ssh/config.")
-                .style(Style::default().fg(MUTED)),
+                .style(Style::default().fg(MUTED.into())),
             inner,
         );
         return;
@@ -1948,21 +2008,25 @@ fn render_host_picker(frame: &mut Frame, area: Rect, app: &App) {
     if group_count > 0 {
         list_items.push(ListItem::new(Line::from(Span::styled(
             " Groups",
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
         ))));
         list_items.extend(items[..group_count].iter().map(|item| {
             let HostPickerItem::Group(group) = item else {
                 unreachable!("group section contains only groups")
             };
             ListItem::new(Line::from(vec![
-                Span::styled("  [G] ", Style::default().fg(GREEN)),
+                Span::styled("  [G] ", Style::default().fg(GREEN.into())),
                 Span::styled(
                     group.title(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(TEXT.into())
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  {} hosts", app.host_group_count(group)),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 ),
             ]))
         }));
@@ -1973,7 +2037,9 @@ fn render_host_picker(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             " Hosts".to_string()
         },
-        Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(GREEN.into())
+            .add_modifier(Modifier::BOLD),
     ))));
     let host_items = &items[group_count..];
     list_items.extend(host_items.iter().map(|item| {
@@ -1987,9 +2053,9 @@ fn render_host_picker(frame: &mut Frame, area: Rect, app: &App) {
             .find(|host| host.alias == *alias)
             .map_or(alias.as_str(), |host| host.destination());
         ListItem::new(Line::from(vec![
-            Span::styled("  [H] ", Style::default().fg(MUTED)),
-            Span::styled(alias, Style::default().fg(TEXT)),
-            Span::styled(format!("  {target}"), Style::default().fg(MUTED)),
+            Span::styled("  [H] ", Style::default().fg(MUTED.into())),
+            Span::styled(alias, Style::default().fg(TEXT.into())),
+            Span::styled(format!("  {target}"), Style::default().fg(MUTED.into())),
         ]))
     }));
     let selected_row = if group_count > 0 && app.host_picker_group.is_none() {
@@ -2015,19 +2081,19 @@ fn render_host_picker(frame: &mut Frame, area: Rect, app: &App) {
 fn file_panel(title: &str, active: bool) -> Block<'_> {
     Block::default()
         .title(title)
-        .title_style(Style::default().fg(if active { GREEN } else { MUTED }))
+        .title_style(Style::default().fg(if active { GREEN.into() } else { MUTED.into() }))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if active { GREEN } else { BORDER }))
-        .style(Style::default().bg(PANEL))
+        .border_style(Style::default().fg(if active { GREEN.into() } else { BORDER.into() }))
+        .style(Style::default().bg(PANEL.into()))
 }
 
 fn file_selection_style(active: bool) -> Style {
     Style::default()
-        .fg(if active { TEXT } else { MUTED })
+        .fg(if active { TEXT.into() } else { MUTED.into() })
         .bg(if active {
-            Color::Rgb(34, 54, 47)
+            SELECTED_ROW.into()
         } else {
-            PANEL
+            PANEL.into()
         })
         .add_modifier(if active {
             Modifier::BOLD
@@ -2065,15 +2131,29 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let content = Line::from(vec![
         Span::styled(
             " LAZYTERM ",
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  remote workspace", Style::default().fg(MUTED)),
+        Span::styled(
+            format!(
+                "  {}",
+                crate::i18n::text(app.metadata.language, "remote workspace")
+            ),
+            Style::default().fg(MUTED.into()),
+        ),
         Span::styled(
             format!("    SSH CONFIG  {hosts}"),
-            Style::default().fg(TEXT),
+            Style::default().fg(TEXT.into()),
         ),
-        Span::styled("    ~/.ssh/config", Style::default().fg(MUTED)),
-        Span::styled("    [,] Settings", Style::default().fg(GREEN)),
+        Span::styled("    ~/.ssh/config", Style::default().fg(MUTED.into())),
+        Span::styled(
+            format!(
+                "    {}",
+                crate::i18n::text(app.metadata.language, "[,] Settings")
+            ),
+            Style::default().fg(GREEN.into()),
+        ),
     ]);
     frame.render_widget(Paragraph::new(content), area);
 }
@@ -2081,12 +2161,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_sections();
     let titles = visible.iter().enumerate().map(|(index, section)| {
+        let localized = crate::i18n::text(app.metadata.language, section.title());
         let title = if area.width < 70 {
-            format!("{} {}", index + 1, &section.title()[..1])
+            format!("{} {}", index + 1, localized.chars().next().unwrap_or(' '))
         } else if area.width < 100 {
-            section.title().to_string()
+            localized.to_string()
         } else {
-            format!("{} {}", index + 1, section.title())
+            format!("{} {}", index + 1, localized)
         };
         Line::from(title)
     });
@@ -2099,81 +2180,154 @@ fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
             .select(selected)
             .padding("", "")
             .divider(if area.width < 70 { " " } else { " | " })
-            .style(Style::default().fg(MUTED))
+            .style(Style::default().fg(MUTED.into()))
             .highlight_style(
                 Style::default()
-                    .fg(GREEN)
-                    .bg(Color::Rgb(34, 54, 47))
+                    .fg(GREEN.into())
+                    .bg(SELECTED_ROW.into())
                     .add_modifier(Modifier::BOLD),
             )
             .block(
                 Block::default()
                     .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(BORDER)),
+                    .border_style(Style::default().fg(BORDER.into())),
             ),
         area,
     );
 }
 
 fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let language = app.metadata.language;
     let rows = [
-        ("Theme", app.metadata.theme.label().to_string()),
-        ("Language", app.metadata.language.label().to_string()),
         (
-            "Show Hosts tab",
-            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Hosts")).to_string(),
+            crate::i18n::text(language, "Theme"),
+            crate::i18n::text(language, app.metadata.theme.label()).to_string(),
         ),
         (
-            "Show Files tab",
-            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Files")).to_string(),
+            crate::i18n::text(language, "Language"),
+            app.metadata.language.label().to_string(),
         ),
         (
-            "Show Tunnels tab",
-            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Tunnels")).to_string(),
+            crate::i18n::text(language, "Show Hosts tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Hosts") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
         ),
         (
-            "Show Snippets tab",
-            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Snippets")).to_string(),
+            crate::i18n::text(language, "Show Files tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Files") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
         ),
         (
-            "Show Runtime tab",
-            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Runtime")).to_string(),
+            crate::i18n::text(language, "Show Tunnels tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Tunnels") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
         ),
         (
-            "Show Projects tab",
-            (!app.metadata.hidden_tabs.iter().any(|tab| tab == "Projects")).to_string(),
+            crate::i18n::text(language, "Show Snippets tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Snippets") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
         ),
         (
-            "Show Credentials tab",
-            (!app
-                .metadata
-                .hidden_tabs
-                .iter()
-                .any(|tab| tab == "Credentials"))
-            .to_string(),
+            crate::i18n::text(language, "Show Runtime tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Runtime") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
         ),
-        ("Export configuration", "Press Enter".into()),
-        ("Export credentials", "Encrypted .age file".into()),
+        (
+            crate::i18n::text(language, "Show Projects tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Projects") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Show Credentials tab"),
+            crate::i18n::text(
+                language,
+                if !app
+                    .metadata
+                    .hidden_tabs
+                    .iter()
+                    .any(|tab| tab == "Credentials")
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Export configuration"),
+            crate::i18n::text(language, "Press Enter").into(),
+        ),
+        (
+            crate::i18n::text(language, "Export credentials"),
+            crate::i18n::text(language, "Encrypted .age file").into(),
+        ),
+        ("Import configuration", "Validated JSON".to_string()),
+        ("Import credentials", "Encrypted .age file".to_string()),
     ];
     let items = rows.iter().enumerate().map(|(index, (label, value))| {
         let selected = index == app.selected_setting;
         let style = if selected {
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(TEXT)
+            Style::default().fg(TEXT.into())
         };
         ListItem::new(Line::from(vec![
             Span::styled(if selected { "▸ " } else { "  " }, style),
             Span::styled(format!("{label:<24}"), style),
             Span::styled(
                 value,
-                Style::default().fg(if selected { GREEN } else { MUTED }),
+                Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
             ),
         ]))
     });
     let mut state = ListState::default().with_selected(Some(app.selected_setting));
     frame.render_stateful_widget(
-        List::new(items).block(panel(" SETTINGS ")),
+        List::new(items).block(panel_l(app, "Settings")),
         area,
         &mut state,
     );
@@ -2193,7 +2347,9 @@ fn render_hosts(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             title,
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
         )),
         rows[0],
     );
@@ -2253,7 +2409,11 @@ fn render_group_cards(frame: &mut Frame, area: Rect, app: &App) {
         format!(" GROUPS  {}", groups.len())
     };
     frame.render_widget(
-        Paragraph::new(heading).style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        Paragraph::new(heading).style(
+            Style::default()
+                .fg(MUTED.into())
+                .add_modifier(Modifier::BOLD),
+        ),
         Rect::new(area.x, area.y, area.width, area.height.min(1)),
     );
     for row in 0..visible_rows {
@@ -2273,11 +2433,11 @@ fn render_group_cards(frame: &mut Frame, area: Rect, app: &App) {
             };
             let active = selected == Some(index);
             let count = app.group_hosts(group).len();
-            let border = if active { GREEN } else { BORDER };
+            let border = if active { GREEN.into() } else { BORDER.into() };
             let background = if active {
-                Color::Rgb(34, 54, 47)
+                SELECTED_ROW.into()
             } else {
-                PANEL
+                PANEL.into()
             };
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -2289,7 +2449,11 @@ fn render_group_cards(frame: &mut Frame, area: Rect, app: &App) {
                 Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
             frame.render_widget(
                 Paragraph::new(group.title())
-                    .style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
+                    .style(
+                        Style::default()
+                            .fg(TEXT.into())
+                            .add_modifier(Modifier::BOLD),
+                    )
                     .wrap(Wrap { trim: true }),
                 rows[0],
             );
@@ -2298,7 +2462,11 @@ fn render_group_cards(frame: &mut Frame, area: Rect, app: &App) {
                     "{count} {}",
                     if count == 1 { "host" } else { "hosts" }
                 ))
-                .style(Style::default().fg(if active { GREEN } else { MUTED })),
+                .style(Style::default().fg(if active {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                })),
                 rows[1],
             );
         }
@@ -2331,7 +2499,7 @@ fn render_host_list(frame: &mut Frame, area: Rect, app: &App) {
                 usize::from(area.width.saturating_sub(6)),
             ))
             .style(if selected == Some(index) {
-                Style::default().bg(Color::Rgb(34, 54, 47))
+                Style::default().bg(SELECTED_ROW.into())
             } else {
                 Style::default()
             })
@@ -2351,8 +2519,8 @@ fn render_host_list(frame: &mut Frame, area: Rect, app: &App) {
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BORDER))
-                    .style(Style::default().bg(PANEL)),
+                    .border_style(Style::default().fg(BORDER.into()))
+                    .style(Style::default().bg(PANEL.into())),
             )
             .highlight_symbol("> ")
             .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
@@ -2372,7 +2540,7 @@ fn render_host_list(frame: &mut Frame, area: Rect, app: &App) {
         let inner = Block::default().borders(Borders::ALL).inner(area);
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(MUTED.into()))
                 .wrap(Wrap { trim: true }),
             inner,
         );
@@ -2390,7 +2558,7 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
                 detail_line("Group", group.title()),
                 detail_line("Hosts", &hosts.len().to_string()),
             ])
-            .block(panel(" GROUP ")),
+            .block(panel_l(app, "Group")),
             rows[0],
         );
         let items = hosts.iter().map(|host| {
@@ -2400,7 +2568,7 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
                 usize::from(area.width.saturating_sub(2)),
             ))
         });
-        frame.render_widget(List::new(items).block(panel(" HOSTS ")), rows[1]);
+        frame.render_widget(List::new(items).block(panel_l(app, "Hosts")), rows[1]);
         return;
     }
     if let Some(host) = app.selected_host() {
@@ -2429,7 +2597,7 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
         ];
         frame.render_widget(
             Paragraph::new(overview)
-                .block(panel(" HOST "))
+                .block(panel_l(app, "Hosts"))
                 .wrap(Wrap { trim: true }),
             vertical[0],
         );
@@ -2477,7 +2645,7 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
         ];
         frame.render_widget(
             Paragraph::new(routing)
-                .block(panel(" CONNECTION "))
+                .block(panel_l(app, "Connection"))
                 .wrap(Wrap { trim: true }),
             vertical[1],
         );
@@ -2486,15 +2654,15 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "No session history yet.",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Enter connects using the system OpenSSH client.",
-                    Style::default().fg(DISABLED),
+                    Style::default().fg(DISABLED.into()),
                 )),
             ])
-            .block(panel(" RECENT SESSIONS "))
+            .block(panel_l(app, "Recent sessions"))
             .wrap(Wrap { trim: true }),
             vertical[2],
         );
@@ -2508,8 +2676,8 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
         };
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(MUTED))
-                .block(panel(" HOST DETAILS "))
+                .style(Style::default().fg(MUTED.into()))
+                .block(panel_l(app, "Host details"))
                 .wrap(Wrap { trim: true }),
             area,
         );
@@ -2519,7 +2687,7 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
 fn host_alias_line(host: &crate::hosts::Host, indent: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!("{indent}{}", host.alias),
-        Style::default().fg(TEXT),
+        Style::default().fg(TEXT.into()),
     ))
 }
 
@@ -2536,7 +2704,10 @@ fn host_list_lines(
         .saturating_sub(usize::from(has_badges));
     let address_text = format!("  {}", host.destination());
     let address_text = truncate_display(&address_text, address_width);
-    let address = Line::from(Span::styled(address_text, Style::default().fg(MUTED)));
+    let address = Line::from(Span::styled(
+        address_text,
+        Style::default().fg(MUTED.into()),
+    ));
     let gap = content_width.saturating_sub(address.width() + badges.width());
     let mut second_line = address.spans;
     second_line.push(Span::raw(" ".repeat(gap)));
@@ -2582,8 +2753,8 @@ fn host_auth_badges(app: &App, host: &crate::hosts::Host) -> Line<'static> {
         spans.push(Span::styled(
             " SSH key ",
             Style::default()
-                .fg(BG)
-                .bg(GREEN)
+                .fg(BG.into())
+                .bg(GREEN.into())
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
@@ -2591,8 +2762,8 @@ fn host_auth_badges(app: &App, host: &crate::hosts::Host) -> Line<'static> {
         spans.push(Span::styled(
             " Key uploaded ",
             Style::default()
-                .fg(BG)
-                .bg(GREEN)
+                .fg(BG.into())
+                .bg(GREEN.into())
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
@@ -2601,7 +2772,7 @@ fn host_auth_badges(app: &App, host: &crate::hosts::Host) -> Line<'static> {
         spans.push(Span::styled(
             " Password ",
             Style::default()
-                .fg(BG)
+                .fg(BG.into())
                 .bg(Color::Rgb(103, 211, 211))
                 .add_modifier(Modifier::BOLD),
         ));
@@ -2611,8 +2782,8 @@ fn host_auth_badges(app: &App, host: &crate::hosts::Host) -> Line<'static> {
 
 fn detail_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<11}  "), Style::default().fg(MUTED)),
-        Span::styled(value.to_string(), Style::default().fg(TEXT)),
+        Span::styled(format!("{label:<11}  "), Style::default().fg(MUTED.into())),
+        Span::styled(value.to_string(), Style::default().fg(TEXT.into())),
     ])
 }
 
@@ -2620,8 +2791,17 @@ fn panel(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL))
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()))
+}
+
+fn panel_l(app: &App, title: &str) -> Block<'static> {
+    let title = crate::i18n::text(app.metadata.language, title);
+    Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()))
 }
 
 fn action_panel<'a>(title: &'a str, footer: &str, border: Color) -> Block<'a> {
@@ -2629,11 +2809,11 @@ fn action_panel<'a>(title: &'a str, footer: &str, border: Color) -> Block<'a> {
         .title(title)
         .title_bottom(Span::styled(
             format!(" {footer} "),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED.into()),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(PANEL))
+        .style(Style::default().bg(PANEL.into()))
 }
 
 fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
@@ -2641,15 +2821,17 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
         render_snippet_execution(frame, area, app);
         return;
     }
-    let block = panel(" SNIPPETS ");
+    let block = panel_l(app, "SNIPPETS");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             "Packages",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(TEXT.into())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("   →   ", Style::default().fg(MUTED)),
+        Span::styled("   →   ", Style::default().fg(MUTED.into())),
         Span::styled(
             if app.snippet_package_open {
                 app.metadata
@@ -2659,7 +2841,9 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "Select a package"
             },
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     frame.render_widget(title, Rect { height: 1, ..inner });
@@ -2683,7 +2867,7 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(Span::styled(
                     format!("▣  {}", package.name),
                     Style::default()
-                        .fg(if selected { GREEN } else { TEXT })
+                        .fg(if selected { GREEN.into() } else { TEXT.into() })
                         .add_modifier(if selected {
                             Modifier::BOLD
                         } else {
@@ -2696,13 +2880,13 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
                         package.snippets.len(),
                         if package.snippets.len() == 1 { "" } else { "s" }
                     ),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 )),
             ])
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(package_rows).block(panel(" PACKAGES ")),
+        List::new(package_rows).block(panel_l(app, "PACKAGES")),
         columns[0],
     );
 
@@ -2722,7 +2906,7 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
                         Line::from(Span::styled(
                             format!("{marker}  {{}}  {} {}", snippet.name, snippet.command),
                             Style::default()
-                                .fg(if selected { GREEN } else { TEXT })
+                                .fg(if selected { GREEN.into() } else { TEXT.into() })
                                 .add_modifier(if selected {
                                     Modifier::BOLD
                                 } else {
@@ -2735,7 +2919,7 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
                             } else {
                                 format!("     {}", snippet.description)
                             },
-                            Style::default().fg(MUTED),
+                            Style::default().fg(MUTED.into()),
                         )),
                     ])
                 })
@@ -2743,34 +2927,36 @@ fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
         })
         .unwrap_or_default();
     frame.render_widget(
-        List::new(snippet_rows).block(panel(" SNIPPETS IN PACKAGE ")),
+        List::new(snippet_rows).block(panel_l(app, "Snippets in package")),
         columns[1],
     );
     render_snippet_runs(frame, sections[1], app);
 }
 
 fn render_snippet_execution(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel(" SNIPPET EXECUTION ");
+    let block = panel_l(app, "Snippet execution");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(run) = app.snippet_runs.get(app.selected_snippet_run) else {
         frame.render_widget(
-            Paragraph::new("No execution selected.").style(Style::default().fg(MUTED)),
+            Paragraph::new("No execution selected.").style(Style::default().fg(MUTED.into())),
             inner,
         );
         return;
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Snippet: ", Style::default().fg(MUTED)),
+            Span::styled("Snippet: ", Style::default().fg(MUTED.into())),
             Span::styled(
                 run.snippet_name.clone(),
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Command: ", Style::default().fg(MUTED)),
-            Span::styled(run.command.clone(), Style::default().fg(TEXT)),
+            Span::styled("Command: ", Style::default().fg(MUTED.into())),
+            Span::styled(run.command.clone(), Style::default().fg(TEXT.into())),
         ]),
     ]);
     frame.render_widget(header, Rect { height: 2, ..inner });
@@ -2796,7 +2982,7 @@ fn render_snippet_execution(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(Span::styled(
                 format!("{} {}", if selected { ">" } else { " " }, item.host_alias),
                 Style::default()
-                    .fg(if selected { GREEN } else { TEXT })
+                    .fg(if selected { GREEN.into() } else { TEXT.into() })
                     .add_modifier(if selected {
                         Modifier::BOLD
                     } else {
@@ -2805,12 +2991,12 @@ fn render_snippet_execution(frame: &mut Frame, area: Rect, app: &App) {
             )),
             Line::from(Span::styled(
                 format!("  {status}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED.into()),
             )),
         ])
     });
     frame.render_widget(
-        List::new(target_rows).block(panel(" TARGET HOSTS ")),
+        List::new(target_rows).block(panel_l(app, "Target hosts")),
         columns[0],
     );
     let output = if run.output.is_empty() {
@@ -2826,7 +3012,7 @@ fn render_snippet_execution(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(output)
             .scroll((app.snippet_output_scroll, 0))
             .wrap(Wrap { trim: false })
-            .block(panel(" OUTPUT ")),
+            .block(panel_l(app, "OUTPUT")),
         columns[1],
     );
 }
@@ -2852,15 +3038,15 @@ fn render_snippet_runs(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 format!("{marker} {:<18} {:<10} ", run.host_alias, status),
                 Style::default().fg(if index == app.selected_snippet_run {
-                    GREEN
+                    GREEN.into()
                 } else {
-                    TEXT
+                    TEXT.into()
                 }),
             ),
-            Span::styled(output, Style::default().fg(MUTED)),
+            Span::styled(output, Style::default().fg(MUTED.into())),
         ]))
     });
-    frame.render_widget(List::new(rows).block(panel(" RUNS ")), area);
+    frame.render_widget(List::new(rows).block(panel_l(app, "RUNS")), area);
 }
 
 fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, app: &App) {
@@ -2903,7 +3089,7 @@ fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, 
                 .find(|package| package.id == dialog.package_id)
                 .map_or("Unknown", |package| package.name.as_str())
         ))
-        .style(Style::default().fg(MUTED))
+        .style(Style::default().fg(MUTED.into()))
         .wrap(Wrap { trim: true }),
         Rect {
             y: inner.y + 6,
@@ -2938,7 +3124,7 @@ fn render_package_dialog(frame: &mut Frame, dialog: &crate::app::PackageDialog) 
     }
     frame.render_widget(
         Paragraph::new("Tab / ↑↓ field    Enter save    Esc cancel")
-            .style(Style::default().fg(MUTED)),
+            .style(Style::default().fg(MUTED.into())),
         Rect {
             y: inner.y + 4,
             height: inner.height.saturating_sub(4),
@@ -2966,7 +3152,7 @@ fn render_snippet_confirmation(frame: &mut Frame, pending: &crate::app::PendingS
             )),
             Line::from(pending.command.clone()),
         ])
-        .style(Style::default().fg(TEXT))
+        .style(Style::default().fg(TEXT.into()))
         .wrap(Wrap { trim: true }),
         inner,
     );
@@ -2988,7 +3174,7 @@ fn render_snippet_delete_confirmation(frame: &mut Frame, target: &crate::app::Sn
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(message).style(Style::default().fg(TEXT)),
+        Paragraph::new(message).style(Style::default().fg(TEXT.into())),
         inner,
     );
 }
@@ -3016,11 +3202,13 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     snippet.name.clone(),
-                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(GREEN.into())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     format!("$ {}", snippet.command),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED.into()),
                 )),
             ]),
             Rect { height: 2, ..inner },
@@ -3065,7 +3253,7 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
             ListItem::new(Span::styled(
                 label,
                 Style::default()
-                    .fg(if selected { GREEN } else { TEXT })
+                    .fg(if selected { GREEN.into() } else { TEXT.into() })
                     .add_modifier(if selected {
                         Modifier::BOLD
                     } else {
@@ -3076,8 +3264,8 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
         .collect::<Vec<_>>();
     frame.render_widget(
         List::new(rows)
-            .block(panel(" TARGETS "))
-            .highlight_style(Style::default().fg(GREEN)),
+            .block(panel_l(app, "Targets"))
+            .highlight_style(Style::default().fg(GREEN.into())),
         list_area,
     );
 }
@@ -3085,6 +3273,7 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let confirmation_open = app.workspace.delete.is_some()
         || app.workspace.confirmation.is_some()
+        || app.import_confirmation.is_some()
         || app.snippet_confirmation.is_some()
         || app.snippet_delete_confirmation.is_some()
         || app.runtime_kill_confirmation.is_some()
@@ -3110,7 +3299,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "1-7 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
     };
     let hint = if confirmation_open {
-        ""
+        if app.import_confirmation.is_some() {
+            "y / Enter confirm  n / Esc cancel"
+        } else {
+            ""
+        }
+    } else if app.credential_import_dialog.is_some() {
+        "Type archive password  Enter continue  Esc cancel"
     } else if app.host_action_dialog.is_some() {
         "Enter / Esc close"
     } else if app.workspace.form.is_some() {
@@ -3255,6 +3450,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "q quit"
     };
+    let hint = crate::i18n::text(app.metadata.language, hint);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(if app.searching {
@@ -3264,7 +3460,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             }),
             Line::from(hint),
         ])
-        .style(Style::default().fg(MUTED)),
+        .style(Style::default().fg(MUTED.into())),
         area,
     );
 }
@@ -3282,10 +3478,10 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
                     input_line("Name", value, true, false),
                     Line::from(Span::styled(
                         "Enter confirm   Esc cancel",
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     )),
                 ])
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT.into()))
                 .block(panel(" RENAME FILE "))
                 .wrap(Wrap { trim: true }),
                 area,
@@ -3308,7 +3504,7 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
                         "This action cannot be undone."
                     }),
                 ])
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT.into()))
                 .block(action_panel(
                     title,
                     "y/Enter yes  n/Esc no",
@@ -3327,10 +3523,10 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
                     Line::from(""),
                     Line::from(Span::styled(
                         "Enter confirm   Esc cancel",
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     )),
                 ])
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT.into()))
                 .block(panel(" NEW DIRECTORY "))
                 .wrap(Wrap { trim: true }),
                 area,
@@ -3354,7 +3550,7 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
                     Line::from(format!("{direction} will overwrite:")),
                     Line::from(target),
                 ])
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT.into()))
                 .block(action_panel(
                     " TRANSFER CONFLICT ",
                     "y/Enter yes  n/Esc no",
@@ -3382,9 +3578,9 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
             Color::Rgb(221, 132, 112),
         )
     } else if dialog.editing {
-        action_panel(" EDIT HOST ", actions, BORDER)
+        action_panel(" EDIT HOST ", actions, BORDER.into())
     } else {
-        action_panel(" NEW HOST ", actions, BORDER)
+        action_panel(" NEW HOST ", actions, BORDER.into())
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3397,7 +3593,7 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
                 ),
                 Line::from("A backup is created before the config is changed."),
             ])
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .wrap(Wrap { trim: true }),
             inner,
         );
@@ -3446,7 +3642,7 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
                 } else {
                     " IP/alias (unlisted OK) | Space to select"
                 },
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED.into()),
             ));
         }
         frame.render_widget(Paragraph::new(line), rows[index]);
@@ -3460,7 +3656,7 @@ fn render_proxy_jump_picker(frame: &mut Frame, app: &App, dialog: &crate::app::H
     let block = action_panel(
         " SELECT JUMP HOST ",
         "↑↓ select  Enter use host  Esc back",
-        BORDER,
+        BORDER.into(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3480,7 +3676,7 @@ fn render_proxy_jump_picker(frame: &mut Frame, app: &App, dialog: &crate::app::H
         });
         let mut state = ListState::default().with_selected(Some(selected));
         frame.render_stateful_widget(
-            List::new(items).highlight_style(Style::default().bg(PANEL)),
+            List::new(items).highlight_style(Style::default().bg(PANEL.into())),
             inner,
             &mut state,
         );
@@ -3537,7 +3733,7 @@ fn render_host_tag_picker(frame: &mut Frame, app: &App, dialog: &crate::app::Hos
     let block = action_panel(
         " SELECT GROUPS ",
         "Type filter  Space toggle  Enter create/apply  Esc done",
-        BORDER,
+        BORDER.into(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3557,7 +3753,7 @@ fn render_host_tag_picker(frame: &mut Frame, app: &App, dialog: &crate::app::Hos
     } else {
         let mut state = ListState::default().with_selected((option_count > 0).then_some(selected));
         frame.render_stateful_widget(
-            List::new(items).highlight_style(Style::default().bg(PANEL)),
+            List::new(items).highlight_style(Style::default().bg(PANEL.into())),
             rows[1],
             &mut state,
         );
@@ -3574,7 +3770,7 @@ fn render_host_group_dialog(frame: &mut Frame, dialog: &crate::app::HostGroupDia
                 Line::from(format!("Delete group \"{name}\"?")),
                 Line::from("Hosts will be kept; only this group assignment is removed."),
             ])
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .block(action_panel(
                 " DELETE GROUP ",
                 "y/Enter delete  n/Esc cancel",
@@ -3591,11 +3787,11 @@ fn render_host_group_dialog(frame: &mut Frame, dialog: &crate::app::HostGroupDia
         };
         frame.render_widget(
             Paragraph::new(input_line("Name", &dialog.name, true, false))
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT.into()))
                 .block(action_panel(
                     title,
                     "Type name  Enter save  Esc cancel",
-                    BORDER,
+                    BORDER.into(),
                 )),
             area,
         );
@@ -3633,7 +3829,7 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
                 "Delete forwarding \"{}\"?",
                 dialog.fields[0]
             ))])
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .wrap(Wrap { trim: true }),
             inner,
         );
@@ -3668,18 +3864,30 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Mode  ", Style::default().fg(MUTED)),
+            Span::styled("Mode  ", Style::default().fg(MUTED.into())),
             Span::styled(
                 "[F1 Local]  ",
-                Style::default().fg(if mode == "Local" { GREEN } else { MUTED }),
+                Style::default().fg(if mode == "Local" {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
             ),
             Span::styled(
                 "[F2 Remote]  ",
-                Style::default().fg(if mode == "Remote" { GREEN } else { MUTED }),
+                Style::default().fg(if mode == "Remote" {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
             ),
             Span::styled(
                 "[F3 Dynamic]",
-                Style::default().fg(if mode == "Dynamic" { GREEN } else { MUTED }),
+                Style::default().fg(if mode == "Dynamic" {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
             ),
         ])),
         Rect {
@@ -3716,7 +3924,7 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
         Paragraph::new(
             "Use a Host alias from ~/.ssh/config, or enter an IP/domain    Tab / ↑↓ field    Enter save    Esc cancel",
         )
-            .style(Style::default().fg(MUTED)),
+            .style(Style::default().fg(MUTED.into())),
         help_area,
     );
 }
@@ -3735,8 +3943,8 @@ fn render_search(frame: &mut Frame, app: &App) {
             Block::default()
                 .title(" SEARCH HOSTS ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(GREEN))
-                .style(Style::default().bg(PANEL)),
+                .border_style(Style::default().fg(GREEN.into()))
+                .style(Style::default().bg(PANEL.into())),
         ),
         area,
     );
@@ -3758,7 +3966,7 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
         0
     };
     let border = if dialog.pending {
-        GREEN
+        GREEN.into()
     } else {
         Color::Rgb(221, 132, 112)
     };
@@ -3776,18 +3984,18 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         content
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .scroll((scroll, 0))
             .block(
                 Block::default()
                     .title(format!(" {} ", dialog.title))
                     .title_bottom(Span::styled(
                         format!(" {footer} "),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED.into()),
                     ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border))
-                    .style(Style::default().bg(PANEL)),
+                    .style(Style::default().bg(PANEL.into())),
             ),
         area,
     );
@@ -3830,13 +4038,13 @@ fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPassw
     let block = action_panel(
         &title,
         "Tab/↑↓ field  Space toggle  Enter connect  Esc cancel",
-        GREEN,
+        GREEN.into(),
     );
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -3851,15 +4059,15 @@ pub(crate) fn input_line(label: &str, value: &str, focused: bool, masked: bool) 
     Line::from(vec![
         Span::styled(
             if focused { "> " } else { "  " },
-            Style::default().fg(if focused { GREEN } else { MUTED }),
+            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
         ),
         Span::styled(
             format!("{label}: "),
-            Style::default().fg(if focused { GREEN } else { MUTED }),
+            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
         ),
         Span::styled(
             format!("{shown}{}", if focused { "_" } else { "" }),
-            Style::default().fg(TEXT),
+            Style::default().fg(TEXT.into()),
         ),
     ])
 }
@@ -3873,11 +4081,11 @@ pub(crate) fn input_value(value: &str, focused: bool, masked: bool) -> Line<'sta
     Line::from(vec![
         Span::styled(
             if focused { "> " } else { "  " },
-            Style::default().fg(if focused { GREEN } else { MUTED }),
+            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
         ),
         Span::styled(
             format!("{shown}{}", if focused { "_" } else { "" }),
-            Style::default().fg(TEXT),
+            Style::default().fg(TEXT.into()),
         ),
     ])
 }
@@ -3886,11 +4094,11 @@ pub(crate) fn checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'
     Line::from(vec![
         Span::styled(
             if focused { "> " } else { "  " },
-            Style::default().fg(if focused { GREEN } else { MUTED }),
+            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
         ),
         Span::styled(
             format!("[{}] {label}", if checked { "x" } else { " " }),
-            Style::default().fg(if focused { GREEN } else { TEXT }),
+            Style::default().fg(if focused { GREEN.into() } else { TEXT.into() }),
         ),
     ])
 }
@@ -3902,13 +4110,13 @@ fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::Crede
         Block::default()
             .title(" EXPORT ENCRYPTED CREDENTIALS ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(GREEN))
-            .style(Style::default().bg(PANEL)),
+            .border_style(Style::default().fg(GREEN.into()))
+            .style(Style::default().bg(PANEL.into())),
         area,
     );
     let inner = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(GREEN))
+        .border_style(Style::default().fg(GREEN.into()))
         .inner(area);
     let rows = Layout::vertical([
         Constraint::Length(2),
@@ -3922,7 +4130,7 @@ fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::Crede
     .split(inner);
     frame.render_widget(
         Paragraph::new("Set a password to protect the exported .age file.")
-            .style(Style::default().fg(TEXT)),
+            .style(Style::default().fg(TEXT.into())),
         rows[0],
     );
     for (index, label) in ["Export password", "Confirm password"].iter().enumerate() {
@@ -3942,19 +4150,17 @@ fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::Crede
         frame.render_widget(
             Paragraph::new(*label).style(
                 Style::default()
-                    .fg(if focused { GREEN } else { TEXT })
+                    .fg(if focused { GREEN.into() } else { TEXT.into() })
                     .add_modifier(Modifier::BOLD),
             ),
             label_area,
         );
         frame.render_widget(
             Paragraph::new(input_value(&dialog.fields[index], focused, true))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(if focused { GREEN } else { BORDER })),
-                )
-                .style(Style::default().fg(if focused { GREEN } else { TEXT })),
+                .block(Block::default().borders(Borders::ALL).border_style(
+                    Style::default().fg(if focused { GREEN.into() } else { BORDER.into() }),
+                ))
+                .style(Style::default().fg(if focused { GREEN.into() } else { TEXT.into() })),
             input_area,
         );
     }
@@ -3966,8 +4172,93 @@ fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::Crede
     }
     frame.render_widget(
         Paragraph::new("Tab/↑↓ switch field   Enter export   Esc cancel")
-            .style(Style::default().fg(MUTED)),
+            .style(Style::default().fg(MUTED.into())),
         rows[6],
+    );
+}
+
+fn render_credential_import_dialog(frame: &mut Frame, dialog: &crate::app::CredentialImportDialog) {
+    let area = centered_rect(72, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let input = Rect {
+        x: area.x + 2,
+        y: area.y + 3,
+        width: area.width.saturating_sub(4),
+        height: 3,
+    };
+    frame.render_widget(
+        Paragraph::new("Enter the password used to encrypt this credential archive.")
+            .style(Style::default().fg(TEXT.into()))
+            .block(
+                Block::default()
+                    .title(" IMPORT ENCRYPTED CREDENTIALS ")
+                    .title_bottom(Span::styled(
+                        " Enter import   Esc cancel ",
+                        Style::default().fg(MUTED.into()),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GREEN.into()))
+                    .style(Style::default().bg(PANEL.into())),
+            ),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(input_value(&dialog.password, true, true)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(GREEN.into())),
+        ),
+        input,
+    );
+    if let Some(error) = dialog.error.as_deref() {
+        let error_area = Rect {
+            x: area.x + 2,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(crate::diagnostics::redact_sensitive_text(error))
+                .style(Style::default().fg(Color::Rgb(221, 132, 112))),
+            error_area,
+        );
+    }
+}
+
+fn render_import_confirmation(frame: &mut Frame, app: &App, kind: crate::app::ImportKind) {
+    let (title, message) = match kind {
+        crate::app::ImportKind::Configuration => (
+            "IMPORT CONFIGURATION",
+            format!(
+                "This replaces LazyTerm metadata and {} SSH hosts. Current files will be backed up first. Keychain passwords are imported separately.",
+                app.pending_configuration_import
+                    .as_ref()
+                    .map_or(0, |pending| pending.import.host_count)
+            ),
+        ),
+        crate::app::ImportKind::Credentials => (
+            "IMPORT CREDENTIALS",
+            "Matching Keychain entries will be replaced. Existing values are backed up encrypted using this archive's password.".to_string(),
+        ),
+    };
+    let area = centered_rect(82, 10, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(TEXT.into()))
+            .block(
+                Block::default()
+                    .title(format!(" {title} "))
+                    .title_bottom(Span::styled(
+                        " y/Enter confirm   n/Esc cancel ",
+                        Style::default().fg(MUTED.into()),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(221, 177, 91)))
+                    .style(Style::default().bg(PANEL.into())),
+            ),
+        area,
     );
 }
 
@@ -4347,6 +4638,34 @@ mod tests {
     }
 
     #[test]
+    fn import_password_is_masked_and_configuration_requires_confirmation() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.credential_import_dialog = Some(crate::app::CredentialImportDialog {
+            password: "archive-secret".into(),
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("**************"), "{text}");
+        assert!(!text.contains("archive-secret"), "{text}");
+
+        app.credential_import_dialog = None;
+        app.import_confirmation = Some(crate::app::ImportKind::Credentials);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("IMPORT CREDENTIALS"), "{text}");
+        assert!(text.contains("y / Enter confirm"), "{text}");
+        assert!(
+            text.contains("encrypted using this archive's password"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn populated_projects_forms_and_output_render_and_scroll_at_supported_sizes() {
         use crate::projects::tests::{Fixture, until};
         use crossterm::event::KeyCode;
@@ -4489,7 +4808,7 @@ mod tests {
                 .buffer()
                 .content
                 .iter()
-                .any(|cell| cell.symbol() == "P" && cell.fg == GREEN)
+                .any(|cell| cell.symbol() == "P" && cell.fg == GREEN.into())
         );
         app.runtime_kill_confirmation = app.selected_runtime_entry().cloned();
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -4561,11 +4880,11 @@ mod tests {
             let layout = runtime_layout(terminal.get_frame().area());
             assert_eq!(
                 terminal.backend().buffer()[(layout.hosts.x + 1, layout.hosts.y)].fg,
-                GREEN
+                GREEN.into()
             );
             assert_eq!(
                 terminal.backend().buffer()[(layout.local.x + 1, layout.local.y)].fg,
-                MUTED
+                MUTED.into()
             );
             app.runtime_kill_confirmation = app.selected_runtime_entry().cloned();
             terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -4748,7 +5067,7 @@ mod tests {
                     format!("{} {}", index + 1, section.title())
                 };
                 let selected = text.find(&selected_label).unwrap();
-                assert_eq!(row[selected].fg, GREEN);
+                assert_eq!(row[selected].fg, GREEN.into());
                 assert_eq!(row[selected].bg, Color::Rgb(34, 54, 47));
                 assert!(!format!("{}", terminal.backend()).contains("WORKSPACE"));
                 if section == NavSection::Hosts {
@@ -4794,8 +5113,8 @@ mod tests {
             .iter()
             .find(|span| span.content == " Key uploaded ")
             .unwrap();
-        assert_eq!(key.style.bg, Some(GREEN));
-        assert_eq!(key.style.fg, Some(BG));
+        assert_eq!(key.style.bg, Some(GREEN.into()));
+        assert_eq!(key.style.fg, Some(BG.into()));
         assert!(!badges.to_string().contains("Password"));
         let lines = host_list_lines(&app, &host, 40);
         assert_eq!(lines.len(), 2);
@@ -4877,7 +5196,7 @@ mod tests {
                 buffer
                     .content
                     .iter()
-                    .any(|cell| { cell.symbol() == "K" && cell.bg == GREEN })
+                    .any(|cell| { cell.symbol() == "K" && cell.bg == GREEN.into() })
             );
             assert!(!text.contains("UP upload recorded"));
             app.active_group = None;
@@ -4925,7 +5244,7 @@ mod tests {
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let buffer = terminal.backend().buffer();
             assert_eq!(buffer[(0, 5)].symbol(), "┌");
-            assert_eq!(buffer[(0, 5)].fg, GREEN);
+            assert_eq!(buffer[(0, 5)].fg, GREEN.into());
             let text = format!("{}", terminal.backend());
             assert!(text.contains("group-00"));
             assert!(text.contains("1 host"));
@@ -4952,7 +5271,7 @@ mod tests {
             terminal.draw(|frame| render(frame, &app)).unwrap();
             assert_eq!(app.selected_host().unwrap().alias, "web");
             assert!(format!("{}", terminal.backend()).contains("web"));
-            assert_eq!(terminal.backend().buffer()[(0, 5)].fg, BORDER);
+            assert_eq!(terminal.backend().buffer()[(0, 5)].fg, BORDER.into());
             app.selected_browse_item = 0;
             app.enter_group();
             terminal.draw(|frame| render(frame, &app)).unwrap();

@@ -2,7 +2,10 @@ mod app;
 mod credential_app;
 mod credential_ui;
 mod credentials;
+mod diagnostics;
 mod hosts;
+mod i18n;
+mod import_export;
 mod instance;
 mod metadata;
 mod project_app;
@@ -12,6 +15,7 @@ mod project_runner;
 mod projects;
 mod runtime;
 mod sftp;
+mod theme;
 mod tunnel;
 mod ui;
 
@@ -166,14 +170,18 @@ fn open_files(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     };
 
     let mut command = Command::new("sftp");
-    if let Some(username) = app.host_password_username(&host.alias) {
+    let username = app.host_password_username(&host.alias);
+    if let Some(username) = username {
         command.arg("-l").arg(username);
     }
     if let Some(reference) = app.host_password_reference(&host.alias) {
         command.args(["-o", "BatchMode=no"]);
-        if let Err(error) =
-            crate::credentials::configure_password(&mut command, reference, &host.alias)
-        {
+        if let Err(error) = crate::credentials::configure_password_for(
+            &mut command,
+            reference,
+            &host.alias,
+            username,
+        ) {
             app.notice = Some(format!("Could not prepare saved password: {error}"));
             return Ok(());
         }
@@ -260,9 +268,12 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     ]);
     if let Some(reference) = password_reference.as_deref() {
         preflight_command.args(["-o", "BatchMode=no"]);
-        if let Err(error) =
-            crate::credentials::configure_password(&mut preflight_command, reference, &host.alias)
-        {
+        if let Err(error) = crate::credentials::configure_password_for(
+            &mut preflight_command,
+            reference,
+            &host.alias,
+            username.as_deref(),
+        ) {
             app.connection_dialog = None;
             app.notice = Some(format!("Could not prepare Host password: {error}"));
             return Ok(());
@@ -346,9 +357,12 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     }
     if let Some(reference) = password_reference.as_deref() {
         command.args(["-o", "BatchMode=no"]);
-        if let Err(error) =
-            crate::credentials::configure_password(&mut command, reference, &host.alias)
-        {
+        if let Err(error) = crate::credentials::configure_password_for(
+            &mut command,
+            reference,
+            &host.alias,
+            username.as_deref(),
+        ) {
             app.notice = Some(format!("Could not prepare saved password: {error}"));
             return Ok(());
         }
@@ -401,11 +415,13 @@ fn ssh_error_detail(stderr: &str, status: ExitStatus) -> String {
     if detail.is_empty() {
         exit_status(status)
     } else {
-        detail
-            .strip_prefix("ssh: ")
-            .unwrap_or(detail)
-            .replace("\r\n", "\n")
-            .replace('\r', "")
+        crate::diagnostics::redact_sensitive_text(
+            &detail
+                .strip_prefix("ssh: ")
+                .unwrap_or(detail)
+                .replace("\r\n", "\n")
+                .replace('\r', ""),
+        )
     }
 }
 

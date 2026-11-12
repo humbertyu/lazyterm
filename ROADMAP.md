@@ -184,18 +184,21 @@ Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, 
 
 - [x] Add a cross-platform Host credential store for usernames and passwords, with a dedicated Credentials tab and reusable Host associations.
 - [x] Manage OpenSSH key references and fingerprints, generate Ed25519 key pairs without overwriting existing files, and upload public keys through the existing Groups/Hosts catalog.
-- [ ] Reuse Host credentials from SSH, SFTP, Tunnel, and Project connections without writing passwords to OpenSSH config, LazyTerm metadata, arguments, environment, or logs.
-- [ ] Add credential prompts for password authentication and first-use credential setup, with explicit errors for unavailable or rejected platform stores.
+- [x] Reuse saved Host credentials from native SSH/SFTP, Tunnels, Snippets, and app-scoped remote Projects through target-scoped askpass. The secret stays in the OS credential store and is not written to config, arguments, environment, or logs.
+- [ ] Add equivalent first-use/rejected-password prompts to Tunnels, Snippets, and Projects; support saved passwords in the embedded SFTP browser and jump-host authentication.
 - [x] Configuration export and documented data locations. Credential export includes saved manager/Host passwords and Project Web Link passwords in a user-selected, password-protected age file; credential import and private-key export remain pending.
-- [ ] Schema migrations and backup behavior.
-- [ ] Better diagnostics with secret redaction.
+- [x] Introduce additive metadata schema migration with version validation and a pre-migration backup using the existing bounded backup rotation.
+- [x] Redact password-like values and URI credentials from surfaced SSH, Tunnel, and Snippet stderr diagnostics; broader diagnostic audit remains part of acceptance.
 - [ ] Recovery behavior for killed TUI and tunnel processes.
 - [ ] macOS builds for supported architectures.
 - [ ] Installation instructions and checksums.
 - [ ] User testing of SSH, SFTP, credentials, tunnels, snippets, Runtime, and Projects.
 - [x] Add the first Settings surface for theme, language, tab visibility, and metadata-only export.
+- [ ] Complete English, Simplified Chinese, and Japanese localization for all workspace labels, dialogs, notices, validation errors, and help text.
 
-0.6 implementation order: Host credentials first, then configuration import and schema migration. The credential manager supports password CRUD, Host association/unlinking, key generation/import, direct association display, and confirmed public-key installation. Native SSH/SFTP and public-key upload use scoped askpass for saved target passwords; embedded SFTP, Tunnel, remote Project, jump-host passwords and private-key passphrase storage remain open. An opt-in disposable SSH fixture verifies generation, idempotent installation, and authentication with the newly installed key. Ordinary configuration archives omit saved password fields and private key files.
+0.6 implementation order: Host credentials, metadata migration, and configuration/credential import are in place; remaining beta-hardening work is next. Configuration import is separate from encrypted credential import. The credential manager supports password CRUD, Host association/unlinking, key generation/import, direct association display, and confirmed public-key installation. Native SSH/SFTP, Tunnels, Snippets, remote app-scoped Projects, and public-key upload use scoped askpass for saved target passwords. First-use prompts outside Hosts, embedded SFTP password authentication, jump-host passwords and private-key passphrase storage remain open. An opt-in disposable SSH fixture verifies generation, idempotent installation, and authentication with the newly installed key. Ordinary configuration archives omit saved password fields and private key files.
+
+Recovery note: startup now scans local Project command records, reattaches a live runner, and marks an active record failed only when its runner lock is released and its process group is confirmed empty. Recovery after the runner itself is killed while its command process group remains alive, recovery of forced-killed TUI-owned Tunnel processes, and end-to-end forced-termination acceptance are still open.
 
 ## v0.7.0 - Stable Core
 

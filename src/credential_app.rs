@@ -975,6 +975,13 @@ impl App {
             .filter(|username| !username.is_empty())
     }
 
+    pub fn host_password_auth(&self, alias: &str) -> crate::credentials::HostAuth {
+        crate::credentials::HostAuth {
+            username: self.host_password_username(alias).map(str::to_string),
+            password_ref: self.host_password_reference(alias).map(str::to_string),
+        }
+    }
+
     fn host_password_credential(&self, alias: &str) -> Option<&Credential> {
         let id = self.metadata.host_passwords.get(alias)?;
         self.metadata
