@@ -4739,7 +4739,7 @@ impl App {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            let dialog = self.host_dialog.as_mut().expect("dialog exists");
+            let dialog = self.host_dialog.as_ref().expect("dialog exists");
             let filter = dialog.tag_filter.to_lowercase();
             let matches = available
                 .iter()
@@ -4753,41 +4753,63 @@ impl App {
             let option_count = matches.len() + usize::from(has_create);
             match key {
                 KeyCode::Esc => {
+                    let dialog = self.host_dialog.as_mut().expect("dialog exists");
                     dialog.tag_picker_open = false;
                     dialog.tag_filter.clear();
                 }
                 KeyCode::Up => {
+                    let dialog = self.host_dialog.as_mut().expect("dialog exists");
                     dialog.tag_picker_selected = dialog.tag_picker_selected.saturating_sub(1);
                 }
                 KeyCode::Down if option_count > 0 => {
+                    let dialog = self.host_dialog.as_mut().expect("dialog exists");
                     dialog.tag_picker_selected =
                         (dialog.tag_picker_selected + 1).min(option_count - 1);
                 }
                 KeyCode::Backspace => {
+                    let dialog = self.host_dialog.as_mut().expect("dialog exists");
                     dialog.tag_filter.pop();
                     dialog.tag_picker_selected = 0;
                 }
                 KeyCode::Char(' ') if dialog.tag_filter.is_empty() && option_count > 0 => {
                     if let Some(tag) = matches.get(dialog.tag_picker_selected) {
+                        let dialog = self.host_dialog.as_mut().expect("dialog exists");
                         toggle_host_tag(&mut dialog.tags, tag);
                     }
                 }
                 KeyCode::Char(' ') if option_count > 0 => {
                     if let Some(tag) = matches.get(dialog.tag_picker_selected) {
+                        let dialog = self.host_dialog.as_mut().expect("dialog exists");
                         toggle_host_tag(&mut dialog.tags, tag);
                     }
                 }
                 KeyCode::Enter if has_create && dialog.tag_picker_selected == matches.len() => {
                     let tag = dialog.tag_filter.trim().to_string();
-                    toggle_host_tag(&mut dialog.tags, &tag);
-                    dialog.tag_filter.clear();
-                    dialog.tag_picker_selected = 0;
+                    let previous_groups = self.metadata.host_groups.clone();
+                    self.metadata.host_groups.push(tag.clone());
+                    self.metadata.host_groups.sort();
+                    self.metadata.host_groups.dedup();
+                    if self.save_metadata() {
+                        if let Some(dialog) = self.host_dialog.as_mut() {
+                            toggle_host_tag(&mut dialog.tags, &tag);
+                            dialog.tag_picker_open = false;
+                            dialog.tag_filter.clear();
+                            dialog.tag_picker_selected = 0;
+                        }
+                        self.notice = Some(format!(
+                            "Created group {tag}; save Host to apply the group."
+                        ));
+                    } else {
+                        self.metadata.host_groups = previous_groups;
+                    }
                 }
                 KeyCode::Enter => {
+                    let dialog = self.host_dialog.as_mut().expect("dialog exists");
                     dialog.tag_picker_open = false;
                     dialog.tag_filter.clear();
                 }
                 KeyCode::Char(value) if !value.is_control() => {
+                    let dialog = self.host_dialog.as_mut().expect("dialog exists");
                     dialog.tag_filter.push(value);
                     dialog.tag_picker_selected = 0;
                 }
@@ -6296,6 +6318,9 @@ mod tests {
     #[test]
     fn host_add_and_edit_forms_include_group_tags() {
         let mut app = grouped_fixture();
+        let fixture = crate::projects::tests::Fixture::new("host-group-picker");
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
         app.active_group = Some(HostGroup::Tag("prod".into()));
         app.open_host_form(None);
         assert_eq!(app.host_dialog.as_ref().unwrap().tags, ["prod"]);
@@ -6336,9 +6361,56 @@ mod tests {
                 .tags
                 .contains(&"dogfoo".into())
         );
-        assert!(app.host_dialog.as_ref().unwrap().tag_picker_open);
-        app.handle_host_dialog_key(KeyCode::Esc);
         assert!(!app.host_dialog.as_ref().unwrap().tag_picker_open);
+        assert!(app.metadata.host_groups.contains(&"dogfoo".into()));
+        assert!(app.notice.as_deref().unwrap().contains("save Host"));
+    }
+
+    #[test]
+    fn creating_a_group_from_an_empty_host_picker_persists_and_returns_to_form() {
+        let mut app = app_fixture();
+        let fixture = crate::projects::tests::Fixture::new("empty-host-group-picker");
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
+        app.open_host_form(None);
+        let dialog = app.host_dialog.as_mut().unwrap();
+        dialog.tag_picker_open = true;
+        dialog.tag_filter = "dogfooding".into();
+
+        app.handle_host_dialog_key(KeyCode::Enter);
+
+        let dialog = app.host_dialog.as_ref().unwrap();
+        assert!(!dialog.tag_picker_open);
+        assert!(dialog.tags.contains(&"dogfooding".into()));
+        assert!(app.metadata.host_groups.contains(&"dogfooding".into()));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Created group dogfooding")
+        );
+    }
+
+    #[test]
+    fn failed_group_creation_stays_in_picker_and_does_not_select_unsaved_group() {
+        let mut app = app_fixture();
+        app.open_host_form(None);
+        let dialog = app.host_dialog.as_mut().unwrap();
+        dialog.tag_picker_open = true;
+        dialog.tag_filter = "dogfooding".into();
+
+        app.handle_host_dialog_key(KeyCode::Enter);
+
+        let dialog = app.host_dialog.as_ref().unwrap();
+        assert!(dialog.tag_picker_open);
+        assert!(dialog.tags.is_empty());
+        assert!(!app.metadata.host_groups.contains(&"dogfooding".into()));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Metadata unavailable")
+        );
     }
 
     #[test]
