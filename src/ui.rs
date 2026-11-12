@@ -134,6 +134,9 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
         if dialog.tag_picker_open {
             render_host_tag_picker(frame, app, dialog);
         }
+        if dialog.proxy_jump_picker_open {
+            render_proxy_jump_picker(frame, app, dialog);
+        }
     }
     if let Some(dialog) = &app.host_group_dialog {
         render_host_group_dialog(frame, dialog);
@@ -2438,7 +2441,10 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
             .filter(|sources| !sources.is_empty())
             .map(|sources| sources.join(", "));
         let routing = vec![
-            detail_line("Routing", "ProxyJump / ProxyCommand"),
+            detail_line(
+                "ProxyJump",
+                host.proxy_jump.as_deref().unwrap_or("OpenSSH config"),
+            ),
             detail_line(
                 "Identity",
                 key_sources
@@ -3371,13 +3377,13 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
     } else if dialog.editing {
         action_panel(
             " EDIT HOST ",
-            "Tab / ↑↓ field  Space groups  Enter save  Esc cancel",
+            "Tab / ↑↓ field  Space select  Enter save  Esc cancel",
             BORDER,
         )
     } else {
         action_panel(
             " NEW HOST ",
-            "Tab / ↑↓ field  Space groups  Enter save  Esc cancel",
+            "Tab / ↑↓ field  Space select  Enter save  Esc cancel",
             BORDER,
         )
     };
@@ -3405,10 +3411,11 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
         "User",
         "Port",
         "IdentityFile",
+        "ProxyJump",
     ];
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2); 6])
+        .constraints([Constraint::Length(if inner.height >= 14 { 2 } else { 1 }); 7])
         .split(inner);
     for (index, label) in labels.iter().enumerate() {
         let value = if index == 2 {
@@ -3420,18 +3427,60 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
                 3 => 2,
                 4 => 3,
                 5 => 4,
+                6 => 5,
                 _ => unreachable!(),
             }]
             .clone()
+        };
+        let value = if index == 6 {
+            format!("{value}  [Space to select]")
+        } else {
+            value
         };
         frame.render_widget(
             Paragraph::new(input_line(
                 label,
                 &value,
-                index == dialog.selected_field,
+                index == dialog.selected_field
+                    && !dialog.tag_picker_open
+                    && !dialog.proxy_jump_picker_open,
                 false,
             )),
             rows[index],
+        );
+    }
+}
+
+fn render_proxy_jump_picker(frame: &mut Frame, app: &App, dialog: &crate::app::HostDialog) {
+    let aliases = app.proxy_jump_choices();
+    let area = centered_rect(64, 16, frame.area());
+    frame.render_widget(Clear, area);
+    let block = action_panel(
+        " SELECT JUMP HOST ",
+        "↑↓ select  Enter use host  Esc back",
+        BORDER,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if aliases.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No other Hosts. Press Esc to enter a jump host manually.")
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+    } else {
+        let selected = dialog.proxy_jump_picker_selected.min(aliases.len() - 1);
+        let items = aliases.iter().enumerate().map(|(index, alias)| {
+            ListItem::new(format!(
+                "{} {alias}",
+                if index == selected { ">" } else { " " }
+            ))
+        });
+        let mut state = ListState::default().with_selected(Some(selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().bg(PANEL)),
+            inner,
+            &mut state,
         );
     }
 }
@@ -4086,11 +4135,14 @@ mod tests {
                 String::new(),
                 String::new(),
                 String::new(),
+                String::new(),
             ],
             tags: Vec::new(),
             tag_picker_open: false,
             tag_filter: String::new(),
             tag_picker_selected: 0,
+            proxy_jump_picker_open: false,
+            proxy_jump_picker_selected: 0,
             original_alias: None,
             selected_field: 0,
             editing: false,
@@ -4119,11 +4171,14 @@ mod tests {
                 "deploy".into(),
                 "22".into(),
                 String::new(),
+                "bastion".into(),
             ],
             tags: vec!["production".into(), "dogfooding".into()],
             tag_picker_open: false,
             tag_filter: String::new(),
             tag_picker_selected: 0,
+            proxy_jump_picker_open: false,
+            proxy_jump_picker_selected: 0,
             original_alias: Some("prod".into()),
             selected_field: 2,
             editing: true,
@@ -4134,14 +4189,15 @@ mod tests {
         let text = format!("{}", terminal.backend());
         assert!(text.contains("EDIT HOST"));
         assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
-        assert!(text.contains("Space groups  Enter save"));
+        assert!(text.contains("Space select  Enter save"));
+        assert!(text.contains("ProxyJump: bastion"));
 
         app.host_dialog.as_mut().unwrap().editing = false;
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let text = format!("{}", terminal.backend());
         assert!(text.contains("NEW HOST"));
         assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
-        assert!(text.contains("Space groups  Enter save"));
+        assert!(text.contains("Space select  Enter save"));
 
         app.host_dialog.as_mut().unwrap().tag_picker_open = true;
         app.host_dialog.as_mut().unwrap().tag_filter = "dog".into();
@@ -4150,6 +4206,25 @@ mod tests {
         assert!(text.contains("SELECT GROUPS"));
         assert!(text.contains("[x] dogfooding"), "{text}");
         assert!(text.contains("Create and add \"dog\""));
+
+        app.host_dialog.as_mut().unwrap().tag_picker_open = false;
+        app.host_dialog.as_mut().unwrap().selected_field = 6;
+        for (width, height) in [(100, 30), (80, 24), (54, 18), (42, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("> ProxyJump: bastion"),
+                "{width}x{height}: {text}"
+            );
+
+            app.host_dialog.as_mut().unwrap().proxy_jump_picker_open = true;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("SELECT JUMP HOST"), "{text}");
+            assert!(text.contains("No other Hosts."), "{text}");
+            app.host_dialog.as_mut().unwrap().proxy_jump_picker_open = false;
+        }
     }
 
     #[test]

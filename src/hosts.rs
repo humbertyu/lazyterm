@@ -341,6 +341,7 @@ fn validate_host_values(host: &Host) -> io::Result<()> {
         host.hostname.as_deref(),
         host.user.as_deref(),
         host.identity_file.as_deref(),
+        host.proxy_jump.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -349,6 +350,19 @@ fn validate_host_values(host: &Host) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Host values cannot contain control characters.",
+        ));
+    }
+    if let Some(jumps) = &host.proxy_jump
+        && (jumps
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '#' | '\\'))
+            || jumps
+                .split(',')
+                .any(|hop| hop.is_empty() || hop.eq_ignore_ascii_case(&host.alias)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ProxyJump requires comma-separated hops without whitespace, quotes, comments, or the Host's own alias.",
         ));
     }
     Ok(())
@@ -403,6 +417,7 @@ fn edit_host_block(
         ("User", host.user.as_deref()),
         ("Port", port_value.as_deref()),
         ("IdentityFile", host.identity_file.as_deref()),
+        ("ProxyJump", host.proxy_jump.as_deref()),
     ];
     let identity_values = lines[start + 1..end]
         .iter()
@@ -445,7 +460,7 @@ fn edit_host_block(
         if let Some(value) = value
             && !present.contains(&key.to_ascii_lowercase())
         {
-            rewritten.push_str(&format!("    {key} {}\n", quote_config_value(value)));
+            rewritten.push_str(&format!("    {key} {}\n", format_option_value(key, value)));
         }
     }
     for line in &lines[start + 1..end] {
@@ -510,7 +525,7 @@ fn replace_config_value(line: &str, expected_key: &str, value: Option<&str>) -> 
     let replacement = value?;
     let mut updated = String::with_capacity(line.len() + replacement.len());
     updated.push_str(&before_comment[..value_start]);
-    updated.push_str(&quote_config_value(replacement));
+    updated.push_str(&format_option_value(expected_key, replacement));
     updated.push_str(&before_comment[trailing_start..]);
     updated.push_str(comment);
     updated.push_str(newline);
@@ -519,6 +534,15 @@ fn replace_config_value(line: &str, expected_key: &str, value: Option<&str>) -> 
 
 fn quote_config_value(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn format_option_value(key: &str, value: &str) -> String {
+    // OpenSSH parses ProxyJump as a raw argument, retaining surrounding quotes.
+    if key.eq_ignore_ascii_case("ProxyJump") {
+        value.to_string()
+    } else {
+        quote_config_value(value)
+    }
 }
 
 fn snapshot_file(
@@ -714,6 +738,9 @@ fn format_host_block(host: &Host) -> String {
     }
     if let Some(value) = &host.identity_file {
         lines.push(format!("    IdentityFile {}", quote_config_value(value)));
+    }
+    if let Some(value) = &host.proxy_jump {
+        lines.push(format!("    ProxyJump {value}"));
     }
     lines.push(String::new());
     lines.join("\n")
@@ -1060,6 +1087,62 @@ mod tests {
     }
 
     #[test]
+    fn proxy_jump_can_be_created_updated_and_cleared_without_touching_proxy_command() {
+        let mut host = Host {
+            alias: "web".into(),
+            hostname: Some("web.internal".into()),
+            user: None,
+            port: None,
+            identity_file: None,
+            proxy_jump: Some("ops@bastion:2222,relay".into()),
+            managed: true,
+        };
+        validate_host_values(&host).unwrap();
+        let created = format_host_block(&host);
+        assert!(created.contains("ProxyJump ops@bastion:2222,relay"));
+        let entries = hosts_and_includes(&created).unwrap();
+        assert_eq!(entries[0].0.as_ref().unwrap().proxy_jump, host.proxy_jump);
+
+        let original = "Host web\n  ProxyJump old # routing note\n  ProxyCommand nc -X connect -x proxy:8080 %h %p\nHost next\n  ProxyJump keep\n";
+        let updated = edit_host_block(original, "web", &host).unwrap().unwrap();
+        assert!(updated.contains("ProxyJump ops@bastion:2222,relay # routing note"));
+        assert!(updated.contains("  ProxyCommand nc -X connect -x proxy:8080 %h %p\n"));
+        host.proxy_jump = None;
+        let cleared = edit_host_block(&updated, "web", &host).unwrap().unwrap();
+        assert!(!cleared.contains("routing note"));
+        assert!(cleared.contains("  ProxyCommand nc -X connect -x proxy:8080 %h %p\n"));
+        assert!(cleared.ends_with("Host next\n  ProxyJump keep\n"));
+    }
+
+    #[test]
+    fn proxy_jump_rejects_config_injection_empty_hops_and_self_reference() {
+        let mut host = Host {
+            alias: "web".into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_file: None,
+            proxy_jump: None,
+            managed: true,
+        };
+        for invalid in [
+            "jump\nHost injected",
+            "jump relay",
+            "jump,",
+            ",jump",
+            "web",
+            "jump,WEB",
+        ] {
+            host.proxy_jump = Some(invalid.into());
+            assert!(validate_host_values(&host).is_err(), "{invalid}");
+        }
+        for valid in ["bastion", "user@jump:2222,relay", "[::1]:2222", "none"] {
+            host.proxy_jump = Some(valid.into());
+            validate_host_values(&host).unwrap();
+        }
+    }
+
+    #[test]
     fn editing_manual_host_preserves_other_options_and_supports_renaming() {
         let contents = "# user comment\nHost=web # host note\n  HostName old.example\n  User deploy # keep this comment\n  Port 22\n  IdentityFile ~/.ssh/old\n  ProxyJump bastion\n  ServerAliveInterval 30\nHost next\n  User root\n";
         let host = Host {
@@ -1068,7 +1151,7 @@ mod tests {
             user: None,
             port: Some(2200),
             identity_file: Some("~/.ssh/new key".into()),
-            proxy_jump: None,
+            proxy_jump: Some("bastion".into()),
             managed: false,
         };
         let updated = edit_host_block(contents, "web", &host).unwrap().unwrap();
@@ -1093,7 +1176,7 @@ mod tests {
             user: Some("deploy".into()),
             port: Some(2200),
             identity_file: Some(fixture.root.join("key file").display().to_string()),
-            proxy_jump: None,
+            proxy_jump: Some("ops@bastion:2222,relay".into()),
             managed: false,
         };
         let contents = edit_host_block(
@@ -1118,7 +1201,11 @@ mod tests {
         assert!(resolved.lines().any(
             |line| line == format!("identityfile {}", fixture.root.join("key file").display())
         ));
-        assert!(resolved.lines().any(|line| line == "proxyjump bastion"));
+        assert!(
+            resolved
+                .lines()
+                .any(|line| line == "proxyjump ops@bastion:2222,relay")
+        );
     }
 
     #[test]
@@ -1147,7 +1234,7 @@ mod tests {
             user: Some("ops".into()),
             port: Some(2200),
             identity_file: None,
-            proxy_jump: None,
+            proxy_jump: Some("new-bastion".into()),
             managed: false,
         };
 
@@ -1160,7 +1247,17 @@ mod tests {
         assert!(updated.contains("User \"ops\""));
         assert!(updated.contains("Port \"2200\""));
         assert!(!updated.contains("IdentityFile"));
-        assert!(updated.contains("ProxyJump bastion"));
+        assert!(updated.contains("ProxyJump new-bastion"));
+        assert_eq!(
+            catalog
+                .hosts
+                .iter()
+                .find(|host| host.alias == "web")
+                .unwrap()
+                .proxy_jump
+                .as_deref(),
+            Some("new-bastion")
+        );
         assert_eq!(
             fs::read_to_string(&config).unwrap(),
             "Include config.d/*.conf\nHost root-host\n  User root\n"

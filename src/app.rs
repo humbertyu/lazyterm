@@ -328,11 +328,13 @@ pub enum FilesState {
 }
 
 pub struct HostDialog {
-    pub fields: [String; 5],
+    pub fields: [String; 6],
     pub tags: Vec<String>,
     pub tag_picker_open: bool,
     pub tag_filter: String,
     pub tag_picker_selected: usize,
+    pub proxy_jump_picker_open: bool,
+    pub proxy_jump_picker_selected: usize,
     pub original_alias: Option<String>,
     pub selected_field: usize,
     pub editing: bool,
@@ -3815,11 +3817,14 @@ impl App {
                             String::new(),
                             String::new(),
                             String::new(),
+                            String::new(),
                         ],
                         tags: Vec::new(),
                         tag_picker_open: false,
                         tag_filter: String::new(),
                         tag_picker_selected: 0,
+                        proxy_jump_picker_open: false,
+                        proxy_jump_picker_selected: 0,
                         original_alias: None,
                         selected_field: 0,
                         editing: false,
@@ -4381,6 +4386,7 @@ impl App {
                         host.user.unwrap_or_default(),
                         host.port.map_or_else(String::new, |port| port.to_string()),
                         host.identity_file.unwrap_or_default(),
+                        host.proxy_jump.unwrap_or_default(),
                     ]
                 },
             ),
@@ -4388,6 +4394,8 @@ impl App {
             tag_picker_open: false,
             tag_filter: String::new(),
             tag_picker_selected: 0,
+            proxy_jump_picker_open: false,
+            proxy_jump_picker_selected: 0,
             original_alias,
             selected_field: 0,
             editing,
@@ -4727,6 +4735,33 @@ impl App {
         if self
             .host_dialog
             .as_ref()
+            .is_some_and(|dialog| dialog.proxy_jump_picker_open)
+        {
+            let aliases = self.proxy_jump_choices();
+            let dialog = self.host_dialog.as_mut().expect("dialog exists");
+            match key {
+                KeyCode::Esc => dialog.proxy_jump_picker_open = false,
+                KeyCode::Up => {
+                    dialog.proxy_jump_picker_selected =
+                        dialog.proxy_jump_picker_selected.saturating_sub(1);
+                }
+                KeyCode::Down if !aliases.is_empty() => {
+                    dialog.proxy_jump_picker_selected =
+                        (dialog.proxy_jump_picker_selected + 1).min(aliases.len() - 1);
+                }
+                KeyCode::Enter => {
+                    if let Some(alias) = aliases.get(dialog.proxy_jump_picker_selected) {
+                        dialog.fields[5] = alias.clone();
+                        dialog.proxy_jump_picker_open = false;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self
+            .host_dialog
+            .as_ref()
             .is_some_and(|dialog| dialog.tag_picker_open)
         {
             let available = self
@@ -4848,9 +4883,9 @@ impl App {
         }
         match key {
             KeyCode::Esc => self.host_dialog = None,
-            KeyCode::Tab | KeyCode::Down => dialog.selected_field = (dialog.selected_field + 1) % 6,
+            KeyCode::Tab | KeyCode::Down => dialog.selected_field = (dialog.selected_field + 1) % 7,
             KeyCode::BackTab | KeyCode::Up => {
-                dialog.selected_field = (dialog.selected_field + 5) % 6
+                dialog.selected_field = (dialog.selected_field + 6) % 7
             }
             KeyCode::Backspace => {
                 if dialog.selected_field == 2 {
@@ -4890,7 +4925,7 @@ impl App {
                     user: nonempty(&dialog.fields[2]),
                     port,
                     identity_file: nonempty(&dialog.fields[4]),
-                    proxy_jump: None,
+                    proxy_jump: nonempty(&dialog.fields[5]),
                     managed: true,
                 };
                 match self
@@ -4943,7 +4978,10 @@ impl App {
                 }
             }
             KeyCode::Char(value) if !value.is_control() => {
-                if dialog.selected_field == 2 {
+                if dialog.selected_field == 6 && value == ' ' {
+                    dialog.proxy_jump_picker_open = true;
+                    dialog.proxy_jump_picker_selected = 0;
+                } else if dialog.selected_field == 2 {
                     if value == ' ' {
                         dialog.tag_picker_open = true;
                         dialog.tag_filter.clear();
@@ -4955,6 +4993,24 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn proxy_jump_choices(&self) -> Vec<String> {
+        let Some(dialog) = self.host_dialog.as_ref() else {
+            return Vec::new();
+        };
+        self.hosts
+            .hosts
+            .iter()
+            .filter(|host| {
+                !host.alias.eq_ignore_ascii_case(dialog.fields[0].trim())
+                    && !dialog
+                        .original_alias
+                        .as_ref()
+                        .is_some_and(|alias| host.alias.eq_ignore_ascii_case(alias))
+            })
+            .map(|host| host.alias.clone())
+            .collect()
     }
 
     fn handle_host_action_dialog_key(&mut self, key: KeyCode) {
@@ -5373,6 +5429,7 @@ fn host_field_index(display_index: usize) -> usize {
         3 => 2,
         4 => 3,
         5 => 4,
+        6 => 5,
         _ => unreachable!("group field has no host config value"),
     }
 }
@@ -6316,6 +6373,47 @@ mod tests {
     }
 
     #[test]
+    fn host_proxy_jump_form_supports_existing_host_selection_and_manual_input() {
+        let mut app = grouped_fixture();
+        app.open_host_form(None);
+        assert!(app.host_dialog.as_ref().unwrap().fields[5].is_empty());
+        let mut host = app
+            .hosts
+            .hosts
+            .iter()
+            .find(|host| host.alias == "web")
+            .unwrap()
+            .clone();
+        host.proxy_jump = Some("existing-jump".into());
+        app.open_host_form(Some(host));
+        let form = app.host_dialog.as_mut().unwrap();
+        assert_eq!(form.fields[5], "existing-jump");
+        form.fields[0] = "db".into();
+        form.selected_field = 6;
+        assert!(!app.proxy_jump_choices().contains(&"web".into()));
+        assert!(!app.proxy_jump_choices().contains(&"db".into()));
+        app.handle_host_dialog_key(KeyCode::Char(' '));
+        assert!(app.host_dialog.as_ref().unwrap().proxy_jump_picker_open);
+        app.handle_host_dialog_key(KeyCode::Esc);
+        assert_eq!(app.host_dialog.as_ref().unwrap().fields[5], "existing-jump");
+        app.handle_host_dialog_key(KeyCode::Char(' '));
+        let selected = app.proxy_jump_choices()[0].clone();
+        app.handle_host_dialog_key(KeyCode::Enter);
+        let form = app.host_dialog.as_ref().unwrap();
+        assert!(!form.proxy_jump_picker_open);
+        assert_eq!(form.fields[5], selected);
+        assert_eq!(form.selected_field, 6);
+        app.handle_host_dialog_key(KeyCode::Char(','));
+        app.handle_host_dialog_key(KeyCode::Char('x'));
+        assert_eq!(
+            app.host_dialog.as_ref().unwrap().fields[5],
+            format!("{selected},x")
+        );
+        app.handle_host_dialog_key(KeyCode::Tab);
+        assert_eq!(app.host_dialog.as_ref().unwrap().selected_field, 0);
+    }
+
+    #[test]
     fn host_add_and_edit_forms_include_group_tags() {
         let mut app = grouped_fixture();
         let fixture = crate::projects::tests::Fixture::new("host-group-picker");
@@ -6337,7 +6435,7 @@ mod tests {
         let form = app.host_dialog.as_ref().unwrap();
         assert_eq!(form.tags, ["prod", "work"]);
         assert_eq!(form.selected_field, 0);
-        for _ in 0..6 {
+        for _ in 0..7 {
             app.handle_host_dialog_key(KeyCode::Tab);
         }
         assert_eq!(app.host_dialog.as_ref().unwrap().selected_field, 0);
