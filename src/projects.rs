@@ -359,20 +359,24 @@ impl ProjectService {
         self.next_run = run_id;
     }
 
-    fn recover_task(&mut self, key: TaskKey) -> io::Result<()> {
-        if self.active(key) {
+    fn recover_task(&mut self, key: TaskKey, lifecycle: ProjectLifecycle) -> io::Result<()> {
+        if self
+            .tasks
+            .get(&key)
+            .is_some_and(|task| task.active() && task.persistent.is_none())
+        {
             return Ok(());
         }
         let Some(root) = &self.log_root else {
             return Ok(());
         };
-        if let Some(handle) = crate::project_runner::recover(root, key)?
-            && self
-                .tasks
-                .get(&key)
-                .is_none_or(|task| task.owner != handle.snapshot.owner)
-        {
-            self.attach_persistent(handle);
+        if let Some(handle) = crate::project_runner::recover(root, key)? {
+            let replace = self.tasks.get(&key).is_none_or(|task| {
+                task.owner != handle.snapshot.owner || task.active() != handle.active()
+            });
+            if replace {
+                self.attach_runner(handle, lifecycle);
+            }
         }
         Ok(())
     }
@@ -387,10 +391,8 @@ impl ProjectService {
         self.restored_at = Some(Instant::now());
         for project in definitions {
             for command in &project.commands {
-                if command.lifecycle == ProjectLifecycle::Persistent
-                    && *execution_target(project, command) == ProjectTarget::Local
-                {
-                    let _ = self.recover_task((project.id, command.id));
+                if *execution_target(project, command) == ProjectTarget::Local {
+                    let _ = self.recover_task((project.id, command.id), command.lifecycle);
                 }
             }
         }
@@ -408,7 +410,11 @@ impl ProjectService {
         Ok(())
     }
 
-    fn attach_persistent(&mut self, handle: crate::project_runner::Handle) {
+    fn attach_runner(
+        &mut self,
+        handle: crate::project_runner::Handle,
+        lifecycle: ProjectLifecycle,
+    ) {
         let snapshot = &handle.snapshot;
         self.tasks.insert(
             snapshot.owner.key,
@@ -420,7 +426,7 @@ impl ProjectService {
                 output: snapshot.output.clone(),
                 stdout_log: snapshot.stdout_log.clone(),
                 stderr_log: snapshot.stderr_log.clone(),
-                lifecycle: ProjectLifecycle::Persistent,
+                lifecycle,
                 persistent: Some(handle),
                 child: None,
                 finished: None,
@@ -449,7 +455,7 @@ impl ProjectService {
             remote_working_directory(project, command)?;
         }
         let key = (project.id, command.id);
-        self.recover_task(key)?;
+        self.recover_task(key, command.lifecycle)?;
         if self.active(key) {
             return Err(io::Error::other("Command is already running"));
         }
@@ -462,7 +468,7 @@ impl ProjectService {
                 .as_ref()
                 .ok_or_else(|| io::Error::other("Project log directory is unavailable"))?;
             let handle = crate::project_runner::start(root, project, command)?;
-            self.attach_persistent(handle);
+            self.attach_runner(handle, command.lifecycle);
             return Ok(());
         }
         self.start_app(project, command)
@@ -809,7 +815,7 @@ fn signal_group(group: u32, signal: i32) -> io::Result<()> {
     }
 }
 
-fn group_has_live_processes(group: u32) -> bool {
+pub(crate) fn group_has_live_processes(group: u32) -> bool {
     let Ok(group) = i32::try_from(group) else {
         return false;
     };

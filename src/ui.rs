@@ -3125,8 +3125,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "↑↓ select  ←→/Space fold  Enter fold  L add link  v view  Esc back"
             } else if app.selected_project_link().is_some() {
                 "↑↓ select  Enter browser  u username  p password  L add link  e edit  d delete  Esc back"
+            } else if app.selected_project_command().is_some() {
+                "↑↓ select  Enter output  s start  x stop  r restart  A/X services  e edit  d delete"
             } else {
-                "↑↓ select  ←→/Space fold  Enter open  a command  L link  G group  e edit  d delete  v view  s/x/r  A/X services"
+                "↑↓ select  ←→/Space fold  Enter open  a command  L link  G group  e/d edit/delete  A/X services  v view"
             }
         } else {
             "↑↓ select  Enter open  a add  e edit  d delete  A/X services  q quit"
@@ -3368,6 +3370,11 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
 fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
     let area = centered_rect(72, 20, frame.area());
     frame.render_widget(Clear, area);
+    let actions = if dialog.selected_field == 6 && !dialog.fields[5].is_empty() {
+        "Tab / ↑↓ field  Enter save  Esc cancel"
+    } else {
+        "Tab / ↑↓ field  Space select  Enter save  Esc cancel"
+    };
     let block = if dialog.deleting {
         action_panel(
             " DELETE HOST ",
@@ -3375,17 +3382,9 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
             Color::Rgb(221, 132, 112),
         )
     } else if dialog.editing {
-        action_panel(
-            " EDIT HOST ",
-            "Tab / ↑↓ field  Space select  Enter save  Esc cancel",
-            BORDER,
-        )
+        action_panel(" EDIT HOST ", actions, BORDER)
     } else {
-        action_panel(
-            " NEW HOST ",
-            "Tab / ↑↓ field  Space select  Enter save  Esc cancel",
-            BORDER,
-        )
+        action_panel(" NEW HOST ", actions, BORDER)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3432,22 +3431,25 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
             }]
             .clone()
         };
-        let value = if index == 6 {
-            format!("{value}  [Space to select]")
-        } else {
-            value
-        };
-        frame.render_widget(
-            Paragraph::new(input_line(
-                label,
-                &value,
-                index == dialog.selected_field
-                    && !dialog.tag_picker_open
-                    && !dialog.proxy_jump_picker_open,
-                false,
-            )),
-            rows[index],
+        let mut line = input_line(
+            label,
+            &value,
+            index == dialog.selected_field
+                && !dialog.tag_picker_open
+                && !dialog.proxy_jump_picker_open,
+            false,
         );
+        if index == 6 && value.is_empty() {
+            line.spans.push(Span::styled(
+                if inner.width < 48 {
+                    " IP/alias | Space select"
+                } else {
+                    " IP/alias (unlisted OK) | Space to select"
+                },
+                Style::default().fg(MUTED),
+            ));
+        }
+        frame.render_widget(Paragraph::new(line), rows[index]);
     }
 }
 
@@ -4217,6 +4219,26 @@ mod tests {
                 text.contains("> ProxyJump: bastion"),
                 "{width}x{height}: {text}"
             );
+            let jump_line = text
+                .lines()
+                .find(|line| line.contains("ProxyJump:"))
+                .unwrap();
+            assert!(!jump_line.contains("Space"), "{jump_line}");
+            assert!(!text.contains("Space select  Enter save"), "{text}");
+
+            app.host_dialog.as_mut().unwrap().fields[5].clear();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            let jump_line = text
+                .lines()
+                .find(|line| line.contains("ProxyJump:"))
+                .unwrap();
+            assert!(jump_line.contains("IP/alias"), "{jump_line}");
+            assert!(jump_line.contains("Space"), "{jump_line}");
+            if width >= 80 {
+                assert!(jump_line.contains("unlisted OK"), "{jump_line}");
+            }
+            app.host_dialog.as_mut().unwrap().fields[5] = "bastion".into();
 
             app.host_dialog.as_mut().unwrap().proxy_jump_picker_open = true;
             terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -4381,6 +4403,48 @@ mod tests {
             assert!(format!("{}", terminal.backend()).contains("Working directory"));
             app.handle_projects_key(KeyCode::Esc);
         }
+    }
+
+    #[test]
+    fn project_action_hints_match_selected_workspace_item() {
+        use crate::projects::tests::Fixture;
+        let mut fixture = Fixture::new("project-action-hints");
+        let mut command = fixture.command("true");
+        command.group = Some("Services".into());
+        fixture.project.groups = vec!["Services".into()];
+        fixture.project.commands.push(command);
+        fixture.project.links.push(crate::projects::ProjectLink {
+            id: 1,
+            name: "Home".into(),
+            url: "http://localhost/".into(),
+            ..Default::default()
+        });
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Projects;
+        app.workspace.project_open = true;
+        app.metadata.projects.push(fixture.project.clone());
+        app.workspace.selected_item = 2;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("A/X services"), "{text}");
+        assert!(!text.contains("s start"), "{text}");
+        assert!(!text.contains("r restart"), "{text}");
+
+        app.workspace.selected_item = 3;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("s start  x stop  r restart"), "{text}");
+
+        app.workspace.selected_item = 1;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("Enter browser"), "{text}");
+        assert!(!text.contains("s start"), "{text}");
     }
 
     #[test]

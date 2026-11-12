@@ -151,7 +151,7 @@ fn record_path(root: &Path, key: TaskKey) -> PathBuf {
     root.join(format!("persistent-{}-{}.json", key.0, key.1))
 }
 
-fn lock_run(root: &Path, key: TaskKey) -> io::Result<File> {
+fn try_lock_run(root: &Path, key: TaskKey) -> io::Result<Option<File>> {
     let lock = OpenOptions::new()
         .write(true)
         .create(true)
@@ -165,11 +165,18 @@ fn lock_run(root: &Path, key: TaskKey) -> io::Result<File> {
         )
     } != 0
     {
-        return Err(io::Error::other(
-            "This command already has a background runner.",
-        ));
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error);
     }
-    Ok(lock)
+    Ok(Some(lock))
+}
+
+fn lock_run(root: &Path, key: TaskKey) -> io::Result<File> {
+    try_lock_run(root, key)?
+        .ok_or_else(|| io::Error::other("This command already has a background runner."))
 }
 
 pub(crate) fn forget(root: &Path, key: TaskKey) -> io::Result<()> {
@@ -211,7 +218,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 
 pub(crate) fn recover(root: &Path, key: TaskKey) -> io::Result<Option<Handle>> {
     let record = record_path(root, key);
-    let snapshot: Snapshot = match read_json(&record) {
+    let mut snapshot: Snapshot = match read_json(&record) {
         Ok(snapshot) => snapshot,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -221,8 +228,18 @@ pub(crate) fn recover(root: &Path, key: TaskKey) -> io::Result<Option<Handle>> {
             "Background record identity does not match its command.",
         ));
     }
+    if snapshot.active()
+        && let Some(_lock) = try_lock_run(root, key)?
+        && !crate::projects::group_has_live_processes(snapshot.owner.process_group)
+    {
+        snapshot.running = false;
+        snapshot.status = TaskStatus::Failed(
+            "Background runner exited unexpectedly. Start the command again.".into(),
+        );
+        write_json(&record, &snapshot)?;
+    }
     let mut handle = Handle::new(snapshot, record);
-    // Keep an unreachable active run reserved rather than launching a duplicate.
+    // An active lock means the runner may still own a live process group.
     let _ = handle.refresh();
     Ok(Some(handle))
 }
@@ -421,6 +438,95 @@ fn run_inner(spec: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_marks_an_unlocked_active_record_as_exited_and_allows_restart() {
+        use crate::projects::tests::{Fixture, PersistentCleanup};
+        let mut fixture = Fixture::new("recover-dead-runner");
+        let mut command = fixture.command("sleep 30");
+        command.lifecycle = ProjectLifecycle::Persistent;
+        fixture.project.commands.push(command.clone());
+        let key = (fixture.project.id, command.id);
+        let root = fixture.root.join("logs");
+        fs::create_dir_all(&root).unwrap();
+        let record = record_path(&root, key);
+        let snapshot = Snapshot {
+            owner: ProjectOwner {
+                key,
+                run_id: 10,
+                process_group: u32::MAX - 1,
+                project_name: fixture.project.name.clone(),
+                command_name: command.name.clone(),
+            },
+            directory: fixture.root.clone(),
+            command: command.command.clone(),
+            status: TaskStatus::Running,
+            running: true,
+            output: String::new(),
+            stdout_log: root.join("stdout.log"),
+            stderr_log: root.join("stderr.log"),
+            socket: root.join("missing/control"),
+            token: "dead-runner-token".into(),
+        };
+        write_json(&record, &snapshot).unwrap();
+
+        let recovered = recover(&root, key).unwrap().unwrap();
+        assert!(!recovered.active());
+        assert!(matches!(
+            recovered.snapshot.status,
+            TaskStatus::Failed(ref message) if message.contains("exited unexpectedly")
+        ));
+        assert!(!read_json::<Snapshot>(&record).unwrap().active());
+
+        let _cleanup = PersistentCleanup::new(&fixture, key);
+        let mut service = fixture.service();
+        service.start(&fixture.project, &command).unwrap();
+        assert!(service.active(key));
+    }
+
+    #[test]
+    fn startup_restore_recovers_a_dead_app_lifecycle_runner() {
+        use crate::projects::tests::Fixture;
+        let mut fixture = Fixture::new("restore-dead-app-runner");
+        let command = fixture.command("sleep 30");
+        fixture.project.commands.push(command.clone());
+        let key = (fixture.project.id, command.id);
+        let root = fixture.root.join("logs");
+        fs::create_dir_all(&root).unwrap();
+        let record = record_path(&root, key);
+        let snapshot = Snapshot {
+            owner: ProjectOwner {
+                key,
+                run_id: 11,
+                process_group: u32::MAX - 1,
+                project_name: fixture.project.name.clone(),
+                command_name: command.name.clone(),
+            },
+            directory: fixture.root.clone(),
+            command: command.command.clone(),
+            status: TaskStatus::Running,
+            running: true,
+            output: String::new(),
+            stdout_log: root.join("stdout.log"),
+            stderr_log: root.join("stderr.log"),
+            socket: root.join("missing/control"),
+            token: "dead-app-runner-token".into(),
+        };
+        write_json(&record, &snapshot).unwrap();
+
+        let mut service = fixture.service();
+        service.restore(std::slice::from_ref(&fixture.project));
+
+        let task = &service.tasks[&key];
+        assert_eq!(task.lifecycle, ProjectLifecycle::App);
+        assert!(!task.active());
+        assert!(matches!(
+            task.status,
+            TaskStatus::Failed(ref message) if message.contains("exited unexpectedly")
+        ));
+        service.start(&fixture.project, &command).unwrap();
+        assert!(service.active(key));
+    }
 
     #[test]
     #[ignore = "independent project runner subprocess helper"]
