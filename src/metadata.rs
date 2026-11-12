@@ -136,21 +136,14 @@ pub enum Theme {
 }
 
 impl Theme {
+    pub const ALL: [Self; 4] = [Self::Forest, Self::Ocean, Self::Amber, Self::Rose];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Forest => "Forest",
             Self::Ocean => "Ocean",
             Self::Amber => "Amber",
             Self::Rose => "Rose",
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            Self::Forest => Self::Ocean,
-            Self::Ocean => Self::Amber,
-            Self::Amber => Self::Rose,
-            Self::Rose => Self::Forest,
         }
     }
 }
@@ -164,19 +157,13 @@ pub enum Language {
 }
 
 impl Language {
+    pub const ALL: [Self; 3] = [Self::English, Self::Chinese, Self::Japanese];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::English => "English",
             Self::Chinese => "中文",
             Self::Japanese => "日本語",
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            Self::English => Self::Chinese,
-            Self::Chinese => Self::Japanese,
-            Self::Japanese => Self::English,
         }
     }
 }

@@ -21,8 +21,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::hosts::{Host, HostCatalog};
 use crate::metadata::{
-    ExportBundle, HostView, Metadata, SnippetDefinition, SnippetPackage, TunnelDefinition,
-    TunnelKind, TunnelLifecycle, parse_tags,
+    ExportBundle, HostView, Language, Metadata, SnippetDefinition, SnippetPackage, Theme,
+    TunnelDefinition, TunnelKind, TunnelLifecycle, parse_tags,
 };
 use crate::runtime::{self, RuntimeEntry, RuntimeEvent, RuntimeFilter, RuntimeTarget};
 use crate::sftp::{
@@ -211,6 +211,7 @@ pub struct App {
     pub hosts: HostCatalog,
     pub selected_host: usize,
     pub selected_setting: usize,
+    pub settings_picker: Option<SettingsPicker>,
     pub selected_browse_item: usize,
     pub viewport_width: u16,
     pub viewport_height: u16,
@@ -307,6 +308,13 @@ pub struct App {
     next_snippet_run_id: u64,
     tunnel_errors: std::collections::HashMap<uuid::Uuid, String>,
     tunnel_retries: std::collections::HashMap<uuid::Uuid, TunnelRetry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsPicker {
+    pub setting: usize,
+    pub selected: usize,
+    original: usize,
 }
 
 fn configuration_export_bytes(
@@ -777,6 +785,7 @@ impl App {
             hosts,
             selected_host: 0,
             selected_setting: 0,
+            settings_picker: None,
             selected_browse_item: 0,
             viewport_width: 80,
             viewport_height: 24,
@@ -2651,7 +2660,7 @@ impl App {
         viewport_width: u16,
         viewport_height: u16,
     ) -> InputAction {
-        if self.credentials_modal() {
+        if self.settings_picker.is_some() || self.credentials_modal() {
             return InputAction::None;
         }
         if self.host_dialog.is_some()
@@ -3295,6 +3304,15 @@ impl App {
     }
 
     pub fn handle_event(&mut self, key: KeyEvent) -> InputAction {
+        if self.settings_picker.is_some() {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                self.handle_settings_picker_key(key.code);
+            }
+            return InputAction::None;
+        }
         if self.host_password_dialog.is_some() {
             if !key
                 .modifiers
@@ -3511,14 +3529,8 @@ impl App {
 
     fn toggle_setting(&mut self) {
         match self.selected_setting {
-            0 => {
-                self.metadata.theme = self.metadata.theme.next();
-                self.save_metadata();
-            }
-            1 => {
-                self.metadata.language = self.metadata.language.next();
-                self.save_metadata();
-            }
+            0 => self.open_settings_picker(0),
+            1 => self.open_settings_picker(1),
             2..=8 => {
                 let section = NavSection::ALL[self.selected_setting - 2];
                 let title = section.title().to_string();
@@ -3546,6 +3558,72 @@ impl App {
             12 => self.import_credentials(),
             _ => {}
         }
+    }
+
+    fn open_settings_picker(&mut self, setting: usize) {
+        let selected = if setting == 0 {
+            Theme::ALL
+                .iter()
+                .position(|theme| *theme == self.metadata.theme)
+                .unwrap_or(0)
+        } else {
+            Language::ALL
+                .iter()
+                .position(|language| *language == self.metadata.language)
+                .unwrap_or(0)
+        };
+        self.settings_picker = Some(SettingsPicker {
+            setting,
+            selected,
+            original: selected,
+        });
+    }
+
+    fn handle_settings_picker_key(&mut self, key: KeyCode) {
+        let Some(mut picker) = self.settings_picker else {
+            return;
+        };
+        let count = if picker.setting == 0 {
+            Theme::ALL.len()
+        } else {
+            Language::ALL.len()
+        };
+        match key {
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => picker.selected = (picker.selected + 1).min(count - 1),
+            KeyCode::Enter => {
+                if picker.setting == 0 {
+                    self.metadata.theme = Theme::ALL[picker.selected];
+                } else {
+                    self.metadata.language = Language::ALL[picker.selected];
+                }
+                self.settings_picker = None;
+                if !self.save_metadata() {
+                    if picker.setting == 0 {
+                        self.metadata.theme = Theme::ALL[picker.original];
+                    } else {
+                        self.metadata.language = Language::ALL[picker.original];
+                    }
+                }
+                return;
+            }
+            KeyCode::Esc => {
+                if picker.setting == 0 {
+                    self.metadata.theme = Theme::ALL[picker.original];
+                } else {
+                    self.metadata.language = Language::ALL[picker.original];
+                }
+                self.settings_picker = None;
+                return;
+            }
+            _ => {}
+        }
+        if picker.setting == 0 {
+            self.metadata.theme = Theme::ALL[picker.selected];
+        } else {
+            self.metadata.language = Language::ALL[picker.selected];
+        }
+        self.settings_picker = Some(picker);
     }
 
     fn handle_credential_export_key(&mut self, key: KeyCode) {
@@ -4083,6 +4161,10 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, key: KeyCode) {
+        if self.settings_picker.is_some() {
+            self.handle_settings_picker_key(key);
+            return;
+        }
         let count = 13;
         match key {
             KeyCode::Up => {
@@ -6785,31 +6867,52 @@ mod tests {
 
     #[test]
     fn settings_change_theme_and_hide_tabs_without_breaking_navigation() {
+        let fixture = crate::projects::tests::Fixture::new("settings-picker-save");
         let mut app = app_fixture();
+        app.metadata_error = false;
+        app.metadata_save_path = Some(fixture.root.join("hosts.json"));
         app.section = NavSection::Settings;
         app.selected_setting = 0;
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.settings_picker.is_some());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(app.metadata.theme, Theme::Ocean);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.metadata.theme, Theme::Amber);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.metadata.theme, Theme::Rose);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.metadata.theme, Theme::Forest);
+        assert_eq!(app.metadata.theme, Theme::Ocean);
 
         app.selected_setting = 1;
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(app.metadata.language, crate::metadata::Language::Chinese);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.metadata.language, crate::metadata::Language::Japanese);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.metadata.language, crate::metadata::Language::English);
+        assert_eq!(app.metadata.language, crate::metadata::Language::Chinese);
+        let saved = Metadata::read_from(app.metadata_save_path.as_ref().unwrap()).unwrap();
+        assert_eq!(saved.theme, Theme::Ocean);
+        assert_eq!(saved.language, Language::Chinese);
 
         app.selected_setting = 2;
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!app.visible_sections().contains(&NavSection::Hosts));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.section, NavSection::Files);
+    }
+
+    #[test]
+    fn settings_picker_previews_choices_and_escape_restores_original_value() {
+        let mut app = app_fixture();
+        app.section = NavSection::Settings;
+        app.selected_setting = 0;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.metadata.theme, Theme::Ocean);
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Settings);
+        assert!(app.settings_picker.is_some());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.metadata.theme, Theme::Forest);
+        assert!(app.settings_picker.is_none());
     }
 
     #[test]

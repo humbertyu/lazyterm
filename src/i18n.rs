@@ -204,11 +204,8 @@ mod tests {
     }
 
     #[test]
-    fn all_language_choices_are_distinct_and_cycle() {
-        assert_eq!(Language::English.next(), Language::Chinese);
-        assert_eq!(Language::Chinese.next(), Language::Japanese);
-        assert_eq!(Language::Japanese.next(), Language::English);
-        for language in [Language::English, Language::Chinese, Language::Japanese] {
+    fn all_language_choices_serialize_round_trip() {
+        for language in Language::ALL {
             let encoded = serde_json::to_string(&language).unwrap();
             assert_eq!(
                 serde_json::from_str::<Language>(&encoded).unwrap(),

@@ -96,12 +96,8 @@ mod tests {
     }
 
     #[test]
-    fn palettes_cycle_and_serialize_round_trip() {
-        assert_eq!(Theme::Forest.next(), Theme::Ocean);
-        assert_eq!(Theme::Ocean.next(), Theme::Amber);
-        assert_eq!(Theme::Amber.next(), Theme::Rose);
-        assert_eq!(Theme::Rose.next(), Theme::Forest);
-        for theme in [Theme::Forest, Theme::Ocean, Theme::Amber, Theme::Rose] {
+    fn palettes_serialize_round_trip() {
+        for theme in Theme::ALL {
             let encoded = serde_json::to_string(&theme).unwrap();
             assert_eq!(serde_json::from_str::<Theme>(&encoded).unwrap(), theme);
         }

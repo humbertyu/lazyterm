@@ -159,6 +159,9 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
     if let Some(dialog) = &app.credential_import_dialog {
         render_credential_import_dialog(frame, dialog);
     }
+    if app.settings_picker.is_some() {
+        render_settings_picker(frame, app);
+    }
     if let Some(kind) = app.import_confirmation {
         render_import_confirmation(frame, app, kind);
     }
@@ -2198,7 +2201,7 @@ fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let language = app.metadata.language;
-    let rows = [
+    let settings = [
         (
             crate::i18n::text(language, "Theme"),
             crate::i18n::text(language, app.metadata.theme.label()).to_string(),
@@ -2307,25 +2310,51 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         ("Import configuration", "Validated JSON".to_string()),
         ("Import credentials", "Encrypted .age file".to_string()),
     ];
-    let items = rows.iter().enumerate().map(|(index, (label, value))| {
-        let selected = index == app.selected_setting;
-        let style = if selected {
+    let groups = [
+        ("Appearance", 0..2),
+        ("Workspace tabs", 2..9),
+        ("Configuration", 9..13),
+    ];
+    let mut selected_row = 0;
+    let mut row_index = 0;
+    let mut items = Vec::with_capacity(settings.len() + groups.len());
+    for (title, range) in groups {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  {}", crate::i18n::text(language, title)),
             Style::default()
                 .fg(GREEN.into())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TEXT.into())
-        };
-        ListItem::new(Line::from(vec![
-            Span::styled(if selected { "▸ " } else { "  " }, style),
-            Span::styled(format!("{label:<24}"), style),
-            Span::styled(
-                value,
-                Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
-            ),
-        ]))
-    });
-    let mut state = ListState::default().with_selected(Some(app.selected_setting));
+                .add_modifier(Modifier::BOLD),
+        ))));
+        row_index += 1;
+        for index in range {
+            let (label, value) = &settings[index];
+            let selected = index == app.selected_setting;
+            if selected {
+                selected_row = row_index;
+            }
+            let style = if selected {
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT.into())
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(if selected { "▸ " } else { "  " }, style),
+                Span::styled(format!("{label:<24}"), style),
+                Span::styled(
+                    if index < 2 {
+                        format!("{value} ▾")
+                    } else {
+                        value.clone()
+                    },
+                    Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
+                ),
+            ])));
+            row_index += 1;
+        }
+    }
+    let mut state = ListState::default().with_selected(Some(selected_row));
     frame.render_stateful_widget(
         List::new(items).block(panel_l(app, "Settings")),
         area,
@@ -3444,7 +3473,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             "l Local  h/s Hosts  Left/Right category  ↑↓ select  r refresh  k TERM  K KILL  o project  q quit"
         }
     } else if app.section == NavSection::Settings {
-        "↑↓ select  Enter / Space change  Tab switch tab  q quit"
+        if app.settings_picker.is_some() {
+            "↑↓ select  Enter confirm  Esc cancel"
+        } else {
+            "↑↓ select  Enter / Space change  Esc / Tab back  q quit"
+        }
     } else if app.section == NavSection::Credentials {
         "↑↓ select  a password  g generate key  i import  Enter assign  u upload key  q quit"
     } else {
@@ -3561,6 +3594,68 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
             );
         }
     }
+}
+
+fn render_settings_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.settings_picker else {
+        return;
+    };
+    let language = app.metadata.language;
+    let (title, choices): (&str, Vec<String>) = if picker.setting == 0 {
+        (
+            "Theme",
+            crate::metadata::Theme::ALL
+                .into_iter()
+                .map(|theme| crate::i18n::text(language, theme.label()).to_string())
+                .collect(),
+        )
+    } else {
+        (
+            "Language",
+            crate::metadata::Language::ALL
+                .into_iter()
+                .map(|language| language.label().to_string())
+                .collect(),
+        )
+    };
+    let height = u16::try_from(choices.len()).unwrap_or(0).saturating_add(4);
+    let area = centered_rect(48, height, frame.area());
+    frame.render_widget(Clear, area);
+    let items = choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            let selected = index == picker.selected;
+            let marker = if selected { "▸ " } else { "  " };
+            let checked = if index == picker.selected {
+                "● "
+            } else {
+                "○ "
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT.into())
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(checked, style),
+                Span::styled(choice, style),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items)
+            .block(action_panel(
+                crate::i18n::text(language, title),
+                "↑↓ select  Enter confirm  Esc cancel",
+                BORDER.into(),
+            ))
+            .highlight_style(Style::default()),
+        area,
+    );
 }
 
 fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
@@ -4890,6 +4985,55 @@ mod tests {
             terminal.draw(|frame| render(frame, &app)).unwrap();
             assert!(format!("{}", terminal.backend()).contains("Machine: Host / prod-web"));
         }
+    }
+
+    #[test]
+    fn settings_pickers_show_all_choices_at_compact_sizes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (width, height) in [(100, 30), (80, 24), (32, 12)] {
+            for (setting, labels) in [
+                (0, vec!["Forest", "Ocean", "Amber", "Rose"]),
+                (1, vec!["English", "中文", "日本語"]),
+            ] {
+                let mut app = App::with_catalog(
+                    HostCatalog::default(),
+                    Ok(crate::metadata::Metadata::default()),
+                );
+                app.section = NavSection::Settings;
+                app.selected_setting = setting;
+                app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert!(app.settings_picker.is_some());
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| render_settings_picker(frame, &app))
+                    .unwrap();
+                let text = format!("{}", terminal.backend());
+                for label in labels {
+                    assert!(text.contains(label), "{width}x{height}: missing {label}");
+                }
+                assert_eq!(text.matches("●").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_render_options_in_non_selectable_sections() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Settings;
+        app.selected_setting = 12;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("Appearance"));
+        assert!(text.contains("Workspace tabs"));
+        assert!(text.contains("Configuration"));
+        assert!(text.contains("Import credentials"));
+        assert_eq!(text.matches("▸").count(), 1);
     }
 
     #[test]
