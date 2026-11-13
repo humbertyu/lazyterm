@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read},
+    io,
     net::TcpListener,
     process::{Command, Stdio},
     sync::mpsc::Sender,
@@ -54,9 +54,11 @@ pub fn spawn_forward(
         if let Err(error) = thread::Builder::new()
             .name(format!("lazyterm-tunnel-{id}"))
             .spawn(move || {
-                let mut output = String::new();
-                let _ = crate::authentication::Reader::new(&mut stderr, trace)
-                    .read_to_string(&mut output);
+                let output = crate::diagnostics::collect(crate::authentication::Reader::new(
+                    &mut stderr,
+                    trace,
+                ))
+                .unwrap_or_default();
                 let message = crate::diagnostics::redact_sensitive_text(output.trim());
                 if !message.is_empty() {
                     let _ = events.send(TunnelEvent::Stderr { id, message });

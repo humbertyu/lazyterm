@@ -452,13 +452,23 @@ async fn connect_sftp(
     let stderr_task = tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            if trace.as_ref().is_some_and(|trace| trace.observe(&line)) {
+            if trace
+                .as_ref()
+                .is_some_and(|trace| trace.filter_stderr(&line))
+            {
                 continue;
             }
             let mut errors = output.lock().unwrap();
             if errors.len() < 16 * 1024 {
                 errors.push_str(&crate::diagnostics::redact_sensitive_text(&line));
                 errors.push('\n');
+            }
+        }
+        if let Some(mut trace) = trace {
+            let detail = trace.finish_diagnostics();
+            let mut errors = output.lock().unwrap();
+            if errors.len() < 16 * 1024 {
+                errors.push_str(&detail);
             }
         }
         transport_alive.store(false, Ordering::Release);

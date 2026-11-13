@@ -332,7 +332,9 @@ fn inspect_listeners_with_config(
             && output.stdout.is_empty()
             && output.stderr.is_empty()))
     {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let error = crate::diagnostics::redact_sensitive_text(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
         return Err(if error.is_empty() {
             format!(
                 "Port inspection exited with {}.",

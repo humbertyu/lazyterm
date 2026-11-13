@@ -1,0 +1,99 @@
+{
+  "id": "d63172b5-fb14-4a73-a724-160a842e2cf1",
+  "name": "lazyterm",
+  "base_path": ".",
+  "target": "Local",
+  "groups": ["Build", "Checks", "Package"],
+  "links": [],
+  "commands": [
+    {
+      "id": "56302909-1040-4a3c-97c8-f181943dd722",
+      "name": "Build debug",
+      "command": "cargo build --locked",
+      "group": "Build",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "13992713-a576-4fab-b999-45639ed31374",
+      "name": "Build release",
+      "command": "cargo build --release --locked",
+      "group": "Build",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "a9ef8414-1b3e-4547-b0cc-ff0e15dc60bd",
+      "name": "Install macOS build targets",
+      "command": "rustup target add aarch64-apple-darwin x86_64-apple-darwin",
+      "group": "Build",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "1839ba6d-5db1-4d18-b9f4-f1f5ca26849a",
+      "name": "Format check",
+      "command": "cargo fmt --check",
+      "group": "Checks",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "56c125cd-0019-4715-b82f-a5aa965e4139",
+      "name": "Clippy",
+      "command": "cargo clippy --locked --all-targets --all-features -- -D warnings",
+      "group": "Checks",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "86d218ca-4fb4-4a7c-9973-eaf373eeab1d",
+      "name": "Rust tests",
+      "command": "cargo test --locked -- --test-threads=1",
+      "group": "Checks",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "5c217ae8-d3fa-47ce-9f51-e046213c6c55",
+      "name": "Packaging tests",
+      "command": "python3 -m unittest discover -s tests -p 'test_release.py'",
+      "group": "Checks",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "bc559dc7-c3d9-44a6-a85c-e537cc420de6",
+      "name": "Universal package (local)",
+      "command": "python3 scripts/release.py universal --allow-dirty",
+      "group": "Package",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "6e411fa5-2e3c-42a3-a32f-76431b3244bc",
+      "name": "Universal package (release)",
+      "command": "python3 scripts/release.py universal",
+      "group": "Package",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "3108799b-e87f-4cb1-928b-643fc2bbdc8f",
+      "name": "Verify checksums",
+      "command": "shasum -a 256 -c SHA256SUMS",
+      "working_directory": "dist",
+      "group": "Package",
+      "kind": "Task",
+      "lifecycle": "App"
+    },
+    {
+      "id": "fdcdbd47-a502-48e0-bb56-31184741c739",
+      "name": "Open packages",
+      "command": "open dist",
+      "group": "Package",
+      "kind": "Task",
+      "lifecycle": "App"
+    }
+  ]
+}

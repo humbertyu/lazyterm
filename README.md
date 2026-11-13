@@ -6,8 +6,14 @@ The project is at an early stage. The Hosts view reads aliases from `~/.ssh/conf
 
 ## Requirements
 
-- Rust stable
-- macOS currently targeted; OpenSSH is expected at `/usr/bin/ssh`
+- macOS 15+ on Intel or Apple Silicon; system OpenSSH and an interactive UTF-8 terminal.
+- Rust 1.92+ and Xcode Command Line Tools for source builds.
+
+See [installation, Homebrew setup, upgrades and the supported environment matrix](docs/INSTALL.md).
+The release preparation workflow combines Intel and Apple Silicon builds into one Universal Binary archive, SHA256SUMS and a Homebrew
+Formula. Published binary assets and a maintained tap are required before `brew install` is available.
+Run `lazyterm --version`, `lazyterm --help` or `lazyterm --diagnostics` without opening the TUI.
+The [security review](docs/SECURITY-REVIEW.md) documents diagnostic redaction and sensitive data boundaries.
 
 ## Run
 

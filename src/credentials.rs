@@ -443,10 +443,9 @@ fn run_upload(
     let (diagnostic_sender, diagnostic_receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         if let Some(stderr) = stderr {
-            let mut stderr = crate::authentication::Reader::new(stderr, trace);
-            let mut diagnostic = Vec::new();
-            let _ = io::Read::read_to_end(&mut stderr, &mut diagnostic);
-            let _ = diagnostic_sender.send(String::from_utf8_lossy(&diagnostic).trim().to_string());
+            let stderr = crate::authentication::Reader::new(stderr, trace);
+            let diagnostic = crate::diagnostics::collect(stderr).unwrap_or_default();
+            let _ = diagnostic_sender.send(diagnostic.trim().to_string());
         }
     });
     let deadline =

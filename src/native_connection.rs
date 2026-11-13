@@ -159,7 +159,9 @@ fn connect(
     let errors = Arc::new(Mutex::new(String::new()));
     let output = errors.clone();
     let reader = std::thread::spawn(move || {
-        let mut reader = crate::authentication::Reader::new(stderr, trace);
+        let mut reader = crate::diagnostics::RedactingReader::new(
+            crate::authentication::Reader::new(stderr, trace),
+        );
         let mut buffer = [0_u8; 4096];
         while let Ok(size) = reader.read(&mut buffer) {
             if size == 0 {
@@ -167,9 +169,7 @@ fn connect(
             }
             let mut errors = output.lock().unwrap();
             if errors.len() < 16 * 1024 {
-                errors.push_str(&crate::diagnostics::redact_sensitive_text(
-                    &String::from_utf8_lossy(&buffer[..size]),
-                ));
+                errors.push_str(&String::from_utf8_lossy(&buffer[..size]));
             }
         }
     });

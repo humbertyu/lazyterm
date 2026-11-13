@@ -1,10 +1,10 @@
 //! Per-connection askpass routing. Secrets travel only through a private local socket.
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, OpenOptions},
     io::{self, BufRead, Read, Write},
     os::unix::{
-        fs::DirBuilderExt,
+        fs::{DirBuilderExt, OpenOptionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -115,7 +115,6 @@ struct Route {
     port: String,
     reference: Option<String>,
     can_save: bool,
-    destination: String,
 }
 
 struct Session {
@@ -127,6 +126,7 @@ struct Session {
     cancelled: AtomicBool,
     closed: AtomicBool,
     authenticated: AtomicBool,
+    diagnostics: Mutex<String>,
 }
 
 #[derive(Clone)]
@@ -143,11 +143,21 @@ impl Status {
 }
 
 /// Owned by the stderr reader; dropping it releases blocked askpass requests.
-pub struct Trace(Arc<Session>);
+pub struct Trace(Arc<Session>, Option<(PathBuf, std::thread::JoinHandle<()>)>);
 
 impl Drop for Trace {
     fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+impl Trace {
+    fn finish(&mut self) {
         self.0.closed.store(true, Ordering::Release);
+        if let Some((path, worker)) = self.1.take() {
+            let _ = worker.join();
+            let _ = fs::remove_file(path);
+        }
         if let Ok(mut sessions) = self.0.state.sessions.lock() {
             sessions.remove(&self.0.token);
         }
@@ -159,43 +169,59 @@ impl Trace {
         Status(self.0.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn observe(&self, line: &str) -> bool {
+        self.0.observe(line)
+    }
+
+    pub(crate) fn filter_stderr(&self, line: &str) -> bool {
+        // Only synthetic unit-test traces parse stderr. Production reads the private -E log.
+        #[cfg(test)]
+        if self.1.is_none() {
+            return self.0.observe(line);
+        }
+        let _ = line;
+        false
+    }
+
+    pub(crate) fn finish_diagnostics(&mut self) -> String {
+        self.finish();
+        std::mem::take(&mut self.0.diagnostics.lock().unwrap())
+    }
+}
+
+impl Session {
+    fn observe(&self, line: &str) -> bool {
         let detail = line.trim().strip_prefix("debug1: ").unwrap_or(line.trim());
         if let Some(authenticated) = detail.strip_prefix("Authenticated to ") {
             let via_proxy = authenticated.contains(" (via proxy) ");
-            for route in &self.0.routes {
+            for route in &self.routes {
                 let is_target = self
-                    .0
                     .routes
                     .last()
                     .is_some_and(|target| target.alias == route.alias);
                 let host_matches = authenticated.starts_with(&format!("{} ", route.hostname))
                     || (via_proxy
-                        && is_target
                         && authenticated.starts_with(&format!("{} (via proxy)", route.alias)));
-                let endpoint_matches = (via_proxy && is_target)
-                    || authenticated.contains(&format!("]:{})", route.port));
-                if !host_matches
-                    || !endpoint_matches
-                    || (self.0.routes.len() > 1 && via_proxy != is_target)
-                    || (self.0.routes.len() == 1 && via_proxy)
-                {
+                let endpoint_matches =
+                    via_proxy || authenticated.contains(&format!("]:{})", route.port));
+                if !host_matches || !endpoint_matches {
                     continue;
                 }
                 if authenticated.contains("using \"publickey\"") && route.can_save {
-                    let _ = self.0.state.events.send(Event::PublicKeyAccepted {
+                    let _ = self.state.events.send(Event::PublicKeyAccepted {
                         alias: route.alias.clone(),
                     });
                 }
                 if is_target {
-                    self.0.authenticated.store(true, Ordering::Release);
+                    self.authenticated.store(true, Ordering::Release);
                 }
                 if authenticated.contains("using \"password\"")
-                    && let Some(answer) = self.0.pending.lock().unwrap().remove(&route.alias)
+                    && let Some(answer) = self.pending.lock().unwrap().remove(&route.alias)
                     && answer.save
                     && route.can_save
                 {
-                    let _ = self.0.state.events.send(Event::Accepted {
+                    let _ = self.state.events.send(Event::Accepted {
                         alias: route.alias.clone(),
                         username: route.username.clone(),
                         password: answer.password,
@@ -210,21 +236,64 @@ impl Trace {
     }
 }
 
+fn watch_client_log(mut file: fs::File, session: &Session) {
+    let mut buffer = [0; 4096];
+    let mut line = Vec::new();
+    let mut overflow = false;
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) if session.closed.load(Ordering::Acquire) => break,
+            Ok(0) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(size) => {
+                for byte in &buffer[..size] {
+                    if *byte == b'\n' {
+                        if !overflow {
+                            let text = String::from_utf8_lossy(&line);
+                            if !session.observe(&text) {
+                                let mut errors = session.diagnostics.lock().unwrap();
+                                if errors.len() < 16 * 1024 {
+                                    errors.push_str(&crate::diagnostics::redact_sensitive_text(
+                                        &text,
+                                    ));
+                                    errors.push('\n');
+                                }
+                            }
+                        }
+                        line.clear();
+                        overflow = false;
+                    } else if line.len() < 16 * 1024 {
+                        line.push(*byte);
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+}
+
 /// Removes SSH's authentication tracing before errors reach logs or output panes.
 pub struct Reader<R> {
     inner: io::BufReader<R>,
     trace: Option<Trace>,
     pending: Vec<u8>,
     offset: usize,
+    finished: bool,
+    client_log: bool,
 }
 
 impl<R: Read> Reader<R> {
     pub fn new(inner: R, trace: Option<Trace>) -> Self {
+        let client_log = trace.as_ref().is_some_and(|trace| trace.1.is_some());
         Self {
             inner: io::BufReader::new(inner),
             trace,
             pending: Vec::new(),
             offset: 0,
+            finished: false,
+            client_log,
         }
     }
 }
@@ -237,17 +306,47 @@ impl<R: Read> Read for Reader<R> {
         if self.trace.is_none() {
             return self.inner.read(buffer);
         }
+        if self.client_log && self.offset == self.pending.len() && !self.finished {
+            let size = self.inner.read(buffer)?;
+            if size > 0 {
+                return Ok(size);
+            }
+            self.finished = true;
+            self.pending = self
+                .trace
+                .as_mut()
+                .unwrap()
+                .finish_diagnostics()
+                .into_bytes();
+            self.offset = 0;
+        }
+        if self.client_log && self.offset == self.pending.len() && self.finished {
+            return Ok(0);
+        }
         while self.offset == self.pending.len() {
             self.pending.clear();
             self.offset = 0;
             if self.inner.read_until(b'\n', &mut self.pending)? == 0 {
-                return Ok(0);
+                if self.finished {
+                    return Ok(0);
+                }
+                self.finished = true;
+                self.pending = self
+                    .trace
+                    .as_mut()
+                    .unwrap()
+                    .finish_diagnostics()
+                    .into_bytes();
+                if self.pending.is_empty() {
+                    return Ok(0);
+                }
+                break;
             }
             if self
                 .trace
                 .as_ref()
                 .unwrap()
-                .observe(&String::from_utf8_lossy(&self.pending))
+                .filter_stderr(&String::from_utf8_lossy(&self.pending))
             {
                 self.pending.clear();
             }
@@ -350,16 +449,54 @@ impl Client {
             &mut Vec::new(),
             &mut routes,
         )?;
-        // Native ProxyJump starts its own SSH children. Explicit users preserve Keychain usernames.
-        if routes.len() > 1 {
-            let jumps = routes[..routes.len() - 1]
-                .iter()
-                .map(|route| route.destination.clone())
-                .collect::<Vec<_>>();
-            let jump = jumps.join(",");
-            command.args(["-J", &jump]);
-        }
         let token = uuid::Uuid::new_v4().to_string();
+        let log = self
+            .state
+            .socket
+            .parent()
+            .unwrap()
+            .join(format!("{token}.ssh.log"));
+        let log_reader = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&log)?;
+        // Give every jump its own client-generated log boundary, separate from remote stderr.
+        let mut proxy = "none".to_string();
+        for (index, route) in routes.iter().take(routes.len() - 1).enumerate() {
+            let next = &routes[index + 1];
+            let mut args = vec![
+                "ssh".into(),
+                "-v".into(),
+                "-E".into(),
+                log.to_string_lossy().into_owned(),
+                "-o".into(),
+                "ControlMaster=no".into(),
+                "-o".into(),
+                "ControlPath=none".into(),
+                "-o".into(),
+                "BatchMode=no".into(),
+                "-o".into(),
+                "NumberOfPasswordPrompts=3".into(),
+                "-o".into(),
+                format!("ProxyCommand={proxy}"),
+                "-l".into(),
+                route.username.clone(),
+                "-p".into(),
+                route.port.clone(),
+                "-W".into(),
+                format!("[{}]:{}", next.hostname, next.port),
+            ];
+            if let Some(config) = &config {
+                args.extend(["-F".into(), config.to_string_lossy().into_owned()]);
+            }
+            args.push(route.alias.clone());
+            proxy = shell_words::join(args);
+        }
+        if routes.len() > 1 {
+            command.args(["-o", &format!("ProxyCommand={proxy}")]);
+        }
         let session = Arc::new(Session {
             token: token.clone(),
             routes,
@@ -369,6 +506,7 @@ impl Client {
             cancelled: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             authenticated: AtomicBool::new(false),
+            diagnostics: Mutex::new(String::new()),
         });
         self.state
             .sessions
@@ -376,6 +514,8 @@ impl Client {
             .unwrap()
             .insert(token.clone(), Arc::downgrade(&session));
         command
+            .arg("-E")
+            .arg(&log)
             .args([
                 "-v",
                 "-o",
@@ -392,7 +532,9 @@ impl Client {
         if let Some(executable) = &auth.askpass {
             command.env("SSH_ASKPASS", executable);
         }
-        Ok(Trace(session))
+        let worker_session = session.clone();
+        let worker = std::thread::spawn(move || watch_client_log(log_reader, &worker_session));
+        Ok(Trace(session, Some((log, worker))))
     }
 }
 
@@ -465,14 +607,6 @@ fn resolve_routes(
         port: port.clone(),
         reference: saved.and_then(|s| s.reference.clone()),
         can_save: saved.is_some(),
-        destination: format!(
-            "{username}@{}:{port}",
-            if alias.contains(':') {
-                format!("[{alias}]")
-            } else {
-                alias.to_string()
-            }
-        ),
     };
     if routes.iter().any(|r| r.hostname == route.hostname) {
         return Err(io::Error::other(
@@ -666,7 +800,6 @@ pub(crate) mod tests {
                 port: "22".into(),
                 reference,
                 can_save: true,
-                destination: "tester@web:22".into(),
             }],
             state: service.state.clone(),
             attempts: Mutex::new(HashMap::new()),
@@ -674,6 +807,7 @@ pub(crate) mod tests {
             cancelled: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             authenticated: AtomicBool::new(false),
+            diagnostics: Mutex::new(String::new()),
         });
         service
             .state
@@ -681,7 +815,7 @@ pub(crate) mod tests {
             .lock()
             .unwrap()
             .insert(token, Arc::downgrade(&session));
-        (service, Trace(session))
+        (service, Trace(session, None))
     }
 
     pub fn request(trace: &Trace, prompt: &str) -> JoinHandle<io::Result<Zeroizing<Vec<u8>>>> {
@@ -846,6 +980,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_stderr_cannot_authenticate_or_commit_a_saved_password() {
+        let (service, trace) = fixture(None);
+        let worker = request(&trace, "tester@127.0.0.1's password:");
+        answer(challenge(&service), "do-not-save-from-remote-output", true);
+        worker.join().unwrap().unwrap();
+        let session = trace.0.clone();
+        let path = service.directory.join("client.log");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let log_session = session.clone();
+        let watcher = std::thread::spawn(move || watch_client_log(file, &log_session));
+        let mut production = Trace(session, Some((path, watcher)));
+        assert!(
+            !production
+                .filter_stderr("Authenticated to 127.0.0.1 ([127.0.0.1]:22) using \"password\".")
+        );
+        assert!(!production.status().authenticated());
+        assert!(service.events.try_recv().is_err());
+        production.finish_diagnostics();
+        drop(trace);
+    }
+
+    #[test]
     fn routes_resolve_nested_jumps_and_keychain_users_without_reading_user_configuration() {
         use crate::projects::tests::Fixture;
         let fixture = Fixture::new("authentication-routes");
@@ -882,7 +1044,9 @@ pub(crate) mod tests {
         assert!(!trace.0.routes[1].can_save);
         let args = format!("{:?}", command.get_args().collect::<Vec<_>>());
         let env = format!("{:?}", command.get_envs().collect::<Vec<_>>());
-        assert!(args.contains("saved-user@jump:2222"));
+        assert!(
+            args.contains("saved-user") && args.contains("2222") && args.contains("ProxyCommand=")
+        );
         assert!(!args.contains("jump-only-ref") && !env.contains("jump-only-ref"));
         fs::write(&config, "Host a\n ProxyJump b\nHost b\n ProxyJump a\n").unwrap();
         let mut routes = Vec::new();

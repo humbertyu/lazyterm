@@ -1,0 +1,131 @@
+name: macOS release preparation
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Validate tag
+        env:
+          REF: ${{ github.ref }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF" == refs/tags/* ]]; then
+            test "$TAG" = "v$(python3 scripts/release.py version)"
+          fi
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked -- --test-threads=1
+      - name: Disposable SSH password, routing and forced-exit fixture
+        run: |
+          python3 -m venv "$RUNNER_TEMP/lazyterm-ssh-fixture"
+          "$RUNNER_TEMP/lazyterm-ssh-fixture/bin/pip" install paramiko==5.1.0
+          cargo build --locked
+          LAZYTERM_SSH_PASSWORD_FIXTURE=1 \
+            LAZYTERM_PARAMIKO_PYTHON="$RUNNER_TEMP/lazyterm-ssh-fixture/bin/python" \
+            cargo test --locked authentication::tests::disposable_password_ssh_proxyjump_sftp_project_tunnel_and_snippet_workflows -- --exact --test-threads=1
+      - run: cargo install cargo-audit --locked --version 0.23.0
+      - run: python3 scripts/audit.py
+      - run: python3 -m unittest discover -s tests -p 'test_release.py'
+      - run: python3 scripts/release.py build --target '${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: dist
+          merge-multiple: true
+      - run: python3 scripts/release.py assemble
+      - run: cd dist && shasum -a 256 -c SHA256SUMS
+      - run: ruby -c dist/lazyterm.rb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lazyterm-macos-release
+          path: |
+            dist/*-universal-apple-darwin.tar.gz
+            dist/SHA256SUMS
+            dist/lazyterm.rb
+          if-no-files-found: error
+
+  verify-universal:
+    needs: package
+    strategy:
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lazyterm-macos-release
+          path: dist
+      - name: Verify universal package on native CPU
+        run: |
+          cd dist
+          shasum -a 256 -c SHA256SUMS
+          tar -xzf lazyterm-*-universal-apple-darwin.tar.gz
+          binary="$(find . -type f -name lazyterm)"
+          test "$(lipo -archs "$binary" | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
+          codesign --verify --strict --all-architectures "$binary"
+          "$binary" --version
+          "$binary" --diagnostics
+
+  draft:
+    needs: verify-universal
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: lazyterm-macos-release
+          path: dist
+      - name: Prepare draft release (never publish automatically)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS dist/lazyterm.rb \
+            --draft --verify-tag --title "LazyTerm $TAG" --notes-file docs/RELEASE-NOTES.md

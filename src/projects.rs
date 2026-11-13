@@ -29,7 +29,7 @@ pub struct ProjectDefinition {
     pub links: Vec<ProjectLink>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectLink {
     pub id: EntityId,
     pub name: String,
@@ -42,6 +42,21 @@ pub struct ProjectLink {
     pub password_storage: PasswordStorage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+}
+
+impl std::fmt::Debug for ProjectLink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectLink")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password_ref", &self.password_ref)
+            .field("password_storage", &self.password_storage)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -862,6 +877,16 @@ pub(crate) fn group_has_live_processes(group: u32) -> bool {
 pub(crate) mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn project_link_debug_never_exposes_a_config_password() {
+        let link = ProjectLink {
+            password: Some("debug-secret".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{link:?}").contains("debug-secret"));
+        assert!(format!("{link:?}").contains("[REDACTED]"));
+    }
 
     #[test]
     fn web_links_accept_complete_web_urls_and_reject_other_targets() {

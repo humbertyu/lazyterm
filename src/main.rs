@@ -57,6 +57,24 @@ fn main() -> Result<()> {
     }
     let mut arguments = std::env::args_os().skip(1);
     let mode = arguments.next();
+    match mode.as_deref().and_then(std::ffi::OsStr::to_str) {
+        Some("--version" | "-V") => {
+            println!("lazyterm {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "LazyTerm {}\n\nUsage: lazyterm [--version | --diagnostics | --help]\n\nRun without arguments to open the terminal workspace.\n--diagnostics prints platform information without reading configuration or credentials.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        Some("--diagnostics") => {
+            print!("{}", crate::diagnostics::support_report());
+            return Ok(());
+        }
+        _ => {}
+    }
     if mode.as_deref() == Some(std::ffi::OsStr::new("--process-guard")) {
         crate::process_guard::run()?;
         return Ok(());

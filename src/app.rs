@@ -618,10 +618,15 @@ struct SnippetProcess {
 }
 
 fn spawn_snippet_reader<R: Read + Send + 'static>(
-    mut reader: R,
+    reader: R,
     sender: Sender<SnippetProcessEvent>,
     stderr: bool,
 ) {
+    let mut reader: Box<dyn Read + Send> = if stderr {
+        Box::new(crate::diagnostics::RedactingReader::new(reader))
+    } else {
+        Box::new(reader)
+    };
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
         loop {
@@ -632,11 +637,6 @@ fn spawn_snippet_reader<R: Read + Send + 'static>(
                 }
                 Ok(size) => {
                     let text = String::from_utf8_lossy(&buffer[..size]).into_owned();
-                    let text = if stderr {
-                        crate::diagnostics::redact_sensitive_text(&text)
-                    } else {
-                        text
-                    };
                     if sender
                         .send(SnippetProcessEvent::Output(text, stderr))
                         .is_err()
