@@ -157,7 +157,7 @@ impl Handle {
             self.pending = Some(receiver);
             std::thread::spawn(move || {
                 let result = Self::request(&snapshot, "status", legacy_key).or_else(|error| {
-                    let saved = read_record(&record, snapshot.owner.key, legacy_key)?;
+                    let saved = reconcile_record(&record, snapshot.owner.key, legacy_key)?;
                     if saved.owner.key != snapshot.owner.key {
                         return Err(io::Error::other("Background record identity changed."));
                     }
@@ -301,21 +301,54 @@ pub(crate) fn recover(root: &Path, key: TaskKey) -> io::Result<Option<Handle>> {
     } else {
         return Ok(None);
     };
-    let mut snapshot = read_record(&record, key, legacy_key)?;
-    if snapshot.active()
-        && let Some(_lock) = try_lock_legacy_or_current(root, key, legacy_key)?
-        && !crate::projects::group_has_live_processes(snapshot.owner.process_group)
-    {
-        snapshot.running = false;
-        snapshot.status = TaskStatus::Failed(
-            "Background runner exited unexpectedly. Start the command again.".into(),
-        );
-        write_json(&record, &snapshot)?;
-    }
+    let snapshot = reconcile_record(&record, key, legacy_key)?;
     let mut handle = Handle::new(snapshot, record, legacy_key);
     // An active lock means the runner may still own a live process group.
     let _ = handle.refresh();
     Ok(Some(handle))
+}
+
+fn reconcile_record(
+    record: &Path,
+    key: TaskKey,
+    legacy_key: Option<(u64, u64)>,
+) -> io::Result<Snapshot> {
+    let root = record
+        .parent()
+        .ok_or_else(|| io::Error::other("Missing run directory"))?;
+    let mut snapshot = read_record(record, key, legacy_key)?;
+    if snapshot.active()
+        && let Some(_lock) = try_lock_legacy_or_current(root, key, legacy_key)?
+    {
+        snapshot = read_record(record, key, legacy_key)?;
+        if snapshot.active()
+            && !crate::projects::group_has_live_processes(snapshot.owner.process_group)
+        {
+            snapshot.running = false;
+            snapshot.status = TaskStatus::Failed(
+                "Background runner exited unexpectedly. Start the command again.".into(),
+            );
+            write_json(record, &snapshot)?;
+            // Only remove our private socket directory, never an arbitrary path from a record.
+            if let Some(directory) = snapshot.socket.parent()
+                && directory.parent() == Some(Path::new("/tmp"))
+                && snapshot.socket.file_name() == Some(std::ffi::OsStr::new("control"))
+                && directory.file_name().is_some_and(|name| {
+                    name.to_string_lossy().starts_with(&format!(
+                        "lazyterm-run-{}-{:x}-",
+                        unsafe { libc::geteuid() },
+                        snapshot.owner.run_id
+                    ))
+                })
+                && let Ok(metadata) = fs::symlink_metadata(directory)
+                && metadata.is_dir()
+            {
+                let _ = fs::remove_file(&snapshot.socket);
+                let _ = fs::remove_dir(directory);
+            }
+        }
+    }
+    Ok(snapshot)
 }
 
 fn legacy_record_path(root: &Path, key: TaskKey) -> io::Result<Option<((u64, u64), PathBuf)>> {
@@ -563,6 +596,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sigkill_tui_preserves_persistent_runner_then_sigkill_runner_cleans_children_and_recovers() {
+        use crate::{
+            process_guard::tests::{start_owner, wait_until},
+            projects::tests::{Fixture, PersistentCleanup, until},
+        };
+        use std::net::TcpStream;
+
+        let mut fixture = Fixture::new("sigkill-persistent");
+        let mut command = fixture.listener_command(true);
+        command.lifecycle = ProjectLifecycle::Persistent;
+        fixture.project.commands.push(command.clone());
+        let key = (fixture.project.id, command.id);
+        let _cleanup = PersistentCleanup::new(&fixture, key);
+        let mut owner = start_owner(&fixture, true);
+        let (_, port) = fixture.ready().unwrap();
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+
+        let root = fixture.root.join("logs");
+        let mut service = fixture.service();
+        service.restore(std::slice::from_ref(&fixture.project));
+        assert!(service.active(key));
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+        assert!(
+            service.start(&fixture.project, &command).is_err(),
+            "Must not duplicate the surviving run"
+        );
+
+        let saved = read_json::<Snapshot>(&record_path(&root, key)).unwrap();
+        let socket_dir = saved.socket.parent().unwrap().to_path_buf();
+        let runner_pid: i32 = socket_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit('-')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+        until(&mut service, |service| !service.active(key));
+        assert!(
+            matches!(service.tasks[&key].status, TaskStatus::Failed(ref message) if message.contains("exited unexpectedly"))
+        );
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(
+            !socket_dir.exists(),
+            "Abandoned control socket must be removed"
+        );
+        assert!(
+            !read_json::<Snapshot>(&record_path(&root, key))
+                .unwrap()
+                .active()
+        );
+        wait_until(|| !crate::projects::group_has_live_processes(saved.owner.process_group));
+
+        fs::remove_file(fixture.root.join("ready")).unwrap();
+        service.start(&fixture.project, &command).unwrap();
+        until(&mut service, |_| fixture.ready().is_some());
+        assert_ne!(
+            service.tasks[&key].owner.process_group,
+            saved.owner.process_group
+        );
+        service.stop(key).unwrap();
+        until(&mut service, |service| !service.active(key));
+    }
+
+    #[test]
     fn recovery_marks_an_unlocked_active_record_as_exited_and_allows_restart() {
         use crate::projects::tests::{Fixture, PersistentCleanup};
         let mut fixture = Fixture::new("recover-dead-runner");
@@ -649,6 +751,55 @@ mod tests {
         ));
         service.start(&fixture.project, &command).unwrap();
         assert!(service.active(key));
+    }
+
+    #[test]
+    fn an_unlocked_record_cannot_signal_or_duplicate_an_unverified_live_group() {
+        use crate::projects::tests::{Fixture, until};
+        let live = Fixture::new("unverified-live-group");
+        let mut live_service = live.service();
+        live_service
+            .start(&live.project, &live.listener_command(false))
+            .unwrap();
+        until(&mut live_service, |_| live.ready().is_some());
+        let live_group = live_service.owners()[0].process_group;
+
+        let mut fixture = Fixture::new("unverified-record");
+        let mut command = fixture.command("sleep 30");
+        command.lifecycle = ProjectLifecycle::Persistent;
+        fixture.project.commands.push(command.clone());
+        let key = (fixture.project.id, command.id);
+        let root = fixture.root.join("logs");
+        fs::create_dir_all(&root).unwrap();
+        write_json(
+            &record_path(&root, key),
+            &Snapshot {
+                owner: ProjectOwner {
+                    key,
+                    run_id: 12,
+                    process_group: live_group,
+                    project_name: "unknown".into(),
+                    command_name: "unknown".into(),
+                },
+                directory: fixture.root.clone(),
+                command: command.command.clone(),
+                status: TaskStatus::Running,
+                running: true,
+                output: String::new(),
+                stdout_log: root.join("stdout.log"),
+                stderr_log: root.join("stderr.log"),
+                socket: root.join("missing/control"),
+                token: "unverified-token".into(),
+            },
+        )
+        .unwrap();
+        let mut service = fixture.service();
+        service.restore(std::slice::from_ref(&fixture.project));
+        assert!(service.active(key));
+        assert!(service.start(&fixture.project, &command).is_err());
+        let (_, port) = live.ready().unwrap();
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        assert!(crate::projects::group_has_live_processes(live_group));
     }
 
     #[test]

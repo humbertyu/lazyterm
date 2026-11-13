@@ -10,6 +10,7 @@ mod import_export;
 mod instance;
 mod metadata;
 mod native_connection;
+mod process_guard;
 mod project_app;
 mod project_credentials;
 mod project_monitor;
@@ -55,7 +56,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut arguments = std::env::args_os().skip(1);
-    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--project-runner")) {
+    let mode = arguments.next();
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--process-guard")) {
+        crate::process_guard::run()?;
+        return Ok(());
+    }
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--project-runner")) {
         let spec = arguments
             .next()
             .ok_or_else(|| io::Error::other("Missing runner launch file"))?;

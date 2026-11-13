@@ -1218,6 +1218,73 @@ pub(crate) mod tests {
         }
         tunnel_process.kill().unwrap();
         tunnel_process.wait().unwrap();
+        drop(tunnel_process);
+
+        // Exercise App polling after a real SSH SIGKILL, then kill the App owner itself.
+        fs::write(
+            root.join("tunnel.json"),
+            serde_json::to_vec(&tunnel).unwrap(),
+        )
+        .unwrap();
+        for kill_owner in [false, true] {
+            let _ = fs::remove_file(root.join("tunnel-owner-ready"));
+            let _ = fs::remove_file(root.join("tunnel-owner-failed"));
+            let mut owner = crate::process_guard::tests::OwnerProcess(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "app::tests::tunnel_recovery_owner_process",
+                        "--nocapture",
+                    ])
+                    .env("LAZYTERM_TUNNEL_RECOVERY_ROOT", &root)
+                    .env("LAZYTERM_TUNNEL_RECOVERY_BINARY", &test_binary)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut tunnel_pid = None;
+            crate::process_guard::tests::wait_until(|| {
+                assert!(
+                    owner.0.try_wait().unwrap().is_none(),
+                    "Tunnel owner exited before ready"
+                );
+                tunnel_pid = fs::read_to_string(root.join("tunnel-owner-ready"))
+                    .ok()
+                    .and_then(|value| value.parse::<i32>().ok());
+                tunnel_pid.is_some()
+            });
+            if kill_owner {
+                owner.0.kill().unwrap();
+                owner.0.wait().unwrap();
+            } else {
+                assert_eq!(unsafe { libc::kill(tunnel_pid.unwrap(), libc::SIGKILL) }, 0);
+                crate::process_guard::tests::wait_until(|| {
+                    root.join("tunnel-owner-failed").exists()
+                });
+                assert!(owner.0.wait().unwrap().success());
+            }
+            crate::process_guard::tests::wait_until(|| {
+                TcpStream::connect(("127.0.0.1", port_forward)).is_err()
+            });
+            assert!(
+                TcpListener::bind(("127.0.0.1", port_forward)).is_ok(),
+                "Killed Tunnel must release its bind port"
+            );
+        }
+
+        let (events, _) = mpsc::channel();
+        let (mut restarted, restarted_status) =
+            crate::tunnel::spawn_forward(&tunnel, events, &auth(&service)).unwrap();
+        answer(&service, "tester", false);
+        crate::process_guard::tests::wait_until(|| {
+            restarted_status.as_ref().unwrap().authenticated()
+                && TcpStream::connect(("127.0.0.1", port_forward)).is_ok()
+        });
+        restarted.kill().unwrap();
+        restarted.wait().unwrap();
+        drop(restarted);
 
         let pending = crate::native_connection::Pending::start(
             "web".into(),

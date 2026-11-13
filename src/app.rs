@@ -312,7 +312,7 @@ pub struct App {
     tunnel_receiver: Receiver<tunnel::TunnelEvent>,
     runtime_sender: Sender<RuntimeEvent>,
     runtime_receiver: Receiver<RuntimeEvent>,
-    tunnel_processes: std::collections::HashMap<uuid::Uuid, Child>,
+    tunnel_processes: std::collections::HashMap<uuid::Uuid, crate::process_guard::ManagedChild>,
     tunnel_authentication: std::collections::HashMap<uuid::Uuid, crate::authentication::Status>,
     snippet_processes: std::collections::HashMap<u64, SnippetProcess>,
     next_snippet_run_id: u64,
@@ -1998,7 +1998,10 @@ impl App {
                 self.tunnel_statuses.insert(id, TunnelStatus::Stopped);
                 continue;
             }
-            let result = self.tunnel_processes.get_mut(&id).map(Child::try_wait);
+            let result = self
+                .tunnel_processes
+                .get_mut(&id)
+                .map(|child| child.try_wait());
             let Some(result) = result else {
                 continue;
             };
@@ -6273,6 +6276,70 @@ mod tests {
         app.metadata_error = true;
         app.viewport_width = 32;
         app
+    }
+
+    #[test]
+    #[ignore = "isolated App/Tunnel owner for the disposable SSH recovery fixture"]
+    fn tunnel_recovery_owner_process() {
+        use crate::authentication::{Answer, Event, SavedHost, Service};
+        let Some(root) = std::env::var_os("LAZYTERM_TUNNEL_RECOVERY_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let definition: TunnelDefinition =
+            serde_json::from_slice(&fs::read(root.join("tunnel.json")).unwrap()).unwrap();
+        let service = Service::new().unwrap();
+        let auth = crate::credentials::HostAuth {
+            broker: Some(service.client(vec![SavedHost {
+                alias: "web".into(),
+                username: Some("tester".into()),
+                reference: None,
+            }])),
+            config: Some(root.join("config")),
+            askpass: Some(PathBuf::from(
+                std::env::var_os("LAZYTERM_TUNNEL_RECOVERY_BINARY").unwrap(),
+            )),
+            ..Default::default()
+        };
+        let mut app = app_fixture();
+        app.metadata.tunnels.push(definition.clone());
+        let (child, authentication) =
+            tunnel::spawn_forward(&definition, app.tunnel_sender.clone(), &auth).unwrap();
+        let pid = child.id();
+        app.tunnel_processes.insert(definition.id, child);
+        app.tunnel_authentication
+            .insert(definition.id, authentication.unwrap());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut ready = false;
+        loop {
+            while let Ok(event) = service.events.try_recv() {
+                if let Event::Challenge(challenge) = event {
+                    challenge.respond(Some(Answer {
+                        password: zeroize::Zeroizing::new("fixture-password".into()),
+                        save: false,
+                    }));
+                }
+            }
+            app.poll_tunnels();
+            if !ready
+                && app.tunnel_statuses.get(&definition.id) == Some(&TunnelStatus::Running)
+                && std::net::TcpStream::connect(("127.0.0.1", definition.local_port)).is_ok()
+            {
+                fs::write(root.join("tunnel-owner-ready"), pid.to_string()).unwrap();
+                ready = true;
+            }
+            if matches!(
+                app.tunnel_statuses.get(&definition.id),
+                Some(TunnelStatus::Failed(_))
+            ) {
+                assert!(ready, "Tunnel failed before the recovery fixture was ready");
+                assert!(!app.tunnel_processes.contains_key(&definition.id));
+                fs::write(root.join("tunnel-owner-failed"), b"failed").unwrap();
+                return;
+            }
+            assert!(Instant::now() < deadline, "Tunnel recovery owner timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

@@ -176,7 +176,7 @@ Project workspaces:
 - [x] Separate current running status from the last managed result and inspect before starting to avoid recognized duplicates.
 - [x] Confirm external stop/restart, revalidate process identity, and preserve external commands on application exit.
 
-Project limits: app-scoped commands may run through the Hosts catalog, but persistent remote commands, interactive PTY, dependency ordering, and remote process rediscovery remain deferred. Only the latest persistent run per command has a saved status/output index; full run history and raw-log rotation remain deferred. App-scoped recovery after forced termination and recovery after the independent runner itself is killed remain in beta hardening. Persistent runs do not automatically relaunch after a crash, logout, or reboot; completing this slice does not declare the v0.5.0 release accepted.
+Project limits: app-scoped commands may run through the Hosts catalog, but persistent remote commands, interactive PTY, dependency ordering, and remote process rediscovery remain deferred. Only the latest persistent run per command has a saved status/output index; full run history and raw-log rotation remain deferred. Beta hardening adds forced-termination cleanup for managed process groups and state recovery for a killed independent runner. Persistent runs do not automatically relaunch after a crash, logout, or reboot; completing this slice does not declare the v0.5.0 release accepted.
 
 ## v0.6.0 - Beta Hardening
 
@@ -189,7 +189,7 @@ Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, 
 - [x] Configuration export and documented data locations. Credential export includes saved manager/Host passwords and Project Web Link passwords in a user-selected, password-protected age file; credential import and private-key export remain pending.
 - [x] Introduce additive metadata schema migration with version validation and a pre-migration backup using the existing bounded backup rotation.
 - [x] Redact password-like values and URI credentials from surfaced SSH, Tunnel, and Snippet stderr diagnostics; broader diagnostic audit remains part of acceptance.
-- [ ] Recovery behavior for killed TUI and tunnel processes.
+- [x] Recovery behavior for killed TUI, Tunnel, and independent Project runner processes: ownership-pipe guards clean abandoned managed groups; surviving persistent runners reattach; dead runner records reconcile without signaling saved PIDs. Isolated SIGKILL tests cover cleanup, restart, and unrelated-process isolation.
 - [ ] macOS builds for supported architectures.
 - [ ] Installation instructions and checksums.
 - [ ] User testing of SSH, SFTP, credentials, tunnels, snippets, Runtime, and Projects.
@@ -200,7 +200,7 @@ Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, 
 
 Configuration import automatically merges with incoming values taking priority: same-name Host stanzas are replaced, local-only aliases and metadata entries survive, and LazyTerm entities use UUIDs matched before name fallback. Existing numeric metadata IDs migrate to UUIDs with a pre-migration backup and their internal references are rewritten. There is one overall import confirmation, with no per-conflict prompts. Host renames, three-way synchronization, and deletion propagation are deferred until Host identity and shared revision history are available.
 
-Recovery note: startup now scans local Project command records, reattaches a live runner, and marks an active record failed only when its runner lock is released and its process group is confirmed empty. Recovery after the runner itself is killed while its command process group remains alive, recovery of forced-killed TUI-owned Tunnel processes, and end-to-end forced-termination acceptance are still open.
+Recovery note: independent guards anchor managed process groups and monitor a private ownership pipe. TUI death cleans app-scoped Project/Tunnel/native-master groups with TERM followed by KILL after two seconds; persistent Project runners survive TUI death. Runner death cleans its command group, then status polling/startup reconciles the private record only after the runner lock is released and the group is confirmed empty, removes the abandoned control socket, and allows restart. Real subprocess tests kill an App owner and runner, check port release and unrelated-service isolation, and verify persistent reattachment and duplicate prevention. The opt-in disposable SSH fixture kills a real Tunnel and its App owner, verifies App failure state/port release, and restarts the same forwarding configuration. Arbitrary daemonized processes outside the owned group, remote process rediscovery, and pre-guard runs are excluded; cross-platform manual acceptance remains open.
 
 ## v0.7.0 - Stable Core
 

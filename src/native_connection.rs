@@ -3,7 +3,7 @@ use std::{
     io::{self, Read},
     os::unix::fs::DirBuilderExt,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -31,7 +31,7 @@ pub struct Connection {
     pub kind: Kind,
     username: Option<String>,
     directory: PathBuf,
-    child: Child,
+    child: crate::process_guard::ManagedChild,
     #[cfg(test)]
     config: Option<PathBuf>,
 }
@@ -142,12 +142,12 @@ fn connect(
         }
     };
     let authentication = trace.as_ref().map(crate::authentication::Trace::status);
-    let spawned = command
+    command
         .arg(&alias)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    let spawned = crate::process_guard::ManagedChild::spawn(&mut command);
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {

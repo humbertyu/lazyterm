@@ -1,7 +1,7 @@
 use std::{
     io::{self, Read},
     net::TcpListener,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::mpsc::Sender,
     thread,
 };
@@ -17,7 +17,10 @@ pub fn spawn_forward(
     tunnel: &TunnelDefinition,
     events: Sender<TunnelEvent>,
     auth: &crate::credentials::HostAuth,
-) -> io::Result<(Child, Option<crate::authentication::Status>)> {
+) -> io::Result<(
+    crate::process_guard::ManagedChild,
+    Option<crate::authentication::Status>,
+)> {
     check_local_bind(tunnel)?;
     let (option, forward) = forward_spec(tunnel)?;
     let mut command = Command::new("ssh");
@@ -45,7 +48,7 @@ pub fn spawn_forward(
     let trace = crate::credentials::configure_host_auth(&mut command, auth, &tunnel.host_alias)?;
     let authentication = trace.as_ref().map(crate::authentication::Trace::status);
     command.arg(&tunnel.host_alias);
-    let mut child = command.spawn()?;
+    let mut child = crate::process_guard::ManagedChild::spawn(&mut command)?;
     if let Some(mut stderr) = child.stderr.take() {
         let id = tunnel.id;
         if let Err(error) = thread::Builder::new()

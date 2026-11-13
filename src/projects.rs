@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, SyncSender},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -277,7 +277,7 @@ pub struct ProjectTask {
     pub stderr_log: PathBuf,
     pub lifecycle: ProjectLifecycle,
     persistent: Option<crate::project_runner::Handle>,
-    child: Option<Child>,
+    child: Option<crate::process_guard::ManagedChild>,
     finished: Option<ExitStatus>,
     receiver: Receiver<OutputEvent>,
     closed_readers: usize,
@@ -308,7 +308,9 @@ impl ProjectTask {
             self.status = handle.snapshot.status.clone();
             return Ok(());
         }
-        signal_group(self.owner.process_group, libc::SIGTERM)?;
+        if let Some(child) = self.child.as_mut() {
+            child.signal_group(libc::SIGTERM)?;
+        }
         self.user_stopped = true;
         self.status = TaskStatus::Stopping;
         self.stop_deadline = Some(Instant::now() + Duration::from_secs(2));
@@ -319,7 +321,8 @@ impl ProjectTask {
 impl Drop for ProjectTask {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = signal_group(self.owner.process_group, libc::SIGKILL);
+            let _ = child.signal_group(libc::SIGKILL);
+            let _ = child.kill();
             let _ = child.wait();
         }
     }
@@ -563,17 +566,8 @@ impl ProjectService {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            process.process_group(0);
-        }
-        #[cfg(not(unix))]
-        return Err(io::Error::other(
-            "Project process groups require macOS or Linux",
-        ));
-        let mut child = process.spawn()?;
-        let process_group = child.id();
+        let mut child = crate::process_guard::ManagedChild::spawn(&mut process)?;
+        let process_group = child.process_group();
         let (sender, receiver) = mpsc::sync_channel(128);
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -723,17 +717,23 @@ impl ProjectService {
             }
             if task.finished.is_some() && task.stop_deadline.is_none() {
                 // A shell can exit while a background server still owns its pipes.
-                let _ = signal_group(task.owner.process_group, libc::SIGTERM);
+                if let Some(child) = task.child.as_mut() {
+                    let _ = child.signal_group(libc::SIGTERM);
+                }
                 task.stop_deadline = Some(Instant::now() + Duration::from_secs(2));
             }
             if let Some(deadline) = task.stop_deadline
                 && Instant::now() >= deadline
+                && let Some(child) = task.child.as_mut()
             {
-                let _ = signal_group(task.owner.process_group, libc::SIGKILL);
+                let _ = child.signal_group(libc::SIGKILL);
             }
             if task.finished.is_some()
                 && task.closed_readers >= 2
-                && !group_has_live_processes(task.owner.process_group)
+                && task
+                    .child
+                    .as_ref()
+                    .is_some_and(|child| !child.group_has_live_processes())
             {
                 task.child = None;
                 if !matches!(task.status, TaskStatus::Failed(_)) {
@@ -827,24 +827,6 @@ impl vte::Perform for DisplayOutput {
             b'\t' => self.text.push_str("    "),
             _ => {}
         }
-    }
-}
-
-fn signal_group(group: u32, signal: i32) -> io::Result<()> {
-    let group = i32::try_from(group).map_err(|_| io::Error::other("Invalid process group"))?;
-    if group <= 1 {
-        return Err(io::Error::other("Refusing invalid process group"));
-    }
-    // Groups are created by CommandExt::process_group for our own child processes.
-    let result = unsafe { libc::kill(-group, signal) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
     }
 }
 
