@@ -28,6 +28,72 @@ pub struct ConfigurationImport {
     pub ssh_root: PathBuf,
 }
 
+pub(crate) fn portable_ssh_snapshot(
+    config_path: &Path,
+    ssh_root: &Path,
+) -> io::Result<BTreeMap<String, String>> {
+    let snapshot = crate::hosts::HostCatalog::snapshot_from(config_path, ssh_root)?;
+    let canonical_root = fs::canonicalize(ssh_root).unwrap_or_else(|_| ssh_root.to_path_buf());
+    let mut portable = BTreeMap::new();
+    for (path, contents) in snapshot {
+        let path = PathBuf::from(path);
+        if path.strip_prefix(&canonical_root).is_err() {
+            continue;
+        }
+        let (contents, _) = strip_external_include_directives(&contents, ssh_root)?;
+        portable.insert(path.display().to_string(), contents);
+    }
+    Ok(portable)
+}
+
+pub(crate) fn strip_external_include_directives(
+    contents: &str,
+    ssh_root: &Path,
+) -> io::Result<(String, Vec<(usize, String)>)> {
+    let canonical_root = fs::canonicalize(ssh_root).unwrap_or_else(|_| ssh_root.to_path_buf());
+    let mut filtered = String::with_capacity(contents.len());
+    let mut local_includes = Vec::new();
+    for (line_index, line) in contents.split_inclusive('\n').enumerate() {
+        let trimmed = line.trim_start();
+        let Some(end) =
+            trimmed.find(|character: char| character.is_whitespace() || character == '=')
+        else {
+            filtered.push_str(line);
+            continue;
+        };
+        if !trimmed[..end].eq_ignore_ascii_case("include") {
+            filtered.push_str(line);
+            continue;
+        }
+        let value = trimmed[end..]
+            .trim_start()
+            .trim_start_matches('=')
+            .trim_start();
+        let value = crate::hosts::strip_comment(value);
+        let paths =
+            shell_words::split(value).map_err(|_| invalid("Invalid SSH Include directive."))?;
+        let mut external = false;
+        for include in paths {
+            for path in crate::hosts::expand_include(&include, ssh_root)? {
+                let path = fs::canonicalize(&path).unwrap_or(path);
+                if !path.starts_with(&canonical_root) {
+                    external = true;
+                    break;
+                }
+            }
+            if external {
+                break;
+            }
+        }
+        if external {
+            local_includes.push((line_index, line.trim_end_matches(['\r', '\n']).to_string()));
+        } else {
+            filtered.push_str(line);
+        }
+    }
+    Ok((filtered, local_includes))
+}
+
 fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata> {
     use serde_json::Value;
     fn merge(local: &mut Value, incoming: Value, field: &str) {
@@ -197,7 +263,7 @@ fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata>
 // An incoming alias replaces its old stanza; aliases absent from the archive survive.
 type SshSections = Vec<(Option<Vec<String>>, String)>;
 
-fn ssh_sections(text: &str) -> io::Result<SshSections> {
+pub(crate) fn ssh_sections(text: &str) -> io::Result<SshSections> {
     let mut result = vec![(None, String::new())];
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
@@ -386,11 +452,55 @@ pub fn parse_configuration(bytes: &[u8], home: &Path) -> io::Result<Configuratio
 }
 
 pub fn apply_configuration(
-    mut import: ConfigurationImport,
+    import: ConfigurationImport,
     metadata_path: &Path,
 ) -> io::Result<Metadata> {
     let current = Metadata::read_for_import(metadata_path)?;
-    import.metadata = merge_metadata(current, import.metadata)?;
+    apply_configuration_inner(import, metadata_path, current, true, false)
+}
+
+pub(crate) fn apply_sync_configuration(
+    import: ConfigurationImport,
+    metadata_path: &Path,
+    expected: Metadata,
+    expected_ssh: &BTreeMap<String, String>,
+    local_only_includes: &BTreeMap<PathBuf, Vec<(usize, String)>>,
+) -> io::Result<Metadata> {
+    let config = import.ssh_root.join("config");
+    if crate::hosts::HostCatalog::snapshot_from(&config, &import.ssh_root)? != *expected_ssh {
+        return Err(invalid(
+            "SSH configuration changed during sync; retry synchronization.",
+        ));
+    }
+    let mut import = import;
+    for (relative, lines) in local_only_includes {
+        let path = import.ssh_root.join(relative);
+        let Some(contents) = import.ssh_files.get_mut(&path) else {
+            continue;
+        };
+        let text = std::str::from_utf8(contents)
+            .map_err(|_| invalid("SSH config files must be valid UTF-8."))?;
+        let mut output = text.lines().map(str::to_string).collect::<Vec<_>>();
+        for (index, line) in lines.iter().rev() {
+            output.insert((*index).min(output.len()), line.clone());
+        }
+        *contents = format!("{}\n", output.join("\n")).into_bytes();
+    }
+    apply_configuration_inner(import, metadata_path, expected, false, true)
+}
+
+fn apply_configuration_inner(
+    mut import: ConfigurationImport,
+    metadata_path: &Path,
+    current: Metadata,
+    merge: bool,
+    allow_external_local_includes: bool,
+) -> io::Result<Metadata> {
+    import.metadata = if merge {
+        merge_metadata(current, import.metadata)?
+    } else {
+        current.merged_document(serde_json::to_value(&import.metadata)?, BTreeMap::new())?
+    };
     let config = import.ssh_root.join("config");
     let canonical_root = fs::canonicalize(&import.ssh_root).unwrap_or(import.ssh_root.clone());
     let snapshot = if import.ssh_files.is_empty() {
@@ -400,15 +510,18 @@ pub fn apply_configuration(
     };
     let mut existing = snapshot
         .into_iter()
-        .map(|(path, contents)| {
+        .filter_map(|(path, contents)| {
             let path = PathBuf::from(path);
-            let relative = path
-                .strip_prefix(&canonical_root)
-                .map_err(|_| invalid("Local SSH Include points outside the SSH directory."))?;
-            Ok((
-                import.ssh_root.join(relative).display().to_string(),
-                contents,
-            ))
+            match path.strip_prefix(&canonical_root) {
+                Ok(relative) => Some(Ok((
+                    import.ssh_root.join(relative).display().to_string(),
+                    contents,
+                ))),
+                Err(_) if allow_external_local_includes => None,
+                Err(_) => Some(Err(invalid(
+                    "Local SSH Include points outside the SSH directory.",
+                ))),
+            }
         })
         .collect::<io::Result<BTreeMap<_, _>>>()?;
     for path in import.ssh_files.keys() {
@@ -435,14 +548,26 @@ pub fn apply_configuration(
     }
     for (path, contents) in &existing {
         let path = PathBuf::from(path);
-        if !import.ssh_files.is_empty() {
+        if merge && !import.ssh_files.is_empty() {
             let incoming = import.ssh_files.entry(path).or_default();
             let incoming_text = std::str::from_utf8(incoming)
                 .map_err(|_| invalid("SSH config files must be valid UTF-8."))?;
             *incoming = merge_ssh_config(contents, incoming_text, &aliases)?.into_bytes();
         }
     }
-    preflight_ssh_files(&import.ssh_files, &config, &import.ssh_root)?;
+    if allow_external_local_includes {
+        let mut portable_files = import.ssh_files.clone();
+        for contents in portable_files.values_mut() {
+            let text = std::str::from_utf8(contents)
+                .map_err(|_| invalid("SSH config files must be valid UTF-8."))?;
+            *contents = strip_external_include_directives(text, &import.ssh_root)?
+                .0
+                .into_bytes();
+        }
+        preflight_ssh_files(&portable_files, &config, &import.ssh_root)?;
+    } else {
+        preflight_ssh_files(&import.ssh_files, &config, &import.ssh_root)?;
+    }
     let mut originals = BTreeMap::new();
     let ssh_root = import.ssh_root.clone();
     for path in import.ssh_files.keys() {
@@ -625,7 +750,7 @@ impl Drop for TemporaryDirectory {
     }
 }
 
-fn rewrite_absolute_includes(
+pub(crate) fn rewrite_absolute_includes(
     contents: &str,
     source_root: &Path,
     target_root: &Path,
@@ -825,6 +950,69 @@ mod tests {
                 .ssh_files
                 .keys()
                 .any(|path| path.ends_with("config.d/work.conf"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_ssh_export_omits_external_machine_local_includes() {
+        let root = fixture("portable-ssh");
+        let ssh_root = root.join(".ssh");
+        fs::create_dir_all(&ssh_root).unwrap();
+        let external = root.join(".orbstack/ssh/config");
+        fs::create_dir_all(external.parent().unwrap()).unwrap();
+        fs::write(&external, "Host orb-machine\n  HostName orb.internal\n").unwrap();
+        let config = ssh_root.join("config");
+        fs::write(
+            &config,
+            format!(
+                "Include {}\nHost app\n  HostName app.internal\n",
+                external.display()
+            ),
+        )
+        .unwrap();
+
+        let snapshot = portable_ssh_snapshot(&config, &ssh_root).unwrap();
+        let root_config = snapshot
+            .get(&fs::canonicalize(&config).unwrap().display().to_string())
+            .unwrap();
+        assert!(!root_config.contains("Include"));
+        assert!(root_config.contains("Host app"));
+        assert!(
+            snapshot
+                .values()
+                .all(|contents| !contents.contains("orb-machine"))
+        );
+        assert!(
+            snapshot
+                .keys()
+                .all(|path| !Path::new(path).starts_with(root.join(".orbstack")))
+        );
+        let source_config = fs::canonicalize(&config).unwrap();
+        let root_config = snapshot
+            .get(&source_config.display().to_string())
+            .unwrap()
+            .clone();
+        let bundle = serde_json::json!({
+            "format_version": 1,
+            "ssh_config_path": source_config,
+            "ssh_config": root_config,
+            "ssh_config_files": snapshot,
+            "metadata": serde_json::to_value(Metadata::default()).unwrap(),
+            "passwords_included": false,
+        });
+        let target_home = root.join("other-device");
+        let imported =
+            parse_configuration(&serde_json::to_vec(&bundle).unwrap(), &target_home).unwrap();
+        assert_eq!(imported.host_count, 1);
+        assert!(
+            !String::from_utf8_lossy(
+                imported
+                    .ssh_files
+                    .get(&target_home.join(".ssh/config"))
+                    .unwrap()
+            )
+            .contains(".orbstack")
         );
         fs::remove_dir_all(root).unwrap();
     }

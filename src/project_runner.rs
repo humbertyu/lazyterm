@@ -308,6 +308,35 @@ pub(crate) fn recover(root: &Path, key: TaskKey) -> io::Result<Option<Handle>> {
     Ok(Some(handle))
 }
 
+// CLI inventory must not reconcile or rewrite runner records.
+pub(crate) fn inspect(root: &Path, key: TaskKey) -> io::Result<Option<Snapshot>> {
+    let record = record_path(root, key);
+    let snapshot = match read_record(&record, key, None) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if snapshot.active() {
+        Handle::request(&snapshot, "status", None).map(Some)
+    } else {
+        Ok(Some(snapshot))
+    }
+}
+
+pub(crate) fn stop_observed(root: &Path, key: TaskKey, run_id: u64) -> io::Result<Snapshot> {
+    let snapshot = inspect(root, key)?
+        .ok_or_else(|| io::Error::other("No managed run exists for this command."))?;
+    if snapshot.owner.run_id != run_id {
+        return Err(io::Error::other(
+            "Run identity changed; query status again before stopping.",
+        ));
+    }
+    if !snapshot.active() {
+        return Err(io::Error::other("The observed run is no longer active."));
+    }
+    Handle::request(&snapshot, "stop", None)
+}
+
 fn reconcile_record(
     record: &Path,
     key: TaskKey,

@@ -1,5 +1,6 @@
 mod app;
 mod authentication;
+mod cli;
 mod credential_app;
 mod credential_ui;
 mod credentials;
@@ -18,6 +19,8 @@ mod project_runner;
 mod projects;
 mod runtime;
 mod sftp;
+mod sync;
+mod sync_engine;
 mod theme;
 mod tunnel;
 mod ui;
@@ -43,6 +46,9 @@ use ratatui::DefaultTerminal;
 use crate::app::{App, ConnectionDialog, InputAction};
 
 fn main() -> Result<()> {
+    if let Some(code) = crate::cli::run_if_requested() {
+        std::process::exit(code);
+    }
     if std::env::var_os("LAZYTERM_AUTH_SOCKET").is_some() {
         if crate::authentication::askpass().is_err() {
             std::process::exit(1);
@@ -115,6 +121,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         app.poll_runtime();
         app.poll_credentials();
         app.poll_authentication();
+        app.poll_sync_test();
         poll_native_connection(terminal, &mut app)?;
         app.update_toast();
         let size = terminal.size()?;
@@ -125,6 +132,10 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         if event::poll(Duration::from_millis(100))? {
             let action = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_event(key),
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                    InputAction::None
+                }
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                     let size = terminal.size()?;
                     app.handle_mouse(mouse.column, mouse.row, size.width, size.height)

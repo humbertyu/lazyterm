@@ -1,5 +1,9 @@
 # LazyTerm
 
+Agent CLI: [commands, JSON contract, and Skill setup](docs/CLI.md). Use
+`lazyterm hosts list --json`, `lazyterm projects status --json`, or
+`lazyterm schema --json` without opening the TUI.
+
 A lightweight, keyboard-driven workspace for remote hosts. LazyTerm aims to bring the useful parts of a Termius-style workflow to a local-first TUI: SSH host management, terminal access, SFTP, tunnels, and command snippets.
 
 The project is at an early stage. The Hosts view reads aliases from `~/.ssh/config`, organizes them by local groups, and opens them with the system OpenSSH client. Add creates a managed block in `~/.ssh/config`; Edit updates ordinary single-alias Host blocks in place, including blocks in `Include` files, while preserving unrelated options and comments. Files has a local-first dual-pane browser with an embedded SFTP directory view, per-host connection reuse, recursive transfers, transfer history, and confirmed file mutations. Tunnels support Local, Remote, and Dynamic/SOCKS forwards with process supervision. Snippets are organized into Packages, can run against a Host or tagged Host group with bounded concurrency, and show per-host output and status. Runtime inspects local or remote TCP listeners through the same Host catalog. Projects organizes local commands by base directory, supervises their processes, and links their listening ports back from Runtime.
@@ -59,7 +63,7 @@ OpenSSH configuration (including discovered `Include` files) is the source of tr
 
 The host-management scope covers common connection fields: alias, hostname, username, port, and identity file. Host passwords are optional and are stored only in the system credential store; LazyTerm metadata keeps a reference so OpenSSH can use them through the scoped askpass helper. Advanced OpenSSH directives and complex configuration rules remain editable directly in `~/.ssh/config`.
 
-In the Hosts view, use `a` to add a managed host, `e` to edit a LazyTerm-managed host, and `d` to delete one after confirmation. Existing unmanaged OpenSSH hosts remain read-only in LazyTerm. Press `Enter` to hand an SSH session to the system OpenSSH client.
+In the Hosts view, use `a` to add a host, `e` to edit an ordinary single-alias Host block, and `d` to delete one after confirmation. Existing OpenSSH hosts can also be managed; shared or ambiguous blocks require explicit SSH config editing. Press `Enter` to hand an SSH session to the system OpenSSH client.
 
 Runtime shows TCP listeners on the local machine or on a selected Host. The top row has clickable `Local` and `Hosts` selectors followed by the current machine name; category tabs sit below it. Press `h` or `s` to open the Groups/Hosts picker, `l` to return to Local, and `r` to refresh the inspection. Each machine keeps its own category, selected listener, and list position for the current app session. Switching machines shows its cached list while a fresh inspection runs; termination is disabled until that inspection succeeds. Older requests cannot replace the current machine's results. `Enter` keeps the selected listener focused and its details visible. Categories and listener rows also support mouse selection.
 

@@ -162,6 +162,12 @@ fn render_dialogs(frame: &mut Frame, app: &App) {
     if app.settings_picker.is_some() {
         render_settings_picker(frame, app);
     }
+    if let Some(dialog) = &app.sync_dialog {
+        render_sync_settings_dialog(frame, dialog);
+    }
+    if let Some(prepared) = &app.sync_conflicts {
+        render_sync_conflicts(frame, prepared);
+    }
     if let Some(kind) = app.import_confirmation {
         render_import_confirmation(frame, app, kind);
     }
@@ -2309,11 +2315,12 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         ),
         ("Import configuration", "Validated JSON".to_string()),
         ("Import credentials", "Encrypted .age file".to_string()),
+        ("Configuration sync", "Git remote settings".to_string()),
     ];
     let groups = [
         ("Appearance", 0..2),
         ("Workspace tabs", 2..9),
-        ("Configuration", 9..13),
+        ("Configuration", 9..14),
     ];
     let mut selected_row = 0;
     let mut row_index = 0;
@@ -2359,6 +2366,185 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         List::new(items).block(panel_l(app, "Settings")),
         area,
         &mut state,
+    );
+}
+
+fn render_sync_settings_dialog(frame: &mut Frame, dialog: &crate::app::SyncSettingsDialog) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(76);
+    let height = 14.min(screen.height.saturating_sub(2));
+    if width < 24 || height < 7 {
+        return;
+    }
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .margin(1)
+    .split(area);
+    frame.render_widget(
+        Paragraph::new("Git configuration sync").style(
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
+        ),
+        rows[0],
+    );
+    for (index, (label, value)) in [
+        ("Remote", dialog.remote.as_str()),
+        ("Branch", dialog.branch.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let selected = dialog.selected == index;
+        frame.render_widget(
+            Paragraph::new(format!("{label}: {value}"))
+                .style(Style::default().fg(if selected { GREEN.into() } else { TEXT.into() }))
+                .block(Block::default().borders(Borders::BOTTOM).border_style(
+                    Style::default().fg(if selected {
+                        GREEN.into()
+                    } else {
+                        BORDER.into()
+                    }),
+                )),
+            rows[index + 1],
+        );
+    }
+    let controls = [
+        (2, "Save"),
+        (
+            3,
+            if dialog.testing {
+                "Testing connection..."
+            } else {
+                "Test connection"
+            },
+        ),
+        (
+            4,
+            if dialog.testing {
+                "Sync unavailable while active"
+            } else {
+                "Sync now"
+            },
+        ),
+    ];
+    for (offset, (index, label)) in controls.into_iter().enumerate() {
+        let selected = dialog.selected == index;
+        frame.render_widget(
+            Paragraph::new(if selected {
+                format!("> {label}")
+            } else {
+                format!("  {label}")
+            })
+            .style(Style::default().fg(if selected {
+                GREEN.into()
+            } else {
+                MUTED.into()
+            })),
+            rows[offset + 3],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("Use a private remote. Git auth uses your agent/helper; passwords and key files are excluded.")
+            .style(Style::default().fg(MUTED.into()))
+            .wrap(Wrap { trim: true }),
+        rows[6],
+    );
+    frame.render_widget(
+        Block::default()
+            .title("Sync settings")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER.into())),
+        area,
+    );
+}
+
+fn render_sync_conflicts(frame: &mut Frame, prepared: &crate::sync_engine::Prepared) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(86);
+    let height = screen.height.saturating_sub(2).min(16);
+    if width < 32 || height < 8 {
+        return;
+    }
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{} conflicting changes detected.",
+                prepared.plan.conflicts.len()
+            ),
+            Style::default()
+                .fg(Color::Rgb(239, 192, 101))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("No files have been changed. Choose each conflict separately:"),
+        Line::from(""),
+    ];
+    let start = prepared.conflict_selection.saturating_sub(5);
+    for (index, conflict) in prepared
+        .plan
+        .conflicts
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(6)
+    {
+        let prefix = if prepared.conflict_selection == index {
+            "> "
+        } else {
+            "  "
+        };
+        lines.push(Line::from(format!(
+            "{prefix}{}  [local]  [remote]",
+            conflict.path
+        )));
+    }
+    if prepared.plan.conflicts.len() > 6 {
+        lines.push(Line::from(format!(
+            "  ... and {} more",
+            prepared.plan.conflicts.len() - 6
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Up/Down select conflict"));
+    lines.push(Line::from(vec![
+        Span::styled("[L] Keep local value", Style::default().fg(GREEN.into())),
+        Span::raw("    "),
+        Span::styled(
+            "[R] Use remote value",
+            Style::default().fg(Color::Rgb(239, 192, 101)),
+        ),
+        Span::raw("    Esc Cancel"),
+    ]));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(" Resolve sync conflicts ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER.into()))
+                .style(Style::default().bg(PANEL.into())),
+        ),
+        area,
     );
 }
 
@@ -5050,7 +5236,32 @@ mod tests {
         assert!(text.contains("Workspace tabs"));
         assert!(text.contains("Configuration"));
         assert!(text.contains("Import credentials"));
+        assert!(text.contains("Configuration sync"));
         assert_eq!(text.matches("▸").count(), 1);
+    }
+
+    #[test]
+    fn sync_settings_modal_shows_remote_branch_and_sync_action() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Settings;
+        app.sync_settings.remote = "git@example.test:team/config.git".into();
+        app.sync_settings.branch = "main".into();
+        app.sync_dialog = Some(crate::app::SyncSettingsDialog {
+            remote: app.sync_settings.remote.clone(),
+            branch: app.sync_settings.branch.clone(),
+            selected: 4,
+            testing: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("git@example.test:team/config.git"));
+        assert!(text.contains("main"));
+        assert!(text.contains("Sync now"));
+        assert!(text.contains("private remote"));
     }
 
     #[test]

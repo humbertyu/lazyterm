@@ -6,9 +6,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Host {
     pub alias: String,
     pub hostname: Option<String>,
@@ -168,6 +168,19 @@ impl HostCatalog {
         original_alias: Option<&str>,
     ) -> io::Result<()> {
         validate_host_values(host)?;
+        let _lock = config_lock(ssh_dir)?;
+        let current = Self::load_from(path, ssh_dir);
+        if let Some(error) = current.error {
+            return Err(io::Error::other(error));
+        }
+        if let Some(alias) = original_alias
+            && self.hosts.iter().find(|entry| entry.alias == alias)
+                != current.hosts.iter().find(|entry| entry.alias == alias)
+        {
+            return Err(io::Error::other(
+                "SSH Host changed since it was loaded; refresh before saving.",
+            ));
+        }
         let files = Self::snapshot_from(path, ssh_dir)?;
         if let Some(original_alias) = original_alias {
             if host.alias != original_alias
@@ -224,6 +237,17 @@ impl HostCatalog {
     }
 
     pub fn delete_host(&mut self, alias: &str) -> io::Result<()> {
+        let path = Self::config_path().ok_or_else(|| io::Error::other("HOME is not set"))?;
+        let _lock = config_lock(path.parent().unwrap())?;
+        let current = Self::load();
+        if current.error.is_some()
+            || self.hosts.iter().find(|entry| entry.alias == alias)
+                != current.hosts.iter().find(|entry| entry.alias == alias)
+        {
+            return Err(io::Error::other(
+                "SSH Host changed; refresh before deleting.",
+            ));
+        }
         let files = Self::config_snapshot()?;
         let mut changes = Vec::new();
         for (path, contents) in files {
@@ -245,6 +269,8 @@ impl HostCatalog {
     }
 
     pub fn set_identity(&mut self, alias: &str, path: &Path) -> io::Result<()> {
+        let config_path = Self::config_path().ok_or_else(|| io::Error::other("HOME is not set"))?;
+        let _lock = config_lock(config_path.parent().unwrap())?;
         let path_text = path
             .to_str()
             .ok_or_else(|| io::Error::other("Key path is not valid UTF-8"))?;
@@ -269,6 +295,23 @@ impl HostCatalog {
         }
         Err(io::Error::other("Host was not found in SSH config"))
     }
+}
+
+fn config_lock(ssh_dir: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if !ssh_dir.exists() {
+        fs::create_dir_all(ssh_dir)?;
+        fs::set_permissions(ssh_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(ssh_dir.join(".lazyterm-config.lock"))?;
+    lock.lock()?;
+    Ok(lock)
 }
 
 fn replace_identity(contents: &str, alias: &str, path: &str) -> io::Result<Option<String>> {
@@ -950,7 +993,7 @@ pub(crate) fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn expand_include(include: &str, ssh_dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn expand_include(include: &str, ssh_dir: &Path) -> io::Result<Vec<PathBuf>> {
     if include.contains('%') || include.contains("${") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1209,6 +1252,29 @@ mod tests {
                 .lines()
                 .any(|line| line == "proxyjump ops@bastion:2222,relay")
         );
+    }
+
+    #[test]
+    fn stale_host_edit_preserves_newer_configuration() {
+        let fixture = crate::projects::tests::Fixture::new("stale-host-cli-edit");
+        let ssh_dir = fixture.root.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        let config = ssh_dir.join("config");
+        fs::write(&config, "Host web\n  HostName old.example\n").unwrap();
+        let mut stale = HostCatalog::load_from(&config, &ssh_dir);
+        let mut host = stale.hosts[0].clone();
+        host.user = Some("deploy".into());
+        fs::write(
+            &config,
+            "Host web\n  HostName new.example\n  ServerAliveInterval 42\n",
+        )
+        .unwrap();
+        let before = fs::read(&config).unwrap();
+        let error = stale
+            .upsert_from_paths(&config, &ssh_dir, &host, Some("web"))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(before, fs::read(&config).unwrap());
     }
 
     #[test]

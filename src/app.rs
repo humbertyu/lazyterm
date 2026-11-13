@@ -217,6 +217,11 @@ pub struct App {
     pub selected_host: usize,
     pub selected_setting: usize,
     pub settings_picker: Option<SettingsPicker>,
+    pub sync_settings: crate::sync::SyncSettings,
+    pub sync_dialog: Option<SyncSettingsDialog>,
+    pub sync_test_pending: Option<crate::sync::ConnectionTest>,
+    pub sync_worker: Option<Receiver<Result<crate::sync_engine::SyncResult, String>>>,
+    pub sync_conflicts: Option<crate::sync_engine::Prepared>,
     pub selected_browse_item: usize,
     pub viewport_width: u16,
     pub viewport_height: u16,
@@ -318,6 +323,14 @@ pub struct App {
     next_snippet_run_id: u64,
     tunnel_errors: std::collections::HashMap<uuid::Uuid, String>,
     tunnel_retries: std::collections::HashMap<uuid::Uuid, TunnelRetry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SyncSettingsDialog {
+    pub remote: String,
+    pub branch: String,
+    pub selected: usize,
+    pub testing: bool,
 }
 
 type AuthenticationSave = (
@@ -815,6 +828,11 @@ impl App {
             selected_host: 0,
             selected_setting: 0,
             settings_picker: None,
+            sync_settings: crate::sync::SyncSettings::load(),
+            sync_dialog: None,
+            sync_test_pending: None,
+            sync_worker: None,
+            sync_conflicts: None,
             selected_browse_item: 0,
             viewport_width: 80,
             viewport_height: 24,
@@ -2734,7 +2752,11 @@ impl App {
         viewport_width: u16,
         viewport_height: u16,
     ) -> InputAction {
-        if self.settings_picker.is_some() || self.credentials_modal() {
+        if self.settings_picker.is_some()
+            || self.sync_dialog.is_some()
+            || self.sync_conflicts.is_some()
+            || self.credentials_modal()
+        {
             return InputAction::None;
         }
         if self.host_dialog.is_some()
@@ -3548,6 +3570,40 @@ impl App {
     }
 
     pub fn handle_event(&mut self, key: KeyEvent) -> InputAction {
+        if self.sync_conflicts.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(prepared) = self.sync_conflicts.as_mut() {
+                        prepared.conflict_selection = prepared.conflict_selection.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(prepared) = self.sync_conflicts.as_mut() {
+                        prepared.conflict_selection = (prepared.conflict_selection + 1)
+                            .min(prepared.plan.conflicts.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => self.resolve_sync_conflicts(false),
+                KeyCode::Char('r') | KeyCode::Char('R') => self.resolve_sync_conflicts(true),
+                KeyCode::Esc => {
+                    self.sync_conflicts = None;
+                    if let Some(dialog) = self.sync_dialog.as_mut() {
+                        dialog.testing = false;
+                    }
+                }
+                _ => {}
+            }
+            return InputAction::None;
+        }
+        if self.sync_dialog.is_some() {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                self.handle_sync_settings_key(key.code);
+            }
+            return InputAction::None;
+        }
         if self.settings_picker.is_some() {
             if !key
                 .modifiers
@@ -3743,14 +3799,24 @@ impl App {
             self.notice = Some("Configuration export cancelled.".into());
             return;
         };
-        let ssh_config_files = match HostCatalog::config_snapshot() {
-            Ok(files) => files,
-            Err(error) => {
-                self.notice = Some(format!("Could not read SSH config for export: {error}"));
-                return;
-            }
-        };
         let ssh_config_path = HostCatalog::config_path();
+        let ssh_config_files = match ssh_config_path.as_deref() {
+            Some(config_path) => {
+                let Some(ssh_root) = config_path.parent() else {
+                    self.notice = Some("Could not locate the SSH config directory.".into());
+                    return;
+                };
+                match crate::import_export::portable_ssh_snapshot(config_path, ssh_root) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        self.notice =
+                            Some(format!("Could not read SSH config for export: {error}"));
+                        return;
+                    }
+                }
+            }
+            None => std::collections::BTreeMap::new(),
+        };
         let ssh_config = ssh_config_path
             .as_ref()
             .and_then(|config_path| fs::canonicalize(config_path).ok())
@@ -3800,6 +3866,249 @@ impl App {
             }
             11 => self.import_configuration(),
             12 => self.import_credentials(),
+            13 => {
+                self.sync_dialog = Some(SyncSettingsDialog {
+                    remote: self.sync_settings.remote.clone(),
+                    branch: if self.sync_settings.branch.is_empty() {
+                        "main".into()
+                    } else {
+                        self.sync_settings.branch.clone()
+                    },
+                    selected: 0,
+                    testing: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    pub fn poll_sync_test(&mut self) {
+        let Some(pending) = &self.sync_test_pending else {
+            self.poll_sync_worker();
+            return;
+        };
+        match pending.try_result() {
+            Ok(Some(Ok(()))) => {
+                self.sync_test_pending = None;
+                self.notice =
+                    Some("Git remote connection succeeded. Data sync is not enabled yet.".into());
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = false;
+                }
+            }
+            Ok(Some(Err(error))) => {
+                self.sync_test_pending = None;
+                self.notice = Some(error);
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = false;
+                }
+            }
+            Err(_) => {
+                self.sync_test_pending = None;
+                self.notice = Some("Git connection test stopped unexpectedly.".into());
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = false;
+                }
+            }
+            Ok(None) => {}
+        }
+        self.poll_sync_worker();
+    }
+
+    fn poll_sync_worker(&mut self) {
+        let Some(worker) = &self.sync_worker else {
+            return;
+        };
+        match worker.try_recv() {
+            Ok(Ok(crate::sync_engine::SyncResult::Prepared(prepared))) => {
+                self.sync_worker = None;
+                if prepared.plan.conflicts.is_empty() {
+                    self.start_sync_apply(*prepared);
+                } else {
+                    self.sync_conflicts = Some(*prepared);
+                    self.notice = None;
+                }
+            }
+            Ok(Ok(crate::sync_engine::SyncResult::Applied(metadata))) => {
+                self.sync_worker = None;
+                self.metadata = *metadata;
+                self.hosts = HostCatalog::load();
+                self.reconcile_metadata();
+                self.refresh_host_key_sources();
+                self.project_service.restore(&self.metadata.projects);
+                self.notice = Some("Configuration sync completed.".into());
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = false;
+                }
+            }
+            Ok(Err(error)) => {
+                self.sync_worker = None;
+                self.reload_after_sync_attempt();
+                self.notice = Some(crate::diagnostics::redact_sensitive_text(&error));
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = false;
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.sync_worker = None;
+                self.reload_after_sync_attempt();
+                self.notice = Some("Configuration sync worker stopped unexpectedly.".into());
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = false;
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn reload_after_sync_attempt(&mut self) {
+        self.hosts = HostCatalog::load();
+        if let Ok(metadata) = Metadata::load() {
+            self.metadata = metadata;
+            self.reconcile_metadata();
+            self.refresh_host_key_sources();
+            self.project_service.restore(&self.metadata.projects);
+        }
+    }
+
+    fn start_sync_apply(&mut self, prepared: crate::sync_engine::Prepared) {
+        match crate::sync_engine::apply(prepared) {
+            Ok(worker) => {
+                self.sync_worker = Some(worker.receiver);
+                self.notice = Some("Applying validated sync and pushing to Git...".into());
+            }
+            Err(error) => {
+                self.notice = Some(format!("Could not start sync apply: {error}"));
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = false;
+                }
+            }
+        }
+    }
+
+    fn start_sync_prepare(&mut self, settings: crate::sync::SyncSettings) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.notice = Some("HOME is not set; cannot synchronize SSH configuration.".into());
+            return;
+        };
+        let metadata_path = match self.metadata_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(format!("Could not locate LazyTerm configuration: {error}"));
+                return;
+            }
+        };
+        let directory = match Metadata::data_dir() {
+            Ok(path) => path.join("sync"),
+            Err(error) => {
+                self.notice = Some(format!("Could not locate sync state directory: {error}"));
+                return;
+            }
+        };
+        match crate::sync_engine::prepare(settings, home, metadata_path, directory) {
+            Ok(worker) => {
+                self.sync_worker = Some(worker.receiver);
+                self.notice = Some("Comparing local configuration with Git remote...".into());
+                if let Some(dialog) = self.sync_dialog.as_mut() {
+                    dialog.testing = true;
+                }
+            }
+            Err(error) => self.notice = Some(format!("Could not start sync: {error}")),
+        }
+    }
+
+    fn resolve_sync_conflicts(&mut self, use_remote: bool) {
+        let Some(mut prepared) = self.sync_conflicts.take() else {
+            return;
+        };
+        match prepared.resolve_selected(use_remote) {
+            Ok(()) if prepared.plan.conflicts.is_empty() => self.start_sync_apply(prepared),
+            Ok(()) => self.sync_conflicts = Some(prepared),
+            Err(error) => {
+                self.sync_conflicts = Some(prepared);
+                self.notice = Some(format!("Could not resolve sync conflicts: {error}"));
+            }
+        }
+    }
+
+    fn handle_sync_settings_key(&mut self, key: KeyCode) {
+        let Some(dialog) = self.sync_dialog.as_mut() else {
+            return;
+        };
+        match key {
+            KeyCode::Esc if dialog.testing => {}
+            KeyCode::Esc => self.sync_dialog = None,
+            KeyCode::Tab | KeyCode::Down => dialog.selected = (dialog.selected + 1) % 5,
+            KeyCode::BackTab | KeyCode::Up => dialog.selected = dialog.selected.wrapping_add(4) % 5,
+            KeyCode::Backspace if dialog.selected == 0 => {
+                dialog.remote.pop();
+            }
+            KeyCode::Backspace if dialog.selected == 1 => {
+                dialog.branch.pop();
+            }
+            KeyCode::Char(character) if dialog.selected == 0 => dialog.remote.push(character),
+            KeyCode::Char(character) if dialog.selected == 1 => dialog.branch.push(character),
+            KeyCode::Enter if dialog.selected == 2 => {
+                let settings = crate::sync::SyncSettings {
+                    remote: dialog.remote.trim().to_string(),
+                    branch: dialog.branch.trim().to_string(),
+                };
+                match settings
+                    .validate()
+                    .and_then(|()| settings.save().map_err(|error| error.to_string()))
+                {
+                    Ok(()) => {
+                        self.sync_settings = settings;
+                        self.notice = Some("Git sync settings saved.".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
+            KeyCode::Enter if dialog.selected == 3 && !dialog.testing => {
+                let settings = crate::sync::SyncSettings {
+                    remote: dialog.remote.trim().to_string(),
+                    branch: dialog.branch.trim().to_string(),
+                };
+                match crate::sync::ConnectionTest::start(settings) {
+                    Ok(test) => {
+                        dialog.testing = true;
+                        self.sync_test_pending = Some(test);
+                        self.notice = Some("Testing Git remote connection...".into());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
+            KeyCode::Enter if dialog.selected == 4 && !dialog.testing => {
+                let settings = crate::sync::SyncSettings {
+                    remote: dialog.remote.trim().to_string(),
+                    branch: dialog.branch.trim().to_string(),
+                };
+                match settings
+                    .validate()
+                    .and_then(|()| settings.save().map_err(|error| error.to_string()))
+                {
+                    Ok(()) => {
+                        self.sync_settings = settings.clone();
+                        self.start_sync_prepare(settings);
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        let Some(dialog) = self.sync_dialog.as_mut() else {
+            return;
+        };
+        let value = text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>();
+        match dialog.selected {
+            0 => dialog.remote.push_str(&value),
+            1 => dialog.branch.push_str(&value),
             _ => {}
         }
     }
@@ -4405,11 +4714,15 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, key: KeyCode) {
+        if self.sync_dialog.is_some() {
+            self.handle_sync_settings_key(key);
+            return;
+        }
         if self.settings_picker.is_some() {
             self.handle_settings_picker_key(key);
             return;
         }
-        let count = 13;
+        let count = 14;
         match key {
             KeyCode::Up => {
                 self.selected_setting = self.selected_setting.saturating_sub(1);
@@ -4451,6 +4764,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.sync_dialog.is_some() {
+            self.handle_sync_settings_key(key);
+            return;
+        }
         if self.host_group_dialog.is_some() {
             self.handle_host_group_dialog_key(key);
             return;
@@ -7326,6 +7643,30 @@ mod tests {
         assert!(!app.visible_sections().contains(&NavSection::Hosts));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.section, NavSection::Files);
+    }
+
+    #[test]
+    fn sync_settings_modal_owns_navigation_and_text_input() {
+        let mut app = app_fixture();
+        app.section = NavSection::Settings;
+        app.selected_setting = 13;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        app.sync_dialog.as_mut().unwrap().remote.clear();
+        app.sync_dialog.as_mut().unwrap().branch = "main".into();
+        assert_eq!(app.sync_dialog.as_ref().unwrap().branch, "main");
+
+        app.handle_paste("git@example.test:team/config.git\n");
+        assert_eq!(
+            app.sync_dialog.as_ref().unwrap().remote,
+            "git@example.test:team/config.git"
+        );
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(app.sync_dialog.as_ref().unwrap().branch, "maind");
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.section, NavSection::Settings);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.sync_dialog.is_none());
     }
 
     #[test]

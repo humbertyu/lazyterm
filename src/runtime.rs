@@ -228,7 +228,7 @@ pub fn kill_async(sender: Sender<RuntimeEvent>, target: RuntimeTarget, pid: u32,
     });
 }
 
-fn inspect(
+pub(crate) fn inspect(
     target: &RuntimeTarget,
     owners: &[ProjectOwner],
     tunnels: &[crate::metadata::TunnelDefinition],
