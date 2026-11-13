@@ -4,7 +4,7 @@ LazyTerm is early-stage software. This roadmap describes intended release bounda
 
 ## Current
 
-Host management and native SSH are implemented in development, with the v0.1 acceptance gaps below still open. v0.2 has started with shared host context and an initial library-backed SFTP directory browser; the native `sftp` client remains a compatibility path. This is not a completed or tagged release; tunnel management, credential storage, and snippets remain open.
+The integrated v0.1-v0.6 workflows are implemented on the `v0.6-beta-hardening` development branch, including native SSH, embedded SFTP, tunnels, snippets, Runtime, Projects, credential import/export, crash recovery, and a macOS Universal Binary release pipeline. v0.1 and v0.2 are historical implementation milestones, not pending feature lists; their remaining items below are specific coverage, scope, or acceptance gaps. v0.6 is still beta work: cross-module user acceptance, full localization, native hosted release CI, publication, and signing/notarization gates remain open. No public release is implied.
 
 ## Delivery Strategy
 
@@ -41,42 +41,42 @@ Goal: manage common SSH host profiles and enter reliable native OpenSSH sessions
 - [x] Search and select hosts.
 - [x] Add a host from the TUI with alias, hostname, username, port, and identity file.
 - [x] Edit and delete basic hosts created or managed by LazyTerm.
-- [ ] Write basic host fields safely without exposing or storing passwords.
-- [ ] Preserve unrelated comments, `Include` directives, advanced OpenSSH options, and unmanaged host blocks where possible.
+- [x] Write basic host fields safely without exposing or storing passwords.
+- [x] Preserve unrelated comments, `Include` directives, advanced OpenSSH options, and unmanaged host blocks when updating managed entries. Full OpenSSH grammar support remains out of scope.
 - [x] Show confirmation before deleting a managed host.
 - [ ] Fully validate alias conflicts across included files; keep overwrites refused unless explicitly confirmed.
 - [x] Support tag-based groups as separate, versioned LazyTerm metadata.
 - [x] Clean up metadata for removed SSH aliases on startup/refresh; retain it when discovery fails.
 - [ ] Support favorites.
-- [ ] Launch `ssh <alias>` with inherited terminal and return cleanly to the TUI.
-- [ ] Preserve OpenSSH host-key verification, identity files, `ssh-agent`, `ProxyJump`, and `ProxyCommand`.
-- [ ] Show connection exit status and useful errors.
-- [ ] Support macOS first and document the tested OpenSSH/Rust versions.
+- [x] Launch `ssh <alias>` with inherited terminal and return cleanly to the TUI.
+- [x] Preserve OpenSSH host-key verification, identity files, `ssh-agent`, `ProxyJump`, and `ProxyCommand`.
+- [x] Show connection exit status and useful errors.
+- [x] Support macOS first and document the locally tested OpenSSH/Rust versions. Native multi-machine acceptance remains open.
 
 Release gate: a clean install can discover or create a normal OpenSSH host, edit or remove a LazyTerm-managed host safely, connect to a host, and return to the TUI without corrupting the terminal.
 
-### v0.1.0 Audit - 2026-11-06
+### v0.1.0 Audit - 2026-11-13
 
-The release gate is **not yet met**. Checked boxes above record implemented behavior, not full release acceptance.
+The historical implementation is substantially complete; this is not a claim that v0.1 shipped or passed full user acceptance.
 
-- Safe writing: backups, atomic replacement, private permissions on newly created files, and protection of neighboring managed markers are implemented and tested. Input quoting/validation, included-file alias conflicts, and preservation of manually added advanced options/comments inside a managed block still need dedicated coverage and hardening.
-- SSH acceptance: verify first-time host-key confirmation, changed-key rejection, password/key authentication, ProxyJump/ProxyCommand, and terminal restoration on success, failure, and interruption against disposable SSH fixtures.
+- Safe writing: backups, atomic replacement, private permissions on newly created files, protection of neighboring managed markers, and preservation of manually added advanced options/comments inside managed blocks are implemented and tested. Full OpenSSH grammar and every alias collision across complex Include expansion still need broader coverage.
+- SSH acceptance: automated disposable fixtures cover password authentication, ProxyJump, and related connection flows. Complete manual acceptance of first-time host-key confirmation, changed-key rejection, key/agent authentication, ProxyCommand, and terminal restoration on success, failure, and interruption remains open.
 - SSH responsiveness: preflight currently blocks the event loop and cannot be cancelled. It runs a remote `true` command, so restricted-command accounts may fail preflight despite supporting the intended session.
-- Error handling: a missing/unlaunchable SSH executable now stays in a TUI error dialog. Process supervision and simulated process/terminal integration tests remain open.
+- Error handling: a missing/unlaunchable SSH executable stays in a TUI error dialog; managed process cleanup and recovery are implemented. Full cross-platform terminal/process acceptance remains open.
 - Persistence: groups and tags are implemented; favorites are not. The legacy `view` metadata property remains readable but no longer selects separate Groups/Hosts pages.
-- Environment: local checks ran with Rust 1.92.0 and system OpenSSH 9.9p2 (LibreSSL 3.3.6) on macOS. This does not constitute a tested support matrix.
-- Release preparation: finish the remaining safety and SSH checks, publish release notes, and only then tag a release. Package version `0.1.0` alone does not mean a release has shipped.
+- Environment: local checks ran with Rust 1.92.0 and system OpenSSH 9.9p2 (LibreSSL 3.3.6) on macOS 15.8.1 Apple Silicon. The release workflow targets macOS 15 Intel and Apple Silicon; its hosted native run is still a release gate.
+- Release preparation and beta checks are tracked under v0.6; package versions do not imply a release has shipped.
 
 ## v0.2.0 - Integrated Files / SFTP
 
-Goal: use the Hosts catalog for file workflows, without a second host database. Grow the initial in-TUI directory browser into a complete Files workflow. Saved-password automation is not a prerequisite for starting Files.
+Goal: use the Hosts catalog for file workflows, without a second host database. The embedded directory browser, transfer controls, and shared authentication are implemented; this milestone records the progression from the initial browser to the integrated Files workflow.
 
 - [x] Carry a stable selected-host alias from Hosts into other modules.
 - [x] Add a native `sftp` handoff using that alias and restore the TUI on exit; this remains a compatibility bridge.
 - [x] Retain host context across tabs, migrate it on in-app rename, and clear it when refresh confirms the alias is gone.
-- [ ] Verify context behavior end to end with SSH config edits, refresh failures, and renamed managed aliases.
+- [x] Verify the Hosts -> Files -> Hosts context flow end to end against a disposable SSH/SFTP fixture. Additional manual edge-case acceptance for external SSH config edits and refresh failures remains open.
 - [x] Select and document `openssh` plus `openssh-sftp-client` for the embedded browser; retain OpenSSH configuration and strict host-key checking.
-- [ ] Share host resolution and credential lookup across SSH and SFTP.
+- [x] Share current Host resolution and saved-password lookup across native SSH and embedded SFTP.
 - [x] List a remote directory, inspect basic entry metadata, enter directories, and return to the parent.
 - [x] Build the first integrated Files browser slice with a persistent local pane, remote pane, and Groups/Hosts picker.
 - [x] Extend the dual-pane browser with single-file transfers and progress reporting.
@@ -92,15 +92,7 @@ Goal: use the Hosts catalog for file workflows, without a second host database. 
 - [x] Verify the integrated Hosts -> Files -> Hosts workflow against a disposable SSH/SFTP fixture.
 - [x] Reuse one live SFTP connection per host inside a dedicated background Tokio service; the cache is isolated to the LazyTerm process and ends with that service.
 
-An opt-in disposable `sshd` fixture covers the embedded SFTP transport and the application-level Hosts -> Files -> Hosts context flow. Broader refresh, rename, and failure-path acceptance remains tracked separately.
-
-Deferred credential track:
-
-- [ ] Add a macOS Keychain-backed credential store.
-- [ ] Support password authentication without writing secrets to config, arguments, environment, or logs.
-- [ ] Complete a security and behavior spike for supplying a saved password to native OpenSSH; do not ship an `sshpass` dependency.
-
-Password authentication and first-use host-key confirmation remain outside the embedded browser until the backend can provide secure callbacks. The current `openssh` adapter requires non-interactive authentication and strict known-hosts validation; the native `sftp` handoff remains the compatibility path for interactive prompts.
+An opt-in disposable `sshd` fixture covers the embedded SFTP transport and the application-level Hosts -> Files -> Hosts context flow. Broader manual refresh, external-config rename, and failure-path acceptance remains tracked separately. The former credential spike is complete: the Keychain-backed store and shared scoped authentication prompt are implemented; no `sshpass` dependency is used. First-time host-key approval in background/noninteractive workflows and encrypted private-key passphrase storage remain unsupported.
 
 Release gate: SSH and SFTP use the same host identity and authentication policy; transfers handle interruption without freezing the TUI.
 
@@ -190,7 +182,7 @@ Goal: make the integrated v0.5 workflows recoverable, diagnosable, installable, 
 - [x] Introduce additive metadata schema migration with version validation and a pre-migration backup using the existing bounded backup rotation.
 - [x] Review diagnostics, credentials, exports/backups, process ownership and release packaging; fix repeated/quoted/header/stream-boundary redaction, mask Project Web Link Debug passwords, separate trusted OpenSSH auth logs from remote stderr, and upgrade rustix after advisory scanning. Document sensitive raw-command logs, dormant/maintenance dependency findings and remaining manual acceptance in docs/SECURITY-REVIEW.md.
 - [x] Recovery behavior for killed TUI, Tunnel, and independent Project runner processes: ownership-pipe guards clean abandoned managed groups; surviving persistent runners reattach; dead runner records reconcile without signaling saved PIDs. Isolated SIGKILL tests cover cleanup, restart, and unrelated-process isolation.
-- [x] Prepare macOS arm64/x86_64 release builds with native CI matrix, ad-hoc signature/system-library/deployment-target checks and version/diagnostics smoke tests. Both architectures build locally; Intel execution verified under Rosetta. Hosted native runs remain a publication gate.
+- [x] Prepare macOS Universal Binary release builds from independently validated arm64/x86_64 slices, with ad-hoc signature/system-library/deployment-target checks and version/diagnostics smoke tests. The combined binary runs locally under both architectures; Intel execution is verified under Rosetta. Hosted native runs remain a publication gate.
 - [x] Add installation/upgrade/backup/uninstall and support-matrix documentation, explicit-allowlist Universal Binary archive, SHA256SUMS and a generated Homebrew Formula using one download for Intel and Apple Silicon. Combine validated per-CPU builds with lipo, sign again, and verify the final package on both native CI runners. A published tap/assets, native-hosted acceptance and Developer ID/notarization remain external release steps; no release has been published.
 - [ ] User testing of SSH, SFTP, credentials, tunnels, snippets, Runtime, and Projects.
 - [x] Add the first Settings surface for theme, language, tab visibility, and metadata-only export.
