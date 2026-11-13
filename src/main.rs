@@ -1,4 +1,5 @@
 mod app;
+mod authentication;
 mod credential_app;
 mod credential_ui;
 mod credentials;
@@ -8,6 +9,7 @@ mod i18n;
 mod import_export;
 mod instance;
 mod metadata;
+mod native_connection;
 mod project_app;
 mod project_credentials;
 mod project_monitor;
@@ -40,6 +42,12 @@ use ratatui::DefaultTerminal;
 use crate::app::{App, ConnectionDialog, InputAction};
 
 fn main() -> Result<()> {
+    if std::env::var_os("LAZYTERM_AUTH_SOCKET").is_some() {
+        if crate::authentication::askpass().is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if std::env::var_os("LAZYTERM_ASKPASS_REFERENCE").is_some() {
         if crate::credentials::askpass().is_err() {
             std::process::exit(1);
@@ -82,6 +90,8 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         app.poll_projects();
         app.poll_runtime();
         app.poll_credentials();
+        app.poll_authentication();
+        poll_native_connection(terminal, &mut app)?;
         app.update_toast();
         let size = terminal.size()?;
         app.viewport_width = size.width;
@@ -169,222 +179,90 @@ fn open_files(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         return Ok(());
     };
 
-    let mut command = Command::new("sftp");
-    let username = app.host_password_username(&host.alias);
-    if let Some(username) = username {
-        command.arg("-l").arg(username);
-    }
-    if let Some(reference) = app.host_password_reference(&host.alias) {
-        command.args(["-o", "BatchMode=no"]);
-        if let Err(error) = crate::credentials::configure_password_for(
-            &mut command,
-            reference,
-            &host.alias,
-            username,
-        ) {
-            app.notice = Some(format!("Could not prepare saved password: {error}"));
-            return Ok(());
-        }
-    }
-
-    terminal.show_cursor()?;
-    execute!(io::stdout(), DisableMouseCapture)?;
-    ratatui::restore();
-    execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show)?;
-    let result = command
-        .arg(&host.alias)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-
-    let notice = match result {
-        Ok(status) if status.success() => format!("SFTP session to {} ended.", host.alias),
-        Ok(status) => format!("SFTP to {} failed ({})", host.alias, exit_status(status)),
-        Err(error) => format!("Could not start OpenSSH sftp: {error}"),
-    };
-
-    execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Hide)?;
-    enable_raw_mode()?;
-    *terminal = ratatui::init();
-    execute!(io::stdout(), EnableMouseCapture)?;
-    terminal.clear()?;
-    app.notice = Some(notice);
-    Ok(())
+    begin_native_connection(terminal, app, host.alias, native_connection::Kind::Sftp)
 }
 
 fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     let Some(host) = app.selected_host().cloned() else {
         return Ok(());
     };
-    let submitted = app.take_pending_host_password();
-    let saved_username = app.host_password_username(&host.alias).map(str::to_string);
-    let username = submitted
-        .as_ref()
-        .map(|value| value.username.clone())
-        .or_else(|| saved_username.clone());
-    let saved_reference = app.host_password_reference(&host.alias).map(str::to_string);
-    let mut prepared = if let Some(value) = &submitted {
-        match crate::project_credentials::prepare_credential(value.password.clone()).recv() {
-            Ok(Ok(prepared)) => Some(prepared),
-            Ok(Err(error)) => {
-                app.notice = Some(format!(
-                    "Could not prepare password in system Keychain: {error}"
-                ));
-                return Ok(());
-            }
-            Err(_) => {
-                app.notice = Some("Password Keychain worker stopped.".into());
-                return Ok(());
-            }
-        }
-    } else {
-        None
-    };
-    let password_reference = prepared
-        .as_ref()
-        .map(|value| value.reference.clone())
-        .or(saved_reference.clone());
+    begin_native_connection(terminal, app, host.alias, native_connection::Kind::Shell)
+}
 
-    app.connection_dialog = Some(ConnectionDialog {
-        title: format!("Connecting to {}", host.alias),
-        message: "Checking SSH authentication...".to_string(),
-        pending: true,
-        scroll: 0,
-    });
-    terminal.draw(|frame| ui::render(frame, app))?;
-    let mut preflight_command = Command::new("ssh");
-    if let Some(username) = &username {
-        preflight_command.arg("-l").arg(username);
+fn begin_native_connection(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    alias: String,
+    kind: native_connection::Kind,
+) -> io::Result<()> {
+    if app.native_connection.is_some() {
+        app.notice = Some("A connection is already being prepared.".into());
+        return Ok(());
     }
-    preflight_command.args([
-        "-v",
-        "-o",
-        "RequestTTY=no",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "NumberOfPasswordPrompts=1",
-    ]);
-    if let Some(reference) = password_reference.as_deref() {
-        preflight_command.args(["-o", "BatchMode=no"]);
-        if let Err(error) = crate::credentials::configure_password_for(
-            &mut preflight_command,
-            reference,
-            &host.alias,
-            username.as_deref(),
-        ) {
-            app.connection_dialog = None;
-            app.notice = Some(format!("Could not prepare Host password: {error}"));
-            return Ok(());
+    match native_connection::Pending::start(alias.clone(), kind, app.host_password_auth(&alias)) {
+        Ok(pending) => {
+            app.native_connection = Some(pending);
+            app.connection_dialog = Some(ConnectionDialog {
+                title: format!("Connecting to {alias}"),
+                message: "Authenticating SSH connection...".into(),
+                pending: true,
+                cancelable: true,
+                scroll: 0,
+            });
         }
-    } else {
-        preflight_command.args(["-o", "BatchMode=yes"]);
+        Err(error) => app.notice = Some(format!("Could not prepare SSH connection: {error}")),
     }
-    let preflight = match preflight_command
-        .arg(&host.alias)
-        .arg("true")
-        .stdin(Stdio::null())
-        .output()
-    {
-        Ok(output) => output,
+    terminal.draw(|frame| ui::render(frame, app))?;
+    Ok(())
+}
+
+fn poll_native_connection(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
+    app.poll_authentication();
+    if app.authentication_saving() {
+        return Ok(());
+    }
+    let Some(pending) = &app.native_connection else {
+        return Ok(());
+    };
+    let result = match pending.receiver.try_recv() {
+        Ok(result) => result,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(io::Error::other("SSH connection worker stopped."))
+        }
+    };
+    let alias = pending.alias.clone();
+    app.native_connection = None;
+    let connection = match result {
+        Ok(connection) => connection,
         Err(error) => {
             app.connection_dialog = Some(ConnectionDialog {
-                title: format!("Connection to {} failed", host.alias),
-                message: format!("Could not start OpenSSH: {error}"),
+                title: format!("Connection to {alias} failed"),
+                message: crate::diagnostics::redact_sensitive_text(&error.to_string()),
                 pending: false,
+                cancelable: false,
                 scroll: 0,
             });
             return Ok(());
         }
     };
-    let detail = String::from_utf8_lossy(&preflight.stderr);
-    if !preflight.status.success() {
-        app.connection_dialog = None;
-        if needs_interactive_auth(&detail) {
-            if submitted.is_none() && saved_reference.is_some() {
-                app.unlink_host_password(&host.alias);
-            }
-            let save = submitted
-                .as_ref()
-                .map_or(saved_reference.is_some(), |value| value.save_in_keychain);
-            let username = username
-                .clone()
-                .or_else(|| crate::hosts::ssh_config_user(&host.alias))
-                .or_else(|| host.user.clone())
-                .unwrap_or_default();
-            app.prompt_host_password(
-                host.alias,
-                username,
-                Some(if submitted.is_some() {
-                    "Authentication failed. Check the password and try again.".into()
-                } else if saved_reference.is_some() {
-                    "Saved password was rejected. Enter the current Host password.".into()
-                } else {
-                    "SSH requires a password. Enter the Host password.".into()
-                }),
-                save,
-                crate::app::HostPasswordPurpose::Connect,
-            );
-        } else {
-            app.connection_dialog = Some(ConnectionDialog {
-                title: format!("Connection to {} failed", host.alias),
-                message: ssh_error_detail(&detail, preflight.status),
-                pending: false,
-                scroll: 0,
-            });
-        }
-        return Ok(());
-    }
-    if authenticated_with_public_key(&detail) {
-        app.metadata.host_public_key_auth.insert(host.alias.clone());
-        app.save_metadata();
-    }
-    if let (Some(value), Some(prepared)) = (&submitted, &mut prepared)
-        && value.save_in_keychain
-        && !app.save_host_password_prepared(&host.alias, &value.username, prepared, None)
-    {
-        app.connection_dialog = None;
-        app.notice =
-            Some("Authenticated, but could not save the Host password in Keychain.".into());
-        return Ok(());
-    }
     app.connection_dialog = None;
-
-    let mut command = Command::new("ssh");
-    if let Some(username) = &username {
-        command.arg("-l").arg(username);
-    }
-    if let Some(reference) = password_reference.as_deref() {
-        command.args(["-o", "BatchMode=no"]);
-        if let Err(error) = crate::credentials::configure_password_for(
-            &mut command,
-            reference,
-            &host.alias,
-            username.as_deref(),
-        ) {
-            app.notice = Some(format!("Could not prepare saved password: {error}"));
-            return Ok(());
-        }
-    }
-
-    // Leave Ratatui's alternate screen completely before handing the terminal
-    // to OpenSSH. The preflight above guarantees that failures stay in the TUI.
+    // The terminal client attaches to the authenticated private master, without a second login.
+    let mut command = connection.command();
     terminal.show_cursor()?;
     execute!(io::stdout(), DisableMouseCapture)?;
     ratatui::restore();
     execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show)?;
 
     let result = command
-        .arg(&host.alias)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status();
 
     let notice = match result {
-        Ok(status) if status.success() => format!("SSH session to {} ended.", host.alias),
-        Ok(status) => format!("SSH to {} failed ({})", host.alias, exit_status(status)),
+        Ok(status) if status.success() => format!("Session to {alias} ended."),
+        Ok(status) => format!("Session to {alias} failed ({})", exit_status(status)),
         Err(error) => format!("Could not start OpenSSH: {error}"),
     };
 
@@ -397,68 +275,9 @@ fn connect_selected(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     Ok(())
 }
 
-fn authenticated_with_public_key(stderr: &str) -> bool {
-    stderr
-        .lines()
-        .any(|line| line.contains("Authenticated to ") && line.contains("using \"publickey\""))
-}
-
 fn exit_status(status: ExitStatus) -> String {
     status.code().map_or_else(
         || "terminated by signal".to_string(),
         |code| format!("exit {code}"),
     )
-}
-
-fn ssh_error_detail(stderr: &str, status: ExitStatus) -> String {
-    let detail = stderr.trim();
-    if detail.is_empty() {
-        exit_status(status)
-    } else {
-        crate::diagnostics::redact_sensitive_text(
-            &detail
-                .strip_prefix("ssh: ")
-                .unwrap_or(detail)
-                .replace("\r\n", "\n")
-                .replace('\r', ""),
-        )
-    }
-}
-
-fn needs_interactive_auth(stderr: &str) -> bool {
-    let detail = stderr.to_ascii_lowercase();
-    detail.contains("permission denied")
-        || detail.contains("publickey")
-        || detail.contains("keyboard-interactive")
-        || detail.contains("password")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ssh_error_detail_preserves_warning_line_breaks() {
-        let detail = ssh_error_detail(
-            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\r\nSHA256:fingerprint\r\n",
-            ExitStatus::default(),
-        );
-        assert_eq!(
-            detail,
-            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nSHA256:fingerprint"
-        );
-    }
-
-    #[test]
-    fn public_key_auth_is_only_recorded_when_openssh_confirms_it() {
-        assert!(authenticated_with_public_key(
-            "debug1: Authenticated to host.example ([192.0.2.1]:22) using \"publickey\"."
-        ));
-        assert!(!authenticated_with_public_key(
-            "debug1: Authenticated to host.example ([192.0.2.1]:22) using \"password\"."
-        ));
-        assert!(!authenticated_with_public_key(
-            "debug1: Offering public key: /Users/test/.ssh/id_ed25519"
-        ));
-    }
 }

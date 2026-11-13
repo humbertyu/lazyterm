@@ -17,7 +17,7 @@ pub fn spawn_forward(
     tunnel: &TunnelDefinition,
     events: Sender<TunnelEvent>,
     auth: &crate::credentials::HostAuth,
-) -> io::Result<Child> {
+) -> io::Result<(Child, Option<crate::authentication::Status>)> {
     check_local_bind(tunnel)?;
     let (option, forward) = forward_spec(tunnel)?;
     let mut command = Command::new("ssh");
@@ -42,7 +42,8 @@ pub fn spawn_forward(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    crate::credentials::configure_host_auth(&mut command, auth, &tunnel.host_alias)?;
+    let trace = crate::credentials::configure_host_auth(&mut command, auth, &tunnel.host_alias)?;
+    let authentication = trace.as_ref().map(crate::authentication::Trace::status);
     command.arg(&tunnel.host_alias);
     let mut child = command.spawn()?;
     if let Some(mut stderr) = child.stderr.take() {
@@ -51,7 +52,8 @@ pub fn spawn_forward(
             .name(format!("lazyterm-tunnel-{id}"))
             .spawn(move || {
                 let mut output = String::new();
-                let _ = stderr.read_to_string(&mut output);
+                let _ = crate::authentication::Reader::new(&mut stderr, trace)
+                    .read_to_string(&mut output);
                 let message = crate::diagnostics::redact_sensitive_text(output.trim());
                 if !message.is_empty() {
                     let _ = events.send(TunnelEvent::Stderr { id, message });
@@ -65,7 +67,7 @@ pub fn spawn_forward(
             )));
         }
     }
-    Ok(child)
+    Ok((child, authentication))
 }
 
 pub fn check_local_bind(tunnel: &TunnelDefinition) -> io::Result<()> {

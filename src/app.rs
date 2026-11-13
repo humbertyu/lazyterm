@@ -26,8 +26,8 @@ use crate::metadata::{
 };
 use crate::runtime::{self, RuntimeEntry, RuntimeEvent, RuntimeFilter, RuntimeTarget};
 use crate::sftp::{
-    self, Mutation, MutationEvent, MutationRequest, SftpListing, SftpResult, TransferDirection,
-    TransferEvent, TransferRequest,
+    self, Mutation, MutationEvent, MutationRequest, SftpListing, TransferDirection, TransferEvent,
+    TransferRequest,
 };
 use crate::tunnel;
 
@@ -203,6 +203,11 @@ impl NavSection {
 }
 
 pub struct App {
+    pub native_connection: Option<crate::native_connection::Pending>,
+    pub authentication: Option<crate::authentication::Service>,
+    pub authentication_challenge: Option<crate::authentication::Challenge>,
+    authentication_queue: std::collections::VecDeque<crate::authentication::Challenge>,
+    authentication_saves: Vec<AuthenticationSave>,
     pub credential_manager: crate::credential_app::CredentialState,
     pub workspace: crate::project_app::WorkspaceState,
     pub project_service: crate::projects::ProjectService,
@@ -260,6 +265,10 @@ pub struct App {
     runtime_request: u64,
     pub runtime_loading: bool,
     pub runtime_error: Option<String>,
+    #[cfg(test)]
+    pub(crate) test_auth_config: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) test_auth_askpass: Option<PathBuf>,
     pub runtime_host_picker_open: bool,
     pub runtime_host_picker_group: Option<HostGroup>,
     pub runtime_host_picker_selection: usize,
@@ -293,7 +302,7 @@ pub struct App {
     pub file_dialog: Option<FileDialog>,
     next_transfer_id: u64,
     next_mutation_id: u64,
-    sftp_receiver: Option<Receiver<SftpResult>>,
+    sftp_receiver: Option<sftp::PendingListing>,
     transfer_sender: Sender<TransferEvent>,
     transfer_receiver: Receiver<TransferEvent>,
     mutation_sender: Sender<MutationEvent>,
@@ -304,11 +313,18 @@ pub struct App {
     runtime_sender: Sender<RuntimeEvent>,
     runtime_receiver: Receiver<RuntimeEvent>,
     tunnel_processes: std::collections::HashMap<uuid::Uuid, Child>,
+    tunnel_authentication: std::collections::HashMap<uuid::Uuid, crate::authentication::Status>,
     snippet_processes: std::collections::HashMap<u64, SnippetProcess>,
     next_snippet_run_id: u64,
     tunnel_errors: std::collections::HashMap<uuid::Uuid, String>,
     tunnel_retries: std::collections::HashMap<uuid::Uuid, TunnelRetry>,
 }
+
+type AuthenticationSave = (
+    String,
+    String,
+    Receiver<Result<crate::project_credentials::PreparedPassword, String>>,
+);
 
 #[derive(Clone, Copy, Debug)]
 pub struct SettingsPicker {
@@ -637,12 +653,13 @@ pub struct ConnectionDialog {
     pub title: String,
     pub message: String,
     pub pending: bool,
+    pub cancelable: bool,
     pub scroll: u16,
 }
 
 #[derive(Clone)]
 pub enum HostPasswordPurpose {
-    Connect,
+    Authentication,
     UploadKey {
         credential: crate::credentials::Credential,
         identity_configured: bool,
@@ -654,6 +671,7 @@ pub struct HostPasswordDialog {
     pub username: String,
     pub password: Zeroizing<String>,
     pub save_in_keychain: bool,
+    pub save_allowed: bool,
     pub selected_field: usize,
     pub error: Option<String>,
     pub purpose: HostPasswordPurpose,
@@ -746,6 +764,12 @@ impl App {
 
     pub fn new() -> Self {
         let mut app = Self::with_catalog(HostCatalog::load(), Metadata::load());
+        match crate::authentication::Service::new() {
+            Ok(service) => app.authentication = Some(service),
+            Err(error) => {
+                app.notice = Some(format!("Interactive authentication unavailable: {error}"))
+            }
+        }
         app.reconcile_metadata();
         app.refresh_host_key_sources();
         app.refresh_local_files();
@@ -773,6 +797,11 @@ impl App {
         let (tunnel_sender, tunnel_receiver) = std::sync::mpsc::channel();
         let (runtime_sender, runtime_receiver) = std::sync::mpsc::channel();
         Self {
+            native_connection: None,
+            authentication: None,
+            authentication_challenge: None,
+            authentication_queue: Default::default(),
+            authentication_saves: Vec::new(),
             credential_manager: Default::default(),
             workspace: crate::project_app::WorkspaceState::default(),
             project_service: crate::projects::ProjectService::new(
@@ -834,6 +863,10 @@ impl App {
             selected_runtime: 0,
             runtime_loading: false,
             runtime_error: None,
+            #[cfg(test)]
+            test_auth_config: None,
+            #[cfg(test)]
+            test_auth_askpass: None,
             runtime_host_picker_open: false,
             runtime_host_picker_group: None,
             runtime_host_picker_selection: 0,
@@ -887,6 +920,7 @@ impl App {
             runtime_sender,
             runtime_receiver,
             tunnel_processes: std::collections::HashMap::new(),
+            tunnel_authentication: std::collections::HashMap::new(),
             snippet_processes: std::collections::HashMap::new(),
             next_snippet_run_id: 1,
             tunnel_errors: std::collections::HashMap::new(),
@@ -1033,7 +1067,8 @@ impl App {
         };
         self.active_file_pane = FilePane::Remote;
         self.notice = Some(format!("Loading remote files from {host_alias}..."));
-        self.sftp_receiver = Some(sftp::spawn_list(host_alias, path));
+        let auth = self.host_password_auth(&host_alias);
+        self.sftp_receiver = Some(sftp::spawn_list_with_auth(host_alias, path, auth));
     }
 
     pub fn refresh_local_files(&mut self) {
@@ -1898,7 +1933,8 @@ impl App {
                         host_alias: host_alias.clone(),
                         path: path.clone(),
                     };
-                    self.sftp_receiver = Some(sftp::spawn_list(host_alias, path));
+                    let auth = self.host_password_auth(&host_alias);
+                    self.sftp_receiver = Some(sftp::spawn_list_with_auth(host_alias, path, auth));
                 }
                 MutationEvent::Failed {
                     operation_id,
@@ -1948,16 +1984,45 @@ impl App {
 
         let ids = self.tunnel_processes.keys().copied().collect::<Vec<_>>();
         for id in ids {
+            if self
+                .tunnel_authentication
+                .get(&id)
+                .is_some_and(|auth| auth.cancelled())
+            {
+                if let Some(mut child) = self.tunnel_processes.remove(&id) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                self.tunnel_authentication.remove(&id);
+                self.tunnel_retries.remove(&id);
+                self.tunnel_statuses.insert(id, TunnelStatus::Stopped);
+                continue;
+            }
             let result = self.tunnel_processes.get_mut(&id).map(Child::try_wait);
             let Some(result) = result else {
                 continue;
             };
             match result {
                 Ok(None) => {
-                    self.tunnel_statuses.insert(id, TunnelStatus::Running);
+                    let starting = self
+                        .tunnel_authentication
+                        .get(&id)
+                        .is_some_and(|auth| !auth.authenticated());
+                    self.tunnel_statuses.insert(
+                        id,
+                        if starting {
+                            TunnelStatus::Starting
+                        } else {
+                            TunnelStatus::Running
+                        },
+                    );
                 }
                 Ok(Some(status)) => {
                     self.tunnel_processes.remove(&id);
+                    let authenticated = self
+                        .tunnel_authentication
+                        .remove(&id)
+                        .is_none_or(|auth| auth.authenticated());
                     if status.success() {
                         self.tunnel_errors.remove(&id);
                         self.tunnel_retries.remove(&id);
@@ -1973,6 +2038,7 @@ impl App {
                         if let Some(tunnel) =
                             self.metadata.tunnels.iter().find(|tunnel| tunnel.id == id)
                             && tunnel.auto_reconnect
+                            && authenticated
                         {
                             let retry = self.tunnel_retries.entry(id).or_insert(TunnelRetry {
                                 attempts: 0,
@@ -1992,6 +2058,7 @@ impl App {
                 }
                 Err(error) => {
                     self.tunnel_processes.remove(&id);
+                    self.tunnel_authentication.remove(&id);
                     let message = format!("Could not check tunnel process: {error}");
                     self.tunnel_errors.insert(id, message.clone());
                     self.tunnel_statuses
@@ -2382,7 +2449,10 @@ impl App {
         self.tunnel_retries.remove(&tunnel.id);
         let auth = self.host_password_auth(&tunnel.host_alias);
         match tunnel::spawn_forward(&tunnel, self.tunnel_sender.clone(), &auth) {
-            Ok(child) => {
+            Ok((child, authentication)) => {
+                if let Some(authentication) = authentication {
+                    self.tunnel_authentication.insert(tunnel.id, authentication);
+                }
                 self.tunnel_processes.insert(tunnel.id, child);
                 self.tunnel_statuses
                     .insert(tunnel.id, TunnelStatus::Starting);
@@ -2425,6 +2495,7 @@ impl App {
             let _ = child.wait();
         }
         self.tunnel_errors.remove(&id);
+        self.tunnel_authentication.remove(&id);
         self.tunnel_retries.remove(&id);
         self.tunnel_statuses.insert(id, TunnelStatus::Stopped);
     }
@@ -3073,22 +3144,17 @@ impl App {
                 continue;
             };
             let mut command = std::process::Command::new("ssh");
-            command.args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "RequestTTY=no",
-                "-o",
-                "ConnectTimeout=10",
-            ]);
-            if let Err(error) =
-                crate::credentials::configure_host_auth(&mut command, &auth, &host_alias)
-            {
-                run.status = SnippetRunStatus::ConnectionFailed(format!(
-                    "Could not prepare saved Host credentials: {error}"
-                ));
-                continue;
-            }
+            command.args(["-o", "RequestTTY=no", "-o", "ConnectTimeout=10"]);
+            let trace =
+                match crate::credentials::configure_host_auth(&mut command, &auth, &host_alias) {
+                    Ok(trace) => trace,
+                    Err(error) => {
+                        run.status = SnippetRunStatus::ConnectionFailed(format!(
+                            "Could not prepare Host authentication: {error}"
+                        ));
+                        continue;
+                    }
+                };
             match command
                 .arg(&run.host_alias)
                 .arg(&run.command)
@@ -3114,7 +3180,11 @@ impl App {
                     };
                     let (sender, receiver) = std::sync::mpsc::channel();
                     spawn_snippet_reader(stdout, sender.clone(), false);
-                    spawn_snippet_reader(stderr, sender, true);
+                    spawn_snippet_reader(
+                        crate::authentication::Reader::new(stderr, trace),
+                        sender,
+                        true,
+                    );
                     run.status = SnippetRunStatus::Running;
                     self.snippet_processes.insert(
                         id,
@@ -3223,6 +3293,7 @@ impl App {
             username,
             password: Zeroizing::new(String::new()),
             save_in_keychain,
+            save_allowed: true,
             selected_field: 0,
             error,
             purpose,
@@ -3233,23 +3304,184 @@ impl App {
         self.pending_host_password.take()
     }
 
+    pub fn authentication_saving(&self) -> bool {
+        !self.authentication_saves.is_empty()
+    }
+
+    pub fn poll_authentication(&mut self) {
+        let events = self
+            .authentication
+            .as_ref()
+            .map(|service| service.events.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                crate::authentication::Event::Challenge(challenge) => {
+                    self.authentication_queue.push_back(challenge)
+                }
+                crate::authentication::Event::PublicKeyAccepted { alias } => {
+                    if self.hosts.hosts.iter().any(|host| host.alias == alias)
+                        && self.metadata.host_public_key_auth.insert(alias)
+                    {
+                        self.save_metadata();
+                    }
+                }
+                crate::authentication::Event::Accepted {
+                    alias,
+                    username,
+                    password,
+                } => {
+                    self.authentication_saves.push((
+                        alias,
+                        username,
+                        crate::project_credentials::prepare_credential(password),
+                    ));
+                }
+            }
+        }
+        let mut index = 0;
+        while index < self.authentication_saves.len() {
+            let result = match self.authentication_saves[index].2.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err("Keychain worker stopped.".into())
+                }
+            };
+            let (alias, username, _) = self.authentication_saves.remove(index);
+            match result {
+                Ok(mut prepared) if self.hosts.hosts.iter().any(|host| host.alias == alias) => {
+                    if !self.save_host_password_prepared(&alias, &username, &mut prepared, None) {
+                        self.notice = Some(format!(
+                            "Connected to {alias}, but its password could not be saved."
+                        ));
+                    }
+                }
+                Ok(_) => {
+                    self.notice = Some(format!("{alias} was removed; its password was not saved."))
+                }
+                Err(error) => {
+                    self.notice = Some(format!(
+                        "Connected to {alias}, but password saving failed: {error}"
+                    ))
+                }
+            }
+        }
+        if self
+            .authentication_challenge
+            .as_ref()
+            .is_some_and(|challenge| !challenge.active())
+        {
+            self.authentication_challenge = None;
+            if self
+                .host_password_dialog
+                .as_ref()
+                .is_some_and(|dialog| matches!(dialog.purpose, HostPasswordPurpose::Authentication))
+            {
+                self.host_password_dialog = None;
+            }
+        }
+        // Serialize prompts without replacing another modal or another connection's input.
+        if self.host_password_dialog.is_none()
+            && (!self.credentials_modal() || self.credentials_uploading())
+            && self.host_dialog.is_none()
+            && self.tunnel_dialog.is_none()
+            && self.snippet_dialog.is_none()
+            && self.package_dialog.is_none()
+            && self.workspace.form.is_none()
+            && self.workspace.delete.is_none()
+            && self.workspace.confirmation.is_none()
+            && self.host_group_dialog.is_none()
+            && self.host_action_dialog.is_none()
+            && self.tags_dialog.is_none()
+            && self.file_dialog.is_none()
+            && self.snippet_confirmation.is_none()
+            && self.snippet_delete_confirmation.is_none()
+            && self.runtime_kill_confirmation.is_none()
+            && self.runtime_force_kill_confirmation.is_none()
+            && !self.host_picker_open
+            && !self.snippet_host_picker_open
+            && !self.runtime_host_picker_open
+            && self
+                .connection_dialog
+                .as_ref()
+                .is_none_or(|dialog| dialog.pending && self.native_connection.is_some())
+            && self.import_confirmation.is_none()
+            && self.credential_export_dialog.is_none()
+            && self.credential_import_dialog.is_none()
+            && self.settings_picker.is_none()
+        {
+            while let Some(challenge) = self.authentication_queue.pop_front() {
+                if !challenge.active() {
+                    continue;
+                }
+                let message = if challenge.rejected {
+                    "Password was rejected. Enter the current password."
+                } else {
+                    "SSH requires a password."
+                };
+                self.prompt_host_password(
+                    challenge.alias.clone(),
+                    challenge.username.clone(),
+                    Some(message.into()),
+                    challenge.can_save,
+                    HostPasswordPurpose::Authentication,
+                );
+                self.host_password_dialog.as_mut().unwrap().selected_field = 1;
+                self.host_password_dialog.as_mut().unwrap().save_allowed = challenge.can_save;
+                self.authentication_challenge = Some(challenge);
+                break;
+            }
+        }
+    }
+
     fn handle_host_password_key(&mut self, key: KeyCode) -> InputAction {
         let Some(dialog) = self.host_password_dialog.as_mut() else {
             return InputAction::None;
         };
+        let shared = matches!(dialog.purpose, HostPasswordPurpose::Authentication);
         match key {
             KeyCode::Esc => {
+                if shared && let Some(challenge) = self.authentication_challenge.take() {
+                    challenge.respond(None);
+                }
                 self.host_password_dialog = None;
                 self.pending_host_password = None;
             }
             KeyCode::Tab | KeyCode::Down => {
-                dialog.selected_field = (dialog.selected_field + 1) % 3;
+                dialog.selected_field = if shared {
+                    if dialog.selected_field == 1 && dialog.save_allowed {
+                        2
+                    } else {
+                        1
+                    }
+                } else {
+                    (dialog.selected_field + 1) % 3
+                };
             }
             KeyCode::BackTab | KeyCode::Up => {
-                dialog.selected_field = (dialog.selected_field + 2) % 3;
+                dialog.selected_field = if shared {
+                    if dialog.selected_field == 1 && dialog.save_allowed {
+                        2
+                    } else {
+                        1
+                    }
+                } else {
+                    (dialog.selected_field + 2) % 3
+                };
             }
             KeyCode::Char(' ') if dialog.selected_field == 2 => {
-                dialog.save_in_keychain = !dialog.save_in_keychain;
+                if !shared
+                    || self
+                        .authentication_challenge
+                        .as_ref()
+                        .is_some_and(|c| c.can_save)
+                {
+                    dialog.save_in_keychain = !dialog.save_in_keychain;
+                }
             }
             KeyCode::Char(' ') if dialog.selected_field == 1 => {
                 dialog.password.push(' ');
@@ -3285,8 +3517,17 @@ impl App {
                 let Some(dialog) = self.host_password_dialog.take() else {
                     return InputAction::None;
                 };
+                if shared {
+                    if let Some(challenge) = self.authentication_challenge.take() {
+                        challenge.respond(Some(crate::authentication::Answer {
+                            password: Zeroizing::new(dialog.password.to_string()),
+                            save: dialog.save_in_keychain,
+                        }));
+                    }
+                    return InputAction::None;
+                }
                 let action = match &dialog.purpose {
-                    HostPasswordPurpose::Connect => InputAction::Connect,
+                    HostPasswordPurpose::Authentication => unreachable!(),
                     HostPasswordPurpose::UploadKey { .. } => InputAction::RetryPublicKeyUpload,
                 };
                 self.pending_host_password = Some(SubmittedHostPassword {
@@ -4222,7 +4463,14 @@ impl App {
                 KeyCode::Down => dialog.scroll = dialog.scroll.saturating_add(1),
                 KeyCode::PageUp => dialog.scroll = dialog.scroll.saturating_sub(6),
                 KeyCode::PageDown => dialog.scroll = dialog.scroll.saturating_add(6),
-                _ => self.connection_dialog = None,
+                KeyCode::Esc if dialog.pending && dialog.cancelable => {
+                    self.connection_dialog = None;
+                    self.native_connection = None;
+                }
+                KeyCode::Enter | KeyCode::Esc if !dialog.pending => {
+                    self.connection_dialog = None;
+                }
+                _ => {}
             }
             return;
         }
@@ -6028,6 +6276,106 @@ mod tests {
     }
 
     #[test]
+    fn shared_authentication_waits_for_modals_cancels_cleanly_and_keeps_other_prompts_queued() {
+        use crate::authentication::tests::{fixture, request};
+        let (service, first_trace) = fixture(None);
+        let first = request(&first_trace, "tester@127.0.0.1's password:");
+        let (other_service, second_trace) = fixture(None);
+        let second = request(&second_trace, "tester@127.0.0.1's password:");
+        let mut app = app_fixture();
+        app.authentication = Some(service);
+        app.tags_dialog = Some(("web".into(), String::new()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.authentication_queue.is_empty() {
+            app.poll_authentication();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.host_password_dialog.is_none());
+        let crate::authentication::Event::Challenge(second_prompt) = other_service
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+        else {
+            panic!("Expected second challenge");
+        };
+        app.authentication_queue.push_back(second_prompt);
+        app.tags_dialog = None;
+        app.poll_authentication();
+        assert_eq!(app.host_password_dialog.as_ref().unwrap().selected_field, 1);
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+        app.poll_authentication();
+        assert_eq!(
+            app.host_password_dialog.as_ref().unwrap().password.as_str(),
+            "p"
+        );
+        assert_eq!(app.authentication_queue.len(), 1);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(first.join().unwrap().is_err());
+        app.poll_authentication();
+        assert!(
+            app.host_password_dialog.is_some(),
+            "The other request survives cancellation"
+        );
+        drop(second_trace);
+        app.poll_authentication();
+        assert!(app.host_password_dialog.is_none());
+        assert!(second.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn shared_authentication_saves_only_successful_passwords_and_replaces_the_previous_record() {
+        use crate::authentication::tests::{fixture, request};
+        let isolated = crate::projects::tests::Fixture::new("auth-save");
+        let mut app = grouped_fixture();
+        app.metadata_error = false;
+        app.metadata_save_path = Some(isolated.root.join("hosts.json"));
+        assert!(app.save_metadata());
+        let mut old = crate::project_credentials::prepare_credential(Zeroizing::new("old".into()))
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert!(app.save_host_password_prepared("web", "tester", &mut old, None));
+        let previous = app.host_password_reference("web").unwrap().to_string();
+        let (service, trace) = fixture(Some(previous.clone()));
+        app.authentication = Some(service);
+        let saved = request(&trace, "tester@127.0.0.1's password:");
+        assert_eq!(&**saved.join().unwrap().unwrap(), b"old");
+        let next = request(&trace, "tester@127.0.0.1's password:");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.host_password_dialog.is_none() {
+            app.poll_authentication();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for value in "updated".chars() {
+            press(&mut app, KeyCode::Char(value), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(&**next.join().unwrap().unwrap(), b"updated");
+        app.poll_authentication();
+        assert_eq!(app.host_password_reference("web"), Some(previous.as_str()));
+        trace.observe("Authenticated to 127.0.0.1 ([127.0.0.1]:22) using \"password\".");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.host_password_reference("web") == Some(previous.as_str()) {
+            app.poll_authentication();
+            assert!(Instant::now() < deadline, "{:?}", app.notice);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reference = app.host_password_reference("web").unwrap();
+        assert_eq!(
+            crate::project_credentials::read_password(reference)
+                .unwrap()
+                .as_str(),
+            "updated"
+        );
+        assert_eq!(app.metadata.credentials.iter().filter(|credential| credential.kind == crate::credentials::CredentialKind::Password).count(), 1);
+        let contents = std::fs::read_to_string(app.metadata_save_path.as_ref().unwrap()).unwrap();
+        assert!(!contents.contains("updated"));
+        crate::project_credentials::delete_password(reference).unwrap();
+    }
+
+    #[test]
     fn toast_reappears_when_the_same_message_changes_source() {
         let mut app = app_fixture();
         app.notice = Some("Saved.".into());
@@ -6082,15 +6430,31 @@ mod tests {
         );
     }
 
+    fn upload_password_purpose() -> HostPasswordPurpose {
+        HostPasswordPurpose::UploadKey {
+            credential: crate::credentials::Credential {
+                id: uuid::Uuid::new_v4(),
+                name: "test key".into(),
+                kind: crate::credentials::CredentialKind::SshKey,
+                username: String::new(),
+                password_ref: None,
+                private_key_path: None,
+                public_key: String::new(),
+                fingerprint: String::new(),
+            },
+            identity_configured: false,
+        }
+    }
+
     #[test]
-    fn host_password_dialog_masks_flow_and_returns_connect_action() {
+    fn host_password_dialog_masks_flow_and_returns_upload_retry_action() {
         let mut app = app_fixture();
         app.prompt_host_password(
             "web".into(),
             "tester".into(),
             None,
             false,
-            HostPasswordPurpose::Connect,
+            upload_password_purpose(),
         );
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.host_password_dialog.as_ref().unwrap().selected_field, 0);
@@ -6105,7 +6469,7 @@ mod tests {
         assert!(app.host_password_dialog.as_ref().unwrap().save_in_keychain);
         assert_eq!(
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
-            InputAction::Connect
+            InputAction::RetryPublicKeyUpload
         );
         let submitted = app.take_pending_host_password().unwrap();
         assert_eq!(submitted.username, "tester");
@@ -6122,7 +6486,7 @@ mod tests {
             "tester".into(),
             None,
             false,
-            HostPasswordPurpose::Connect,
+            upload_password_purpose(),
         );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(
@@ -6151,7 +6515,7 @@ mod tests {
             "dada".into(),
             None,
             false,
-            HostPasswordPurpose::Connect,
+            upload_password_purpose(),
         );
         for _ in 0..4 {
             press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
@@ -6171,7 +6535,7 @@ mod tests {
         }
         assert_eq!(
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
-            InputAction::Connect
+            InputAction::RetryPublicKeyUpload
         );
         let submitted = app.take_pending_host_password().unwrap();
         assert_eq!(submitted.username, "root");
@@ -7579,6 +7943,7 @@ mod tests {
             title: "Error".into(),
             message: "Failed".into(),
             pending: false,
+            cancelable: false,
             scroll: 0,
         });
         assert_eq!(
@@ -8056,7 +8421,7 @@ mod tests {
             path: String::new(),
         };
         let (sender, receiver) = std::sync::mpsc::channel();
-        app.sftp_receiver = Some(receiver);
+        app.sftp_receiver = Some(sftp::PendingListing::from_receiver(receiver));
         sender
             .send(Ok(crate::sftp::SftpListing {
                 host_alias: "web".into(),

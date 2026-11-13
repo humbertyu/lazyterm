@@ -981,6 +981,25 @@ impl App {
         crate::credentials::HostAuth {
             username: self.host_password_username(alias).map(str::to_string),
             password_ref: self.host_password_reference(alias).map(str::to_string),
+            broker: self.authentication.as_ref().map(|service| {
+                service.client(
+                    self.hosts
+                        .hosts
+                        .iter()
+                        .map(|host| crate::authentication::SavedHost {
+                            alias: host.alias.clone(),
+                            username: self.host_password_username(&host.alias).map(str::to_string),
+                            reference: self
+                                .host_password_reference(&host.alias)
+                                .map(str::to_string),
+                        })
+                        .collect(),
+                )
+            }),
+            #[cfg(test)]
+            config: self.test_auth_config.clone(),
+            #[cfg(test)]
+            askpass: self.test_auth_askpass.clone(),
         }
     }
 
@@ -1161,6 +1180,10 @@ impl App {
 
     pub fn credentials_busy(&self) -> bool {
         self.credential_manager.pending.is_some()
+    }
+
+    pub fn credentials_uploading(&self) -> bool {
+        self.credentials_busy() && self.credential_manager.upload_cancel.is_some()
     }
 
     pub(crate) fn refresh_host_key_sources(&mut self) {
@@ -1573,7 +1596,7 @@ impl App {
                     credential,
                     identity_configured,
                 } => (credential.clone(), *identity_configured),
-                HostPasswordPurpose::Connect => return,
+                HostPasswordPurpose::Authentication => return,
             }
         } else {
             let Some(item) = self.selected_credential() else {
@@ -1609,20 +1632,26 @@ impl App {
             .as_ref()
             .map_or(had_saved_password, |value| value.save_in_keychain);
         let username = submitted.as_ref().map(|value| value.username.clone());
+        let auth = (submitted.is_none() && self.authentication.is_some())
+            .then(|| self.host_password_auth(&alias));
         let (sender, receiver) = mpsc::channel();
         self.credential_manager.pending = Some(receiver);
         self.credential_manager.message = Some(format!("Uploading public key to {alias}..."));
         let cancelled = Arc::new(AtomicBool::new(false));
         self.credential_manager.upload_cancel = Some(cancelled.clone());
         std::thread::spawn(move || {
-            let result = credentials::upload(
-                &credential.public_key,
-                &alias,
-                username.as_deref(),
-                password_ref.as_deref(),
-                None,
-                &cancelled,
-            );
+            let result = if let Some(auth) = &auth {
+                credentials::upload_with_auth(&credential.public_key, &alias, auth, &cancelled)
+            } else {
+                credentials::upload(
+                    &credential.public_key,
+                    &alias,
+                    username.as_deref(),
+                    password_ref.as_deref(),
+                    None,
+                    &cancelled,
+                )
+            };
             let result = match result {
                 Ok(message) => Ok(CredentialJob::UploadedKey {
                     alias,
@@ -1637,7 +1666,7 @@ impl App {
                     alias,
                     username: username.clone(),
                     credential,
-                    authentication_failed: upload_authentication_failed(&error),
+                    authentication_failed: auth.is_none() && upload_authentication_failed(&error),
                     error,
                     save_password,
                     identity_configured,

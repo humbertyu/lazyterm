@@ -13,8 +13,7 @@ use std::{
 
 use async_recursion::async_recursion;
 use futures_util::StreamExt;
-use openssh::{KnownHosts, SessionBuilder};
-use openssh_sftp_client::{Sftp, file::File, metadata::FileType};
+use openssh_sftp_client::{Sftp, SftpAuxiliaryData, file::File, metadata::FileType};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -119,6 +118,8 @@ enum SftpCommand {
     List {
         host_alias: String,
         path: String,
+        auth: crate::credentials::HostAuth,
+        cancelled: Arc<AtomicBool>,
         sender: Sender<SftpResult>,
     },
     Transfer {
@@ -132,7 +133,14 @@ enum SftpCommand {
     },
 }
 
-type ConnectionCache = Arc<Mutex<HashMap<String, Arc<Mutex<Sftp>>>>>;
+#[derive(Default)]
+struct Connections {
+    sessions: HashMap<String, (Arc<Mutex<Sftp>>, Arc<AtomicBool>)>,
+    auth: HashMap<String, crate::credentials::HostAuth>,
+    connecting: HashMap<String, Arc<Mutex<()>>>,
+}
+
+type ConnectionCache = Arc<Mutex<Connections>>;
 
 fn service_sender() -> &'static tokio_mpsc::UnboundedSender<SftpCommand> {
     static SERVICE: OnceLock<tokio_mpsc::UnboundedSender<SftpCommand>> = OnceLock::new();
@@ -153,17 +161,22 @@ fn service_sender() -> &'static tokio_mpsc::UnboundedSender<SftpCommand> {
 }
 
 async fn sftp_service(mut receiver: tokio_mpsc::UnboundedReceiver<SftpCommand>) {
-    let cache = Arc::new(Mutex::new(HashMap::new()));
+    let cache = Arc::new(Mutex::new(Connections::default()));
     while let Some(command) = receiver.recv().await {
         match command {
             SftpCommand::List {
                 host_alias,
                 path,
+                auth,
+                cancelled,
                 sender,
             } => {
                 let cache = Arc::clone(&cache);
                 tokio::spawn(async move {
-                    let result = list_directory(&host_alias, &path, &cache).await;
+                    let result = tokio::select! {
+                        result = list_directory(&host_alias, &path, &cache, auth) => result,
+                        _ = wait_cancelled(&cancelled) => Err("SFTP listing cancelled.".into()),
+                    };
                     let _ = sender.send(result);
                 });
             }
@@ -204,14 +217,65 @@ async fn sftp_service(mut receiver: tokio_mpsc::UnboundedReceiver<SftpCommand>) 
     }
 }
 
-pub fn spawn_list(host_alias: String, path: String) -> Receiver<SftpResult> {
+#[cfg(test)]
+pub fn spawn_list(host_alias: String, path: String) -> PendingListing {
+    spawn_list_with_auth(host_alias, path, Default::default())
+}
+
+pub struct PendingListing {
+    receiver: Receiver<SftpResult>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PendingListing {
+    pub fn try_recv(&self) -> Result<SftpResult, mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    #[cfg(test)]
+    pub fn from_receiver(receiver: Receiver<SftpResult>) -> Self {
+        Self {
+            receiver,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<SftpResult, mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
+impl Drop for PendingListing {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+async fn wait_cancelled(cancelled: &AtomicBool) {
+    while !cancelled.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub fn spawn_list_with_auth(
+    host_alias: String,
+    path: String,
+    auth: crate::credentials::HostAuth,
+) -> PendingListing {
     let (sender, receiver) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let _ = service_sender().send(SftpCommand::List {
         host_alias,
         path,
+        auth,
+        cancelled: cancelled.clone(),
         sender,
     });
-    receiver
+    PendingListing {
+        receiver,
+        cancelled,
+    }
 }
 
 pub fn spawn_transfer(
@@ -231,6 +295,7 @@ pub fn spawn_mutation(request: MutationRequest, sender: Sender<MutationEvent>) {
 }
 
 async fn mutate(request: &MutationRequest, cache: &ConnectionCache) -> Result<(), String> {
+    cached_sftp(&request.host_alias, cache, None).await?;
     tokio::time::timeout(MUTATION_TIMEOUT, mutate_inner(request, cache))
         .await
         .map_err(|_| {
@@ -242,7 +307,7 @@ async fn mutate(request: &MutationRequest, cache: &ConnectionCache) -> Result<()
 }
 
 async fn mutate_inner(request: &MutationRequest, cache: &ConnectionCache) -> Result<(), String> {
-    let connection = cached_sftp(&request.host_alias, cache).await?;
+    let connection = cached_sftp(&request.host_alias, cache, None).await?;
     let sftp = connection.lock().await;
     let mut fs = sftp.fs();
     match &request.mutation {
@@ -268,17 +333,26 @@ async fn mutate_inner(request: &MutationRequest, cache: &ConnectionCache) -> Res
     }
 }
 
-async fn list_directory(host_alias: &str, path: &str, cache: &ConnectionCache) -> SftpResult {
+async fn list_directory(
+    host_alias: &str,
+    path: &str,
+    cache: &ConnectionCache,
+    auth: crate::credentials::HostAuth,
+) -> SftpResult {
+    let connection = cached_sftp(host_alias, cache, Some(auth)).await?;
     tokio::time::timeout(
         LISTING_TIMEOUT,
-        list_directory_inner(host_alias, path, cache),
+        list_directory_inner(host_alias, path, connection),
     )
     .await
     .map_err(|_| format!("Timed out while loading {path} from {host_alias}."))?
 }
 
-async fn list_directory_inner(host_alias: &str, path: &str, cache: &ConnectionCache) -> SftpResult {
-    let connection = cached_sftp(host_alias, cache).await?;
+async fn list_directory_inner(
+    host_alias: &str,
+    path: &str,
+    connection: Arc<Mutex<Sftp>>,
+) -> SftpResult {
     let sftp = connection.lock().await;
     let directory = sftp
         .fs()
@@ -328,38 +402,156 @@ async fn list_directory_inner(host_alias: &str, path: &str, cache: &ConnectionCa
     })
 }
 
-async fn connect_sftp(host_alias: &str) -> Result<Sftp, String> {
-    let mut builder = SessionBuilder::default();
-    builder
-        .known_hosts_check(KnownHosts::Strict)
-        .connect_timeout(CONNECT_TIMEOUT);
+async fn connect_sftp(
+    host_alias: &str,
+    auth: &crate::credentials::HostAuth,
+) -> Result<(Sftp, Arc<AtomicBool>), String> {
+    use std::process::{Command, Stdio};
+    use tokio::io::AsyncBufReadExt;
+    let mut command = Command::new("ssh");
+    command.args([
+        "-T",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        &format!("ConnectTimeout={}", CONNECT_TIMEOUT.as_secs()),
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]);
     #[cfg(test)]
     if let Some((config_file, known_hosts_file)) = TEST_CONNECTION_CONFIG.get() {
-        builder
-            .config_file(config_file)
-            .user_known_hosts_file(known_hosts_file);
+        command
+            .arg("-F")
+            .arg(config_file)
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={}", known_hosts_file.display()));
     }
-    let session = builder
-        .connect(host_alias)
-        .await
-        .map_err(|error| format!("SSH connection failed: {error}"))?;
-    Sftp::from_session(session, Default::default())
-        .await
-        .map_err(|error| format!("SFTP subsystem failed: {error}"))
+    let trace = crate::credentials::configure_host_auth(&mut command, auth, host_alias)
+        .map_err(|error| format!("Could not prepare SFTP authentication: {error}"))?;
+    command
+        .arg("-s")
+        .arg(host_alias)
+        .arg("sftp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start SFTP transport: {error}"))?;
+    let stdin = child.stdin.take().expect("piped SFTP stdin");
+    let stdout = child.stdout.take().expect("piped SFTP stdout");
+    let stderr = child.stderr.take().expect("piped SFTP stderr");
+    let errors = Arc::new(std::sync::Mutex::new(String::new()));
+    let output = errors.clone();
+    let alive = Arc::new(AtomicBool::new(true));
+    let transport_alive = alive.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if trace.as_ref().is_some_and(|trace| trace.observe(&line)) {
+                continue;
+            }
+            let mut errors = output.lock().unwrap();
+            if errors.len() < 16 * 1024 {
+                errors.push_str(&crate::diagnostics::redact_sensitive_text(&line));
+                errors.push('\n');
+            }
+        }
+        transport_alive.store(false, Ordering::Release);
+    });
+    struct Transport {
+        child: std::sync::Mutex<tokio::process::Child>,
+        stderr: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Transport {
+        fn drop(&mut self) {
+            let _ = self.child.get_mut().unwrap().start_kill();
+            self.stderr.abort();
+        }
+    }
+    struct PendingTransport(Arc<Transport>, bool);
+    impl Drop for PendingTransport {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = self.0.child.lock().unwrap().start_kill();
+                self.0.stderr.abort();
+            }
+        }
+    }
+    let transport = Arc::new(Transport {
+        child: std::sync::Mutex::new(child),
+        stderr: stderr_task,
+    });
+    // SFTP's internal tasks may outlive a cancelled handshake future.
+    let mut pending_transport = PendingTransport(transport.clone(), true);
+    let sftp = tokio::time::timeout(
+        Duration::from_secs(210),
+        Sftp::new_with_auxiliary(
+            stdin,
+            stdout,
+            Default::default(),
+            SftpAuxiliaryData::Boxed(Box::new(transport)),
+        ),
+    )
+    .await
+    .map_err(|_| "SFTP authentication timed out.".to_string())?
+    .map_err(|error| {
+        let detail = errors.lock().unwrap();
+        if detail.trim().is_empty() {
+            format!("SFTP connection failed: {error}")
+        } else {
+            format!("SFTP connection failed: {}", detail.trim())
+        }
+    })?;
+    pending_transport.1 = false;
+    Ok((sftp, alive))
 }
 
 async fn cached_sftp(
     host_alias: &str,
     cache: &ConnectionCache,
+    requested_auth: Option<crate::credentials::HostAuth>,
 ) -> Result<Arc<Mutex<Sftp>>, String> {
-    if let Some(connection) = cache.lock().await.get(host_alias).cloned() {
+    let connecting = cache
+        .lock()
+        .await
+        .connecting
+        .entry(host_alias.to_string())
+        .or_default()
+        .clone();
+    let _connecting = connecting.lock().await;
+    if let Some(auth) = requested_auth {
+        let mut connections = cache.lock().await;
+        if connections.auth.get(host_alias) != Some(&auth) {
+            connections.sessions.remove(host_alias);
+            connections.auth.insert(host_alias.to_string(), auth);
+        }
+    }
+    if let Some((connection, alive)) = cache.lock().await.sessions.get(host_alias).cloned()
+        && alive.load(Ordering::Acquire)
+    {
         return Ok(connection);
     }
-    let sftp = Arc::new(Mutex::new(connect_sftp(host_alias).await?));
+    cache.lock().await.sessions.remove(host_alias);
+    let auth = cache
+        .lock()
+        .await
+        .auth
+        .get(host_alias)
+        .cloned()
+        .unwrap_or_default();
+    let (sftp, alive) = connect_sftp(host_alias, &auth).await?;
+    let sftp = Arc::new(Mutex::new(sftp));
     let mut connections = cache.lock().await;
     Ok(connections
+        .sessions
         .entry(host_alias.to_string())
-        .or_insert_with(|| Arc::clone(&sftp))
+        .or_insert_with(|| (Arc::clone(&sftp), alive))
+        .0
         .clone())
 }
 
@@ -384,8 +576,14 @@ async fn transfer_inner(
     cache: &ConnectionCache,
 ) -> Result<(), String> {
     check_cancelled(cancelled)?;
-    let connection = cached_sftp(&request.host_alias, cache).await?;
-    let sftp = connection.lock().await;
+    let connection = tokio::select! {
+        connection = cached_sftp(&request.host_alias, cache, None) => connection?,
+        _ = wait_cancelled(cancelled) => return Err("TRANSFER_CANCELLED".into()),
+    };
+    let sftp = tokio::select! {
+        sftp = connection.lock() => sftp,
+        _ = wait_cancelled(cancelled) => return Err("TRANSFER_CANCELLED".into()),
+    };
     let total = match request.direction {
         TransferDirection::Upload => local_size(&request.local_path).await?,
         TransferDirection::Download => {

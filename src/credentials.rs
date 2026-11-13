@@ -18,17 +18,35 @@ pub enum CredentialKind {
 pub struct HostAuth {
     pub username: Option<String>,
     pub password_ref: Option<String>,
+    pub broker: Option<crate::authentication::Client>,
+    #[cfg(test)]
+    pub config: Option<PathBuf>,
+    #[cfg(test)]
+    pub askpass: Option<PathBuf>,
 }
 
-pub fn configure_host_auth(command: &mut Command, auth: &HostAuth, alias: &str) -> io::Result<()> {
+pub fn configure_host_auth(
+    command: &mut Command,
+    auth: &HostAuth,
+    alias: &str,
+) -> io::Result<Option<crate::authentication::Trace>> {
+    #[cfg(test)]
+    if let Some(config) = &auth.config {
+        command.arg("-F").arg(config);
+    }
     if let Some(username) = auth.username.as_deref() {
         command.args(["-l", username]);
+    }
+    if let Some(broker) = &auth.broker {
+        return broker.configure(command, alias, auth).map(Some);
     }
     if let Some(reference) = auth.password_ref.as_deref() {
         command.args(["-o", "BatchMode=no"]);
         configure_password_for(command, reference, alias, auth.username.as_deref())?;
+    } else {
+        command.args(["-o", "BatchMode=yes"]);
     }
-    Ok(())
+    Ok(None)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -317,6 +335,24 @@ pub fn upload(
         password_ref,
         config,
         cancelled,
+        None,
+    )
+}
+
+pub fn upload_with_auth(
+    key: &str,
+    alias: &str,
+    auth: &HostAuth,
+    cancelled: &AtomicBool,
+) -> Result<String, String> {
+    run_upload(
+        upload_command(key)?,
+        alias,
+        None,
+        None,
+        None,
+        cancelled,
+        Some(auth),
     )
 }
 
@@ -334,6 +370,7 @@ pub fn upload_fixture(key: &str, config: &Path, remote_home: &Path) -> Result<St
         None,
         Some(config),
         &AtomicBool::new(false),
+        None,
     )
 }
 
@@ -344,6 +381,7 @@ fn run_upload(
     password_ref: Option<&str>,
     config: Option<&Path>,
     cancelled: &AtomicBool,
+    auth: Option<&HostAuth>,
 ) -> Result<String, String> {
     if alias.is_empty() || alias.starts_with('-') || alias.chars().any(char::is_control) {
         return Err("Invalid Host alias.".into());
@@ -373,15 +411,19 @@ fn run_upload(
         "-o",
         "ServerAliveCountMax=2",
         "-o",
-        "NumberOfPasswordPrompts=1",
     ]);
-    if let Some(reference) = password_ref {
+    let trace = if let Some(auth) = auth {
+        configure_host_auth(&mut command, auth, alias)
+            .map_err(|error| format!("Could not prepare SSH authentication: {error}"))?
+    } else if let Some(reference) = password_ref {
         command.args(["-o", "BatchMode=no"]);
         configure_password_for(&mut command, reference, alias, username)
             .map_err(|_| "Could not prepare password authentication.")?;
+        None
     } else {
         command.args(["-o", "BatchMode=yes"]);
-    }
+        None
+    };
     command
         .arg(alias)
         .arg(script)
@@ -400,13 +442,15 @@ fn run_upload(
     let stderr = child.stderr.take();
     let (diagnostic_sender, diagnostic_receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
-        if let Some(mut stderr) = stderr {
+        if let Some(stderr) = stderr {
+            let mut stderr = crate::authentication::Reader::new(stderr, trace);
             let mut diagnostic = Vec::new();
             let _ = io::Read::read_to_end(&mut stderr, &mut diagnostic);
             let _ = diagnostic_sender.send(String::from_utf8_lossy(&diagnostic).trim().to_string());
         }
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(if auth.is_some() { 210 } else { 45 });
     let result = loop {
         if cancelled.load(Ordering::Relaxed) {
             stop_upload(&mut child);
@@ -477,6 +521,9 @@ mod tests {
         let auth = HostAuth {
             username: Some("deploy".into()),
             password_ref: None,
+            broker: None,
+            config: None,
+            askpass: None,
         };
         let mut command = Command::new("ssh");
         configure_host_auth(&mut command, &auth, "web").unwrap();
@@ -484,7 +531,7 @@ mod tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(args, ["-l", "deploy"]);
+        assert_eq!(args, ["-l", "deploy", "-o", "BatchMode=yes"]);
         assert!(
             command
                 .get_envs()

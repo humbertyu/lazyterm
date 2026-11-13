@@ -541,17 +541,12 @@ impl ProjectService {
         let stderr_log = log_root.join(format!("{prefix}.stderr.log"));
         let stdout_file = private_log(&stdout_log)?;
         let stderr_file = private_log(&stderr_log)?;
+        let mut authentication_trace = None;
         let mut process = if let ProjectTarget::Host(alias) = &target {
             let mut process = Command::new("ssh");
-            process.args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "RequestTTY=no",
-                "-o",
-                "ConnectTimeout=10",
-            ]);
-            crate::credentials::configure_host_auth(&mut process, auth, alias)?;
+            process.args(["-o", "RequestTTY=no", "-o", "ConnectTimeout=10"]);
+            authentication_trace =
+                crate::credentials::configure_host_auth(&mut process, auth, alias)?;
             process
                 .arg(alias)
                 .arg(remote_shell_command(&directory, &command.command));
@@ -583,7 +578,12 @@ impl ProjectService {
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         spawn_reader(stdout, stdout_file, sender.clone(), false);
-        spawn_reader(stderr, stderr_file, sender, true);
+        spawn_reader(
+            crate::authentication::Reader::new(stderr, authentication_trace),
+            stderr_file,
+            sender,
+            true,
+        );
         self.tasks.insert(
             key,
             ProjectTask {

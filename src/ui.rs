@@ -4066,7 +4066,11 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
         Color::Rgb(221, 132, 112)
     };
     let footer = if dialog.pending {
-        "Please wait..."
+        if dialog.cancelable {
+            "Connecting...  Esc cancel"
+        } else {
+            "Please wait..."
+        }
     } else if needs_scroll {
         if area.width < 60 {
             "↑↓ scroll  Enter/Esc close"
@@ -4074,7 +4078,7 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
             "↑↓ scroll  PgUp/PgDn page  Enter/Esc close"
         }
     } else {
-        "Enter/Esc close"
+        "Enter close"
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -4099,29 +4103,40 @@ fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
 fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPasswordDialog) {
     let area = centered_rect(72, 12, frame.area());
     let purpose = match &dialog.purpose {
-        HostPasswordPurpose::Connect => "Connect to Host",
+        HostPasswordPurpose::Authentication => "SSH authentication",
         HostPasswordPurpose::UploadKey { .. } => "Install SSH public key",
     };
     let mut lines = vec![
         Line::from(format!("Host: {}", dialog.alias)),
         Line::from(""),
-        input_line(
-            "Username",
-            &dialog.username,
-            dialog.selected_field == 0,
-            false,
-        ),
+        if matches!(dialog.purpose, HostPasswordPurpose::Authentication) {
+            Line::from(format!(
+                "  SSH user: {} (from Host/config)",
+                dialog.username
+            ))
+        } else {
+            input_line(
+                "Username",
+                &dialog.username,
+                dialog.selected_field == 0,
+                false,
+            )
+        },
         input_line(
             "Password",
             dialog.password.as_str(),
             dialog.selected_field == 1,
             true,
         ),
-        checkbox_line(
-            "Save password in system Keychain",
-            dialog.save_in_keychain,
-            dialog.selected_field == 2,
-        ),
+        if dialog.save_allowed {
+            checkbox_line(
+                "Save password in system Keychain",
+                dialog.save_in_keychain,
+                dialog.selected_field == 2,
+            )
+        } else {
+            Line::from("  Add this host to Hosts to save its password.")
+        },
     ];
     if let Some(error) = &dialog.error {
         lines.push(Line::from(Span::styled(
@@ -4476,6 +4491,7 @@ mod tests {
             ]
             .join("\n"),
             pending: false,
+            cancelable: false,
             scroll: 0,
         });
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
@@ -4500,12 +4516,13 @@ mod tests {
             title: "Connection failed".into(),
             message: "Connection refused.".into(),
             pending: false,
+            cancelable: false,
             scroll: 0,
         });
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let text = format!("{}", terminal.backend());
-        assert!(text.contains("Enter/Esc close"));
+        assert!(text.contains("Enter close"));
         assert!(!text.contains("scroll"));
         assert!(!text.contains("PgUp"));
     }
@@ -4680,7 +4697,7 @@ mod tests {
             "root".into(),
             Some("Password authentication required.".into()),
             true,
-            HostPasswordPurpose::Connect,
+            HostPasswordPurpose::Authentication,
         );
         app.host_password_dialog
             .as_mut()
@@ -4692,7 +4709,7 @@ mod tests {
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let text = format!("{}", terminal.backend());
             assert!(text.contains("Password: **************"), "{text}");
-            assert!(text.contains("> Username: root_"));
+            assert!(text.contains("SSH user: root (from Host/config)"));
             assert!(text.contains("Save password in system Keychain"));
             assert!(text.contains("Space toggle"));
             assert!(!text.contains("fixture-secret"));
