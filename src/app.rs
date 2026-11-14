@@ -329,7 +329,8 @@ pub struct App {
     pub files: FilesState,
     pub selected_file: usize,
     pub local_files: LocalFiles,
-    pub file_filter: String,
+    pub local_file_filter: String,
+    pub remote_file_filter: String,
     pub file_filtering: bool,
     pub show_hidden_files: bool,
     pub active_file_pane: FilePane,
@@ -949,7 +950,8 @@ impl App {
                 selected: 0,
                 error: None,
             },
-            file_filter: String::new(),
+            local_file_filter: String::new(),
+            remote_file_filter: String::new(),
             file_filtering: false,
             show_hidden_files,
             active_file_pane: FilePane::Remote,
@@ -1200,7 +1202,7 @@ impl App {
     }
 
     pub fn visible_local_entries(&self) -> Vec<&LocalEntry> {
-        let query = self.file_filter.to_lowercase();
+        let query = self.local_file_filter.to_lowercase();
         self.local_files
             .entries
             .iter()
@@ -1216,7 +1218,7 @@ impl App {
         let FilesState::Loaded(listing) = &self.files else {
             return Vec::new();
         };
-        let query = self.file_filter.to_lowercase();
+        let query = self.remote_file_filter.to_lowercase();
         listing
             .entries
             .iter()
@@ -1325,12 +1327,37 @@ impl App {
         tail
     }
 
+    pub fn file_filter(&self, pane: FilePane) -> &str {
+        match pane {
+            FilePane::Local => &self.local_file_filter,
+            FilePane::Remote => &self.remote_file_filter,
+        }
+    }
+
+    fn active_file_filter_mut(&mut self) -> &mut String {
+        match self.active_file_pane {
+            FilePane::Local => &mut self.local_file_filter,
+            FilePane::Remote => &mut self.remote_file_filter,
+        }
+    }
+
+    pub fn file_filter_visible(&self, pane: FilePane) -> bool {
+        (self.file_filtering && self.active_file_pane == pane) || !self.file_filter(pane).is_empty()
+    }
+
+    fn reset_active_file_selection(&mut self) {
+        match self.active_file_pane {
+            FilePane::Local => self.local_files.selected = 0,
+            FilePane::Remote => self.selected_file = 0,
+        }
+    }
+
     fn local_list_start_row(&self) -> u16 {
-        5 + u16::from(self.file_filtering || !self.file_filter.is_empty())
+        5 + u16::from(self.file_filter_visible(FilePane::Local))
     }
 
     fn remote_list_start_row(&self) -> u16 {
-        4 + u16::from(self.file_filtering || !self.file_filter.is_empty())
+        4 + u16::from(self.file_filter_visible(FilePane::Remote))
     }
 
     pub fn transfer_panel_height(&self, area_height: u16) -> u16 {
@@ -1361,8 +1388,10 @@ impl App {
     fn navigate_local_to(&mut self, path: PathBuf) {
         self.local_files.path = path;
         self.local_files.selected = 0;
-        self.file_filter.clear();
-        self.file_filtering = false;
+        self.local_file_filter.clear();
+        if self.active_file_pane == FilePane::Local {
+            self.file_filtering = false;
+        }
         self.metadata.local_path = Some(self.local_files.path.clone());
         self.save_metadata();
         self.refresh_local_files();
@@ -2688,10 +2717,9 @@ impl App {
             return InputAction::None;
         }
 
-        if key == KeyCode::Esc && !self.file_filter.is_empty() {
-            self.file_filter.clear();
-            self.local_files.selected = 0;
-            self.selected_file = 0;
+        if key == KeyCode::Esc && !self.file_filter(self.active_file_pane).is_empty() {
+            self.active_file_filter_mut().clear();
+            self.reset_active_file_selection();
             return InputAction::None;
         }
 
@@ -2746,9 +2774,8 @@ impl App {
                     || self.active_file_pane == FilePane::Remote =>
             {
                 self.file_filtering = true;
-                self.file_filter.clear();
-                self.local_files.selected = 0;
-                self.selected_file = 0;
+                self.active_file_filter_mut().clear();
+                self.reset_active_file_selection();
             }
             KeyCode::Char('r') => match self.active_file_pane {
                 FilePane::Local => self.refresh_local_files(),
@@ -2873,16 +2900,17 @@ impl App {
         if row >= pane_end {
             return InputAction::None;
         }
-        if self.file_filtering {
-            return InputAction::None;
-        }
-
         let local_width = viewport_width / 2;
-        self.active_file_pane = if column < local_width {
+        let clicked_pane = if column < local_width {
             FilePane::Local
         } else {
             FilePane::Remote
         };
+        if self.file_filtering && clicked_pane == self.active_file_pane {
+            return InputAction::None;
+        }
+        self.file_filtering = false;
+        self.active_file_pane = clicked_pane;
         if row == 3 {
             return InputAction::None;
         }
@@ -6350,13 +6378,12 @@ impl App {
             }
             KeyCode::Esc => {
                 self.file_filtering = false;
-                self.file_filter.clear();
-                self.local_files.selected = 0;
+                self.active_file_filter_mut().clear();
+                self.reset_active_file_selection();
             }
             KeyCode::Backspace => {
-                self.file_filter.pop();
-                self.local_files.selected = 0;
-                self.selected_file = 0;
+                self.active_file_filter_mut().pop();
+                self.reset_active_file_selection();
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.file_filtering = false;
@@ -6366,9 +6393,8 @@ impl App {
                 };
             }
             KeyCode::Char(character) if !character.is_control() => {
-                self.file_filter.push(character);
-                self.local_files.selected = 0;
-                self.selected_file = 0;
+                self.active_file_filter_mut().push(character);
+                self.reset_active_file_selection();
             }
             _ => {}
         }
@@ -8790,6 +8816,71 @@ mod tests {
     }
 
     #[test]
+    fn file_filters_are_independent_when_switching_panes_and_clearing() {
+        let mut app = app_fixture();
+        app.section = NavSection::Files;
+        app.active_file_pane = FilePane::Local;
+        app.local_files.entries = vec![
+            LocalEntry {
+                name: "notes.txt".into(),
+                kind: LocalEntryKind::File,
+                size: None,
+            },
+            LocalEntry {
+                name: "other.txt".into(),
+                kind: LocalEntryKind::File,
+                size: None,
+            },
+        ];
+        app.files = FilesState::Loaded(crate::sftp::SftpListing {
+            host_alias: "web".into(),
+            path: String::new(),
+            entries: ["logs", "README.md"]
+                .into_iter()
+                .map(|name| crate::sftp::SftpEntry {
+                    name: name.into(),
+                    kind: crate::sftp::SftpEntryKind::File,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        app.selected_file = 1;
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(app.file_filter_visible(FilePane::Local));
+        assert!(!app.file_filter_visible(FilePane::Remote));
+        for character in "note".chars() {
+            press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        assert_eq!(app.visible_local_entries().len(), 1);
+        assert_eq!(app.visible_remote_entries().len(), 2);
+        assert_eq!(app.selected_file, 1);
+
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.active_file_pane, FilePane::Remote);
+        assert!(!app.file_filtering);
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for character in "log".chars() {
+            press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        assert_eq!(app.local_file_filter, "note");
+        assert_eq!(app.remote_file_filter, "log");
+        assert_eq!(app.visible_remote_entries().len(), 1);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.remote_file_filter.is_empty());
+        assert_eq!(app.local_file_filter, "note");
+        assert_eq!(app.visible_local_entries().len(), 1);
+        assert_eq!(app.visible_remote_entries().len(), 2);
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_mouse(10, 5, 100, 24);
+        assert_eq!(app.active_file_pane, FilePane::Local);
+        assert!(!app.file_filtering);
+        assert_eq!(app.local_file_filter, "note");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.local_file_filter.is_empty());
+    }
+
+    #[test]
     fn local_file_filter_matches_names_and_preserves_parent_entry() {
         let mut app = app_fixture();
         app.section = NavSection::Files;
@@ -8829,9 +8920,9 @@ mod tests {
         assert_eq!(app.local_files.selected, 1);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!app.file_filtering);
-        assert_eq!(app.file_filter, "note");
+        assert_eq!(app.local_file_filter, "note");
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(app.file_filter.is_empty());
+        assert!(app.local_file_filter.is_empty());
     }
 
     #[test]

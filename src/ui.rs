@@ -1558,7 +1558,8 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let filter_visible = app.file_filtering || !app.file_filter.is_empty();
+    let filter_visible = app.file_filter_visible(FilePane::Local);
+    let filter = app.file_filter(FilePane::Local);
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(u16::from(filter_visible)),
@@ -1604,12 +1605,12 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(input_line(
                 "Filter",
-                &app.file_filter,
-                app.file_filtering,
+                filter,
+                app.file_filtering && active,
                 false,
             ))
             .style(Style::default().fg(if active {
-                if app.file_filter.is_empty() {
+                if filter.is_empty() {
                     MUTED.into()
                 } else {
                     GREEN.into()
@@ -1689,7 +1690,7 @@ fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
         rows[2],
         &mut state,
     );
-    if visible_entries.is_empty() && !app.file_filter.is_empty() {
+    if visible_entries.is_empty() && !filter.is_empty() {
         frame.render_widget(
             Paragraph::new("No matching local files or directories.")
                 .style(Style::default().fg(MUTED.into())),
@@ -1831,7 +1832,8 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
             let inner = block.inner(area);
             frame.render_widget(block, area);
             let entries = app.visible_remote_entries();
-            let filter_visible = app.file_filtering || !app.file_filter.is_empty();
+            let filter_visible = app.file_filter_visible(FilePane::Remote);
+            let filter = app.file_filter(FilePane::Remote);
             let rows = Layout::vertical([
                 Constraint::Length(u16::from(filter_visible)),
                 Constraint::Min(1),
@@ -1841,12 +1843,12 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
                 frame.render_widget(
                     Paragraph::new(input_line(
                         "Filter",
-                        &app.file_filter,
-                        app.file_filtering,
+                        filter,
+                        app.file_filtering && active,
                         false,
                     ))
                     .style(Style::default().fg(if active {
-                        if app.file_filter.is_empty() {
+                        if filter.is_empty() {
                             MUTED.into()
                         } else {
                             GREEN.into()
@@ -1859,7 +1861,7 @@ fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
             }
             if entries.is_empty() {
                 frame.render_widget(
-                    Paragraph::new(if app.file_filter.is_empty() {
+                    Paragraph::new(if filter.is_empty() {
                         "This directory is empty."
                     } else {
                         "No matching remote files or directories."
@@ -4626,6 +4628,50 @@ mod tests {
         app::{App, TransferStatus, TransferTask},
         hosts::{Host, HostCatalog},
     };
+
+    #[test]
+    fn files_only_show_the_focused_panes_filter_cursor() {
+        let mut app = App::with_catalog(
+            HostCatalog {
+                hosts: vec![Host {
+                    alias: "web".into(),
+                    hostname: Some("web.example.com".into()),
+                    user: None,
+                    port: None,
+                    identity_file: None,
+                    proxy_jump: None,
+                    managed: false,
+                }],
+                error: None,
+            },
+            Ok(Default::default()),
+        );
+        app.section = NavSection::Files;
+        app.host_context = Some("web".into());
+        app.files = FilesState::Loaded(crate::sftp::SftpListing {
+            host_alias: "web".into(),
+            path: String::new(),
+            entries: Vec::new(),
+        });
+        for pane in [FilePane::Local, FilePane::Remote] {
+            app.active_file_pane = pane;
+            app.file_filtering = true;
+            app.local_file_filter.clear();
+            app.remote_file_filter.clear();
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert_eq!(text.matches("> Filter: _").count(), 1);
+            assert_eq!(text.matches("Filter:").count(), 1);
+        }
+        app.local_file_filter = "local-query".into();
+        app.remote_file_filter = "remote-query".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("  Filter: local-query"));
+        assert!(text.contains("> Filter: remote-query_"));
+    }
 
     #[test]
     fn file_name_dialogs_keep_actions_on_bottom_and_show_the_edit_position() {
