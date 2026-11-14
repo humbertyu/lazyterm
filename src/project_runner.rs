@@ -56,6 +56,8 @@ pub(crate) struct Snapshot {
     pub owner: ProjectOwner,
     pub directory: PathBuf,
     pub command: String,
+    #[serde(default)]
+    pub target: crate::projects::ProjectTarget,
     pub status: TaskStatus,
     running: bool,
     pub output: String,
@@ -108,7 +110,10 @@ impl Handle {
         stream.write_all(b"\n")?;
         let value: serde_json::Value = serde_json::from_reader(stream)?;
         let snapshot = parse_snapshot(value, expected.owner.key, legacy_key)?;
-        if snapshot.token != expected.token || snapshot.owner != expected.owner {
+        if snapshot.token != expected.token
+            || snapshot.owner != expected.owner
+            || snapshot.target != expected.target
+        {
             return Err(io::Error::other("Background run identity changed."));
         }
         Ok(snapshot)
@@ -216,6 +221,8 @@ struct Launch {
     log_root: PathBuf,
     run_id: u64,
     token: String,
+    #[serde(default)]
+    ssh_config: Option<PathBuf>,
 }
 
 fn record_path(root: &Path, key: TaskKey) -> PathBuf {
@@ -434,6 +441,15 @@ pub(crate) fn start(
     project: &ProjectDefinition,
     command: &ProjectCommand,
 ) -> io::Result<Handle> {
+    start_with_config(root, project, command, None)
+}
+
+pub(crate) fn start_with_config(
+    root: &Path,
+    project: &ProjectDefinition,
+    command: &ProjectCommand,
+    ssh_config: Option<PathBuf>,
+) -> io::Result<Handle> {
     fs::create_dir_all(root)?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     let run_id = u64::try_from(
@@ -458,6 +474,7 @@ pub(crate) fn start(
             log_root: root.to_path_buf(),
             run_id,
             token: token.clone(),
+            ssh_config,
         },
     )?;
     let mut worker = Command::new(std::env::current_exe()?);
@@ -561,7 +578,22 @@ fn run_inner(spec: &Path) -> io::Result<()> {
     service.set_next_run(launch.run_id);
     // The independent runner owns the ordinary app-scoped supervisor.
     launch.command.lifecycle = ProjectLifecycle::App;
-    service.start_app(&launch.project, &launch.command)?;
+    if let Some(config) = launch.ssh_config {
+        service.start_app_supervised(
+            &launch.project,
+            &launch.command,
+            &crate::credentials::HostAuth {
+                config: Some(config),
+                ..Default::default()
+            },
+            matches!(
+                crate::projects::execution_target(&launch.project, &launch.command),
+                crate::projects::ProjectTarget::Host(_)
+            ),
+        )?;
+    } else {
+        service.start_app(&launch.project, &launch.command)?;
+    }
     let record = record_path(&launch.log_root, key);
     let mut previous = None;
     loop {
@@ -571,6 +603,7 @@ fn run_inner(spec: &Path) -> io::Result<()> {
             owner: task.owner.clone(),
             directory: task.directory.clone(),
             command: task.command.clone(),
+            target: crate::projects::execution_target(&launch.project, &launch.command).clone(),
             status: task.status.clone(),
             running: task.active(),
             output: task.output.clone(),
@@ -714,6 +747,7 @@ mod tests {
             },
             directory: fixture.root.clone(),
             command: command.command.clone(),
+            target: Default::default(),
             status: TaskStatus::Running,
             running: true,
             output: String::new(),
@@ -758,6 +792,7 @@ mod tests {
             },
             directory: fixture.root.clone(),
             command: command.command.clone(),
+            target: Default::default(),
             status: TaskStatus::Running,
             running: true,
             output: String::new(),
@@ -812,6 +847,7 @@ mod tests {
                 },
                 directory: fixture.root.clone(),
                 command: command.command.clone(),
+                target: Default::default(),
                 status: TaskStatus::Running,
                 running: true,
                 output: String::new(),

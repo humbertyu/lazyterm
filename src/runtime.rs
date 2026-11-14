@@ -233,9 +233,18 @@ pub(crate) fn inspect(
     owners: &[ProjectOwner],
     tunnels: &[crate::metadata::TunnelDefinition],
 ) -> Result<Vec<RuntimeEntry>, String> {
-    let mut entries = inspect_listeners(target)?;
-    enrich_process_details(target, &mut entries);
-    let observations = process_observations(target);
+    inspect_with_config(target, owners, tunnels, None)
+}
+
+pub(crate) fn inspect_with_config(
+    target: &RuntimeTarget,
+    owners: &[ProjectOwner],
+    tunnels: &[crate::metadata::TunnelDefinition],
+    config: Option<&std::path::Path>,
+) -> Result<Vec<RuntimeEntry>, String> {
+    let mut entries = inspect_listeners_with_config(target, config)?;
+    enrich_process_details(target, &mut entries, config);
+    let observations = process_observations(target, config);
     for entry in &mut entries {
         entry.kind = classify_process(entry);
         (entry.origin, entry.origin_reason) = classify_origin(entry.pid, &observations);
@@ -296,7 +305,7 @@ pub(crate) fn inspect_listeners_with_test_config(
     inspect_listeners_with_config(target, Some(config_file))
 }
 
-fn inspect_listeners_with_config(
+pub(crate) fn inspect_listeners_with_config(
     target: &RuntimeTarget,
     config_file: Option<&std::path::Path>,
 ) -> Result<Vec<RuntimeEntry>, String> {
@@ -307,18 +316,8 @@ fn inspect_listeners_with_config(
             .output()
             .map_err(|error| format!("Could not start local port inspection: {error}"))?,
         RuntimeTarget::Host(alias) => {
-            let mut command = Command::new("ssh");
-            command.args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "RequestTTY=no",
-                "-o",
-                "ConnectTimeout=10",
-            ]);
-            if let Some(config_file) = config_file {
-                command.arg("-F").arg(config_file);
-            }
+            let mut command = inspection_ssh(config_file, alias)
+                .map_err(|error| format!("Could not prepare SSH inspection: {error}"))?;
             command
                 .arg(alias)
                 .arg(INSPECT_SCRIPT)
@@ -371,24 +370,45 @@ fn project_owner(
         .cloned()
 }
 
-fn process_observations(target: &RuntimeTarget) -> HashMap<u32, ProcessObservation> {
+fn inspection_ssh(config: Option<&std::path::Path>, alias: &str) -> std::io::Result<Command> {
+    let mut command = Command::new("ssh");
+    command.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=2",
+    ]);
+    if let Some(config) = config {
+        command.arg("-F").arg(config);
+    }
+    crate::authentication::configure_noninteractive(&mut command, alias, config)?;
+    command.stdin(Stdio::null());
+    Ok(command)
+}
+
+fn process_observations(
+    target: &RuntimeTarget,
+    config: Option<&std::path::Path>,
+) -> HashMap<u32, ProcessObservation> {
     let output = match target {
         RuntimeTarget::Local => Command::new("ps")
             .args(["-ww", "-axo", "pid=,ppid=,pgid=,tty=,command="])
             .output(),
-        RuntimeTarget::Host(alias) => Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "RequestTTY=no",
-                "-o",
-                "ConnectTimeout=10",
-            ])
-            .arg(alias)
-            .arg("ps -ww -axo pid=,ppid=,pgid=,tty=,command=")
-            .stdin(Stdio::null())
-            .output(),
+        RuntimeTarget::Host(alias) => inspection_ssh(config, alias).and_then(|mut command| {
+            command
+                .arg(alias)
+                .arg("ps -ww -axo pid=,ppid=,pgid=,tty=,command=")
+                .stdin(Stdio::null())
+                .output()
+        }),
     };
     let Ok(output) = output else {
         return HashMap::new();
@@ -487,16 +507,20 @@ fn is_app_bundle_command(command: &str) -> bool {
         })
 }
 
-fn enrich_process_details(target: &RuntimeTarget, entries: &mut [RuntimeEntry]) {
+fn enrich_process_details(
+    target: &RuntimeTarget,
+    entries: &mut [RuntimeEntry],
+    config: Option<&std::path::Path>,
+) {
     let mut details = HashMap::new();
-    let current_uid = target_uid(target);
+    let current_uid = target_uid(target, config);
     for entry in entries {
         let Some(pid) = entry.pid else {
             continue;
         };
         let detail = details
             .entry(pid)
-            .or_insert_with(|| process_details(target, pid));
+            .or_insert_with(|| process_details(target, pid, config));
         if let Some((uid, command, working_directory)) = detail {
             entry.owned_by_current_user = current_uid.as_ref() == Some(uid);
             entry.user.clone_from(uid);
@@ -506,18 +530,11 @@ fn enrich_process_details(target: &RuntimeTarget, entries: &mut [RuntimeEntry]) 
     }
 }
 
-fn target_uid(target: &RuntimeTarget) -> Option<String> {
+fn target_uid(target: &RuntimeTarget, config: Option<&std::path::Path>) -> Option<String> {
     let output = match target {
         RuntimeTarget::Local => Command::new("id").arg("-u").output().ok()?,
-        RuntimeTarget::Host(alias) => Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "RequestTTY=no",
-                "-o",
-                "ConnectTimeout=10",
-            ])
+        RuntimeTarget::Host(alias) => inspection_ssh(config, alias)
+            .ok()?
             .arg(alias)
             .arg("id -u")
             .stdin(Stdio::null())
@@ -530,7 +547,11 @@ fn target_uid(target: &RuntimeTarget) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn process_details(target: &RuntimeTarget, pid: u32) -> Option<(String, String, Option<String>)> {
+fn process_details(
+    target: &RuntimeTarget,
+    pid: u32,
+    config: Option<&std::path::Path>,
+) -> Option<(String, String, Option<String>)> {
     let command_output = match target {
         RuntimeTarget::Local => Command::new("ps")
             .args([
@@ -544,15 +565,8 @@ fn process_details(target: &RuntimeTarget, pid: u32) -> Option<(String, String, 
             ])
             .output()
             .ok()?,
-        RuntimeTarget::Host(alias) => Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "RequestTTY=no",
-                "-o",
-                "ConnectTimeout=10",
-            ])
+        RuntimeTarget::Host(alias) => inspection_ssh(config, alias)
+            .ok()?
             .arg(alias)
             .args([
                 "ps",
@@ -582,11 +596,19 @@ fn process_details(target: &RuntimeTarget, pid: u32) -> Option<(String, String, 
     Some((
         uid.to_string(),
         command,
-        process_working_directory(target, pid),
+        process_working_directory_with_config(target, pid, config),
     ))
 }
 
 pub(crate) fn process_working_directory(target: &RuntimeTarget, pid: u32) -> Option<String> {
+    process_working_directory_with_config(target, pid, None)
+}
+
+fn process_working_directory_with_config(
+    target: &RuntimeTarget,
+    pid: u32,
+    config: Option<&std::path::Path>,
+) -> Option<String> {
     let output = match target {
         RuntimeTarget::Local => Command::new("sh")
             .args([
@@ -597,15 +619,7 @@ pub(crate) fn process_working_directory(target: &RuntimeTarget, pid: u32) -> Opt
             ])
             .output()
             .ok()?,
-        RuntimeTarget::Host(alias) => Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "RequestTTY=no",
-                "-o",
-                "ConnectTimeout=10",
-            ])
+        RuntimeTarget::Host(alias) => inspection_ssh(config, alias).ok()?
             .arg(alias)
             .arg(format!(
                 "if command -v lsof >/dev/null 2>&1; then lsof -a -p {pid} -d cwd -Fn; elif [ -e /proc/{pid}/cwd ]; then readlink /proc/{pid}/cwd; fi"

@@ -34,11 +34,13 @@ entity, `4` action authorization required, `5` conflict/concurrent change.
 `--help`, `--version`, and `--diagnostics` are human-readable exceptions.
 
 Projects, commands, links, Tunnels, packages, and Snippets have UUIDs. Hosts use
-OpenSSH aliases, not IP addresses; groups use names. Run IDs are opaque decimal
-**strings** to avoid numeric precision loss in JSON clients. Preserve them exactly.
+OpenSSH aliases, not IP addresses; groups use names. Run IDs are opaque
+**strings**: decimal strings for managed runs and `external:...` for recognized
+external Project processes. Preserve them exactly.
 Status can be `unobserved` or `unavailable`; neither proves a command is stopped.
-Runner inventory does not discover externally started commands or app-scoped
-TUI tasks. Local listener inspection supplies additional live evidence.
+Status also discovers recognizable local external Project commands by user,
+working directory, command and process ancestry. Unrecognizable external commands
+and TUI tasks without a matching process remain unobserved.
 
 ## Configuration
 
@@ -98,21 +100,32 @@ On conflict, re-query before preparing a new update. Do not retry stale payloads
 blindly. Direct edits from tools that do not participate in these locks can still
 race file writes.
 
-The running TUI reloads shared configuration through `r` on Hosts. A stale TUI
-save is rejected rather than replacing newer metadata. This version does not
-automatically refresh every open TUI view. If CLI queries report an old metadata
-version, open the TUI once to perform its backed-up migration.
+The running TUI checks shared configuration about once a second. Refresh waits
+until open edit/confirmation dialogs close; stale saves are still rejected.
+Invalid or missing metadata retains the last loaded data and blocks saving
+until a valid file is restored. Hosts `r` remains a manual reload.
+If CLI queries report an old metadata version, open the TUI once to perform its
+backed-up migration. Reads do not migrate configuration.
 
 ## Process Actions
 
-These endpoints support **Local Project commands with either saved lifecycle
+These endpoints support **Local and Host Project commands with either saved lifecycle
 (App/Persistent) and either kind (Task/Service)**. Each CLI start runs through an
 independent background runner and reports `execution_lifecycle: "Persistent"`.
 The saved definition stays unchanged: its lifecycle controls future TUI starts,
 while a CLI-started run survives CLI/TUI exit until completion or explicit stop.
 Tasks finish normally; they do not need to be reclassified as Services.
-Host-targeted starts, external PID termination, Tunnel lifecycle
-control, and remote Runtime inspection remain in the TUI.
+Host runs use the saved Host alias and OpenSSH config. They require noninteractive
+key/agent authentication (including any jump hosts), a trusted host key, and
+`python3`, `sh`, and `ps` on the POSIX remote. No password prompt is opened by the
+CLI. Fix authentication through the TUI or the user's own SSH tools if needed.
+A local background runner holds the SSH connection; this is not a detached runner
+installed on the server. A connection-scoped Python supervisor owns the remote
+process group. Stop/EOF cleans it with TERM and then KILL after two seconds;
+missing heartbeats expire after 20 seconds. Remote network loss, logout/reboot,
+and commands that deliberately detach outside that group cannot provide
+uninterrupted persistent service. Generic Host execution, arbitrary PID kills
+and Tunnel lifecycle control remain outside this CLI.
 
 ```sh
 lazyterm projects start PROJECT-UUID COMMAND-UUID --yes
@@ -122,13 +135,15 @@ lazyterm projects stop PROJECT-UUID COMMAND-UUID --run-id RUN-ID --yes
 ```
 
 `runtime stop PROJECT-UUID COMMAND-UUID --run-id RUN-ID --yes` is an alias for
-stopping that managed run. It is not a PID kill command.
+stopping the identified Project run. It accepts managed or recognized local
+external Project run IDs; it is not a PID kill command.
 
 Use `--yes` only for the action the user authorized. Read the exact command,
 working directory, and target before starting. Starting a stored Project command
 executes its shell text; adding its definition does not authorize execution.
 Start validates the directory and relies on the runner lock to prevent duplicate
-managed starts. It does not detect every externally started copy.
+managed starts. Recognizable external copies block start with a conflict;
+unknown/ambiguous process matches cannot be guaranteed detectable.
 
 Before stopping, query status and pass the returned run ID. The existing runner
 protocol authenticates the run and verifies ownership; a replaced run ID fails
@@ -136,10 +151,23 @@ with a conflict rather than stopping the replacement. TERM/KILL behavior is the
 same as the TUI Project supervisor. CLI-started processes survive CLI and TUI exit.
 Agents must not rewrite command definitions to work around execution errors.
 
+External status includes `source: "external"`, an opaque run ID and
+`external_runs` when multiple copies match the same command. Stop accepts one
+exact external run ID, rechecks PID/user/start-time/command/directory, and sends
+TERM only to validated individual descendants. It never kills an external process
+group or escalates external termination to KILL. External output is not captured:
+`projects output` returns only a saved managed run, which may be an earlier run.
+
 `runtime list` inspects local TCP listeners and provides command/path/origin
 evidence when the OS exposes it. Managed persistent Project attribution includes
 the Project UUID, command UUID, and run ID. Insufficient process permissions or
 missing `lsof`/`ss` can limit inspection.
+
+`runtime list --host ALIAS` explicitly connects to one existing Host and inspects
+its TCP listeners using `lsof` or `ss` plus available `ps`/cwd evidence. BatchMode
+and strict host-key verification prevent interactive prompts or silent first-use
+trust. Ordinary inventory commands never connect. Remote listeners are never
+matched against local process groups or exposed through arbitrary PID stop.
 
 Output returns at most the latest 16,384 Unicode characters of the runner's
 retained output, with a `truncated` flag for this additional CLI limit. The runner

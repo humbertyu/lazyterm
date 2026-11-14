@@ -283,6 +283,7 @@ impl TaskStatus {
 }
 
 pub struct ProjectTask {
+    pub target: ProjectTarget,
     pub owner: ProjectOwner,
     pub directory: PathBuf,
     pub command: String,
@@ -369,7 +370,7 @@ impl ProjectService {
     pub fn owners(&self) -> Vec<ProjectOwner> {
         self.tasks
             .values()
-            .filter(|task| task.active())
+            .filter(|task| task.active() && task.target == ProjectTarget::Local)
             .map(|task| task.owner.clone())
             .collect()
     }
@@ -414,9 +415,7 @@ impl ProjectService {
         self.restored_at = Some(Instant::now());
         for project in definitions {
             for command in &project.commands {
-                if *execution_target(project, command) == ProjectTarget::Local {
-                    let _ = self.recover_task((project.id, command.id), command.lifecycle);
-                }
+                let _ = self.recover_task((project.id, command.id), command.lifecycle);
             }
         }
     }
@@ -448,6 +447,7 @@ impl ProjectService {
         self.tasks.insert(
             snapshot.owner.key,
             ProjectTask {
+                target: snapshot.target.clone(),
                 owner: snapshot.owner.clone(),
                 directory: snapshot.directory.clone(),
                 command: snapshot.command.clone(),
@@ -526,6 +526,16 @@ impl ProjectService {
         command: &ProjectCommand,
         auth: &crate::credentials::HostAuth,
     ) -> io::Result<()> {
+        self.start_app_supervised(project, command, auth, false)
+    }
+
+    pub(crate) fn start_app_supervised(
+        &mut self,
+        project: &ProjectDefinition,
+        command: &ProjectCommand,
+        auth: &crate::credentials::HostAuth,
+        remote_guard: bool,
+    ) -> io::Result<()> {
         let key = (project.id, command.id);
         if self.active(key) {
             return Err(io::Error::other("Command is already running"));
@@ -568,12 +578,38 @@ impl ProjectService {
         let mut authentication_trace = None;
         let mut process = if let ProjectTarget::Host(alias) = &target {
             let mut process = Command::new("ssh");
-            process.args(["-o", "RequestTTY=no", "-o", "ConnectTimeout=10"]);
+            if remote_guard {
+                crate::authentication::configure_noninteractive(
+                    &mut process,
+                    alias,
+                    auth.config.as_deref(),
+                )?;
+            }
+            process.args([
+                "-o",
+                "RequestTTY=no",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=2",
+            ]);
             authentication_trace =
                 crate::credentials::configure_host_auth(&mut process, auth, alias)?;
-            process
-                .arg(alias)
-                .arg(remote_shell_command(&directory, &command.command));
+            let script = if remote_guard {
+                format!(
+                    "exec python3 -u -c {} {} {}",
+                    shell_quote(include_str!("remote_project.py")),
+                    shell_quote(&directory.to_string_lossy()),
+                    shell_quote(&command.command)
+                )
+            } else {
+                remote_shell_command(&directory, &command.command)
+            };
+            process.arg(alias).arg(script);
             process
         } else {
             let mut process = Command::new("sh");
@@ -584,10 +620,26 @@ impl ProjectService {
             process
         };
         process
-            .stdin(Stdio::null())
+            .stdin(if remote_guard {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = crate::process_guard::ManagedChild::spawn(&mut process)?;
+        if remote_guard {
+            let mut heartbeat = child.stdin.take().expect("piped heartbeat");
+            std::thread::spawn(move || {
+                while heartbeat
+                    .write_all(b".")
+                    .and_then(|()| heartbeat.flush())
+                    .is_ok()
+                {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            });
+        }
         let process_group = child.process_group();
         let (sender, receiver) = mpsc::sync_channel(128);
         let stdout = child.stdout.take().expect("piped stdout");
@@ -602,6 +654,7 @@ impl ProjectService {
         self.tasks.insert(
             key,
             ProjectTask {
+                target,
                 owner: ProjectOwner {
                     key,
                     run_id,
@@ -679,6 +732,7 @@ impl ProjectService {
             match handle.refresh() {
                 Ok(()) => {
                     if task.owner != handle.snapshot.owner {
+                        task.target = handle.snapshot.target.clone();
                         task.owner = handle.snapshot.owner.clone();
                         task.directory.clone_from(&handle.snapshot.directory);
                         task.command.clone_from(&handle.snapshot.command);

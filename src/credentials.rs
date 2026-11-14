@@ -19,7 +19,6 @@ pub struct HostAuth {
     pub username: Option<String>,
     pub password_ref: Option<String>,
     pub broker: Option<crate::authentication::Client>,
-    #[cfg(test)]
     pub config: Option<PathBuf>,
     #[cfg(test)]
     pub askpass: Option<PathBuf>,
@@ -30,7 +29,6 @@ pub fn configure_host_auth(
     auth: &HostAuth,
     alias: &str,
 ) -> io::Result<Option<crate::authentication::Trace>> {
-    #[cfg(test)]
     if let Some(config) = &auth.config {
         command.arg("-F").arg(config);
     }
@@ -410,7 +408,6 @@ fn run_upload(
         "ServerAliveInterval=5",
         "-o",
         "ServerAliveCountMax=2",
-        "-o",
     ]);
     let trace = if let Some(auth) = auth {
         configure_host_auth(&mut command, auth, alias)

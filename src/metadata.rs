@@ -231,14 +231,34 @@ impl Metadata {
     }
 
     pub(crate) fn read_from(path: &std::path::Path) -> io::Result<Self> {
-        Self::read_document(path, true)
+        Self::read_document(path, true, true)
     }
 
     pub(crate) fn read_for_import(path: &std::path::Path) -> io::Result<Self> {
-        Self::read_document(path, false)
+        Self::read_document(path, false, true)
     }
 
-    fn read_document(path: &std::path::Path, migrate: bool) -> io::Result<Self> {
+    pub(crate) fn read_existing(path: &std::path::Path) -> io::Result<Self> {
+        Self::read_document(path, false, false)
+    }
+
+    pub(crate) fn changed_on_disk(&self, path: &std::path::Path) -> io::Result<bool> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(self.snapshot.borrow().as_ref() != Some(&bytes)),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && self.snapshot.borrow().is_none() =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_document(
+        path: &std::path::Path,
+        migrate: bool,
+        allow_missing: bool,
+    ) -> io::Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
                 let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -272,7 +292,9 @@ impl Metadata {
                 }
                 Ok(metadata)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {
+                Ok(Self::default())
+            }
             Err(error) => Err(error),
         }
     }

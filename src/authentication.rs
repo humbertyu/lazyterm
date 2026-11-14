@@ -538,6 +538,54 @@ impl Client {
     }
 }
 
+pub(crate) fn configure_noninteractive(
+    command: &mut Command,
+    alias: &str,
+    config: Option<&Path>,
+) -> io::Result<()> {
+    let mut routes = Vec::new();
+    resolve_routes(alias, None, None, config, &[], &mut Vec::new(), &mut routes)?;
+    let mut proxy = "none".to_string();
+    for (index, route) in routes
+        .iter()
+        .take(routes.len().saturating_sub(1))
+        .enumerate()
+    {
+        let next = &routes[index + 1];
+        let mut args = vec![
+            "ssh".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "ControlPath=none".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
+            "-o".into(),
+            format!("ProxyCommand={proxy}"),
+            "-l".into(),
+            route.username.clone(),
+            "-p".into(),
+            route.port.clone(),
+            "-W".into(),
+            format!("[{}]:{}", next.hostname, next.port),
+        ];
+        if let Some(config) = config {
+            args.extend(["-F".into(), config.to_string_lossy().into_owned()]);
+        }
+        args.push(route.alias.clone());
+        proxy = shell_words::join(args);
+    }
+    if routes.len() > 1 {
+        command.args(["-o", &format!("ProxyCommand={proxy}")]);
+    }
+    command.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]);
+    Ok(())
+}
+
 fn resolve_routes(
     alias: &str,
     username: Option<&str>,
@@ -1005,6 +1053,30 @@ pub(crate) mod tests {
         assert!(service.events.try_recv().is_err());
         production.finish_diagnostics();
         drop(trace);
+    }
+
+    #[test]
+    fn noninteractive_routes_apply_strict_batch_policy_to_each_jump() {
+        let fixture = crate::projects::tests::Fixture::new("noninteractive-routes");
+        let config = fixture.root.join("config");
+        fs::write(
+            &config,
+            "Host target\n HostName 192.0.2.3\n ProxyJump jump\n\
+            Host jump\n HostName 192.0.2.2\n ProxyJump first\n\
+            Host first\n HostName 192.0.2.1\n\
+            Host *\n BatchMode no\n StrictHostKeyChecking no\n",
+        )
+        .unwrap();
+        let mut command = Command::new("ssh");
+        configure_noninteractive(&mut command, "target", Some(&config)).unwrap();
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(args.matches("BatchMode=yes").count(), 3);
+        assert_eq!(args.matches("StrictHostKeyChecking=yes").count(), 3);
+        assert!(!args.contains("BatchMode=no"));
     }
 
     #[test]

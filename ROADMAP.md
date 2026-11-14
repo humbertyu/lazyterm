@@ -239,24 +239,35 @@ Goal: let a user-approved Agent discover the Hosts, Projects, and local/remote r
 - [x] Provide validated configuration create/update commands for Hosts/groups, Snippet packages/templates, Projects/commands/web links, and Tunnel definitions. Agents can translate a user's description into LazyTerm configuration; reuse existing SSH config writers and metadata transactions rather than editing JSON directly.
 - [x] Keep Hosts/SFTP operational actions outside the Agent CLI: no interactive SSH login, arbitrary remote command execution, file upload/download, remote file mutation, or SSH key deployment through these endpoints. Agents use their own SSH/SFTP tools with the queried Host information.
 - [x] List Host aliases and safe connection metadata, Projects/commands/web links, and observed local listeners with process origin and ownership evidence.
-- [ ] Add explicit remote Runtime inspection without introducing a generic Host execution endpoint.
+- [x] Add explicit `runtime list --host ALIAS` remote Runtime inspection with catalog validation, BatchMode and strict host-key verification, without introducing a generic Host execution endpoint.
 - [x] List Snippet packages, descriptions, and command templates for Agent reference. Agents execute approved commands through their own tools; the Snippet UI runner is not their execution API.
 - [x] Expose managed persistent Project status and bounded, redacted output summaries.
 - [x] Add explicitly authorized Local Project start/stop for both App/Persistent and Task/Service definitions. CLI runs use a background runner without editing saved policies or types; expose actual run lifecycle and reject stale run IDs during managed-run stop.
-- [ ] Extend lifecycle/status coverage to Host-targeted Projects and externally started processes, with equivalent identity and authorization checks.
+- [x] Extend CLI lifecycle/status/output to saved Host-targeted Project commands through a local authenticated runner and a connection-scoped remote process-group supervisor. Remote Python 3 and noninteractive SSH authentication are required; disconnect/heartbeat loss cleans the remote group. This is not remote detached-runner installation or rediscovery.
+- [x] Detect recognizable Local external Project processes in status/Runtime, block duplicate starts, and stop one exact opaque external run ID after directory/user/start-time/command revalidation. External output capture, arbitrary PID stop, and remote external-process control remain excluded.
 - [x] Require `--yes` for each process action and revalidate authenticated managed-run identity immediately before stopping. This flag expresses client authorization; the Skill must respect the user's actual authorization.
 - [x] Omit saved credential fields, private key contents, Keychain data, runner authentication sockets/tokens, and raw unbounded logs. Redact recognized secret patterns in command/output text; arbitrary unlabelled application secrets cannot be guaranteed detectable.
 - [x] Return versioned typed results, stable entity UUIDs/Host aliases, opaque run-ID strings, errors, and operation status.
 - [x] Test real CLI subprocesses with disposable configuration/Projects, including stale run IDs, denied actions, missing Hosts, TUI-lock independence, credential rejection/redaction, and unrelated-process isolation.
 - [x] Validate CLI writes, preserve unrelated SSH directives/metadata/child entities and saved link passwords, and reject stale metadata/Host saves through shared safeguards.
-- [ ] Complete interactive acceptance while a live TUI edits/reloads CLI-authored configuration. Hosts `r` currently reloads metadata; automatic refresh of every TUI view remains deferred.
+- [x] Automatically refresh CLI-authored metadata across TUI views, defer replacement while an edit/confirmation dialog is open, preserve data and block saves after missing/invalid metadata, and retain stale-save protection. A real PTY TUI/CLI fixture covers live refresh and deferred update after closing a form; additional Agent-client/platform manual acceptance remains a release gate.
 - [x] Document CLI usage, JSON contracts, Skill installation, permissions, privacy, and troubleshooting.
 
 Initial implementation: `docs/CLI.md` and `skills/lazyterm/SKILL.md`. No separate
 Agent database or MCP server is introduced. Local inventory and persistent runner
-actions are implemented first; remote Runtime, external-process termination,
-Host-targeted lifecycle control, configuration deletion/Host alias rename, and
-complete interactive Agent/TUI acceptance remain outside this initial slice.
+actions are implemented, together with explicit remote Runtime inspection,
+Host-targeted Project lifecycle control, recognized local external-run stop and
+live TUI refresh. Configuration deletion/Host alias rename, arbitrary PID kill,
+remote external-process management, remote detached-runner rediscovery and
+complete Agent-client/platform manual acceptance remain outside this slice.
+
+v0.8 completion checks: real CLI subprocess fixtures cover Local App/Task and
+Persistent/Service runs, recognized external commands, duplicate/stale-run
+rejection and a live PTY TUI observing CLI changes without overwriting an open
+form. `LAZYTERM_SFTP_FIXTURE=1 cargo test --test cli` additionally starts a
+disposable real sshd and verifies explicit remote Runtime and Host Project
+start/output/stop/restart, including remote port cleanup after local runner
+SIGKILL. No live user configuration is used.
 
 The Skill is the Agent-facing instruction layer; the CLI provides configuration access and approved Project/process control. An Agent with shell access calls the same `lazyterm` executable using subcommands and `--json`; launching without subcommands continues to open the TUI. MCP is deferred and is not required to expose the planned capabilities. Prioritize inventory and attribution ("which Hosts exist?", "what is listening?", "which Project started it?"), followed by configuration authoring and scoped lifecycle actions. Host discovery/configuration must not launch SSH or SFTP sessions. Project commands may still use LazyTerm's existing local/Host targets when explicitly started through the approved Project lifecycle interface; that does not introduce an arbitrary Host execution endpoint.
 

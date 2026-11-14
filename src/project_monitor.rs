@@ -43,6 +43,18 @@ pub struct ExternalRun {
 }
 
 impl ExternalRun {
+    pub fn run_id(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::hash::DefaultHasher::new();
+        self.key.hash(&mut hash);
+        self.root.pid.hash(&mut hash);
+        self.root.uid.hash(&mut hash);
+        self.root.started.hash(&mut hash);
+        self.root.command.hash(&mut hash);
+        self.directory.hash(&mut hash);
+        format!("external:{}:{:016x}", self.root.pid, hash.finish())
+    }
+
     pub fn label(&self) -> String {
         let ports = self
             .ports
@@ -156,7 +168,7 @@ impl ProjectMonitor {
     }
 }
 
-fn inspect(
+pub(crate) fn inspect(
     definitions: &[ProjectDefinition],
     owners: &[ProjectOwner],
 ) -> Result<BTreeMap<TaskKey, Vec<ExternalRun>>, String> {
@@ -415,7 +427,7 @@ pub fn stop_external_async(runs: Vec<ExternalRun>) -> Receiver<Result<(), String
     receiver
 }
 
-fn stop_external(runs: &[ExternalRun]) -> Result<(), String> {
+pub(crate) fn stop_external(runs: &[ExternalRun]) -> Result<(), String> {
     let snapshot = process_snapshot()?;
     let mut protected = ancestors_of(std::process::id(), &snapshot);
     protected.insert(std::process::id());

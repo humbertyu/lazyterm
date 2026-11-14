@@ -998,6 +998,8 @@ impl App {
             }),
             #[cfg(test)]
             config: self.test_auth_config.clone(),
+            #[cfg(not(test))]
+            config: None,
             #[cfg(test)]
             askpass: self.test_auth_askpass.clone(),
         }

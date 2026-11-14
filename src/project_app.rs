@@ -1003,9 +1003,9 @@ impl App {
             if let Some(project) = &project
                 && self
                     .project_service
-                    .owners()
-                    .iter()
-                    .any(|owner| owner.key.0 == project.id)
+                    .tasks
+                    .values()
+                    .any(|task| task.active() && task.owner.key.0 == project.id)
             {
                 self.notice = Some("Stop project commands before editing the project.".into());
                 return;
@@ -1135,9 +1135,9 @@ impl App {
         } else if let Some(project) = self.selected_project() {
             if self
                 .project_service
-                .owners()
-                .iter()
-                .any(|owner| owner.key.0 == project.id)
+                .tasks
+                .values()
+                .any(|task| task.active() && task.owner.key.0 == project.id)
             {
                 self.notice = Some("Stop project commands before deleting the project.".into());
             } else {

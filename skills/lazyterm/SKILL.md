@@ -1,6 +1,6 @@
 ---
 name: lazyterm
-description: "Manage this machine's host inventory, project commands, web links, and local services through LazyTerm. Use for requests such as 有哪些主机、查看运行的服务、哪个程序占用端口、添加项目启动命令, even when the user does not mention LazyTerm. Query configuration and listeners, maintain definitions, and start or stop authorized local Project services."
+description: "Manage this machine's host inventory, project commands, web links, and services through LazyTerm. Use for requests such as 有哪些主机、查看运行的服务、哪个程序占用端口、添加项目启动命令, even when the user does not mention LazyTerm. Query local or explicitly selected Host listeners, maintain definitions, and control authorized Project services."
 ---
 
 # LazyTerm
@@ -27,7 +27,8 @@ Route ordinary requests by intent:
 Answer in terms of the user's Hosts, Projects, and services without repeatedly
 prefixing results with "configured in LazyTerm". Keep evidence limits visible:
 saved Hosts are an inventory, not a scan of every server; Runtime defaults to
-this local machine and does not show remote listeners. If a requested item is
+this local machine; query remote listeners only for a user-selected Host through
+`runtime list --host ALIAS`. If a requested item is
 missing, report that lookup result rather than claiming it does not exist.
 Resolve service names against Project definitions before an authorized action;
 ask only when the target or intended action remains ambiguous. Discovery does
@@ -61,7 +62,8 @@ stderr. Use `--input FILE` or `--input -` for structured configuration writes.
   Empty child arrays do not delete items. Deletion and Host alias renaming are
   currently TUI operations.
 - On exit code 5, re-read state and reconsider the intended change. Do not blindly
-  retry a stale write. A running TUI can refresh shared data with `r` on Hosts.
+  retry a stale write. The TUI refreshes shared data automatically while no edit
+  or confirmation dialog is open; `r` on Hosts remains a manual reload.
 - Snippets are reference templates. For Host login, remote shell work, and file
   transfers, use your own SSH/SFTP tools and the discovered alias. LazyTerm has no
   Host execution or SFTP CLI endpoint. Do not request private keys or passwords.
@@ -69,12 +71,17 @@ stderr. Use `--input FILE` or `--input -` for structured configuration writes.
 ## Inspect and Control Services
 
 `runtime list` inspects local TCP listeners with available process/path/origin
-evidence. `projects status` reports managed persistent runs; `unobserved` and
+evidence. `runtime list --host ALIAS` explicitly connects to that existing Host
+using noninteractive SSH and strict known-host verification. If authentication
+or trust is missing, report the failure; do not change SSH policy to bypass it.
+`projects status` reports managed runs and recognizable local external Project
+commands. External runs have `source: "external"` and `external_runs` lists;
+`unobserved` and
 `unavailable` are uncertain states, not proof that no process is running.
 External processes and TUI app-scoped tasks may not appear in managed status.
 
 Before an authorized start, read the Project and exact command, directory,
-target, and lifecycle. CLI starts support Local commands with either App/Persistent
+target, and lifecycle. CLI starts support Local/Host commands with either App/Persistent
 lifecycle and Task/Service kind. Each CLI start uses an independent background
 runner for that run, without modifying the saved lifecycle or kind:
 
@@ -83,6 +90,12 @@ lazyterm projects start PROJECT-UUID COMMAND-UUID --yes
 lazyterm projects output PROJECT-UUID COMMAND-UUID --json
 ```
 
+Host commands require noninteractive SSH key/agent authentication, existing
+host-key trust, and remote Python 3, sh and ps. A local runner maintains the SSH
+session; its remote process group is cleaned when that session/heartbeat ends.
+This is not a remotely installed persistent service. Do not install missing
+dependencies or rewrite a command/target to bypass a failure unless requested.
+
 Creating a command definition does not authorize executing its shell text.
 Starting a command does not authorize changing its definition. Never change
 lifecycle, kind, command text, target, or groups merely to work around a start
@@ -90,14 +103,17 @@ error. Report a genuine unsupported target or error instead. A Task can be
 started individually; it does not need to become a Service.
 Use `--yes` only within the user's explicit requested execution/termination scope.
 For stop, query status immediately and preserve the returned run ID exactly as a
-decimal string:
+opaque string (including the `external:` prefix for external runs):
 
 ```sh
 lazyterm projects stop PROJECT-UUID COMMAND-UUID --run-id RUN-ID --yes
 ```
 
-`runtime stop` takes the same identifiers and stops only the authenticated managed
-run. There is no arbitrary PID termination endpoint. A stale run ID must trigger
+`runtime stop` takes the same identifiers. Managed runs use authenticated runner
+control; external runs revalidate user/start-time/command/directory and signal
+only that run's individual processes. External output is not captured; saved
+managed output can belong to an earlier run, so inspect its run ID/source.
+There is no arbitrary PID termination endpoint. A stale run ID must trigger
 reinspection, not an attempt to kill its old PID. Do not auto-retry a failed or
 timed-out start; inspect status and listeners first to avoid duplicate services.
 

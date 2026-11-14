@@ -29,7 +29,7 @@ Resources:
              start UUID COMMAND-UUID --yes
              stop UUID COMMAND-UUID --run-id RUN-ID --yes
   tunnels    list | get UUID | create | update UUID
-  runtime    list | stop PROJECT-UUID COMMAND-UUID --run-id RUN-ID --yes
+  runtime    list [--host ALIAS] | stop PROJECT-UUID COMMAND-UUID --run-id RUN-ID --yes
 
 Options:
   --version, -V          Application version
@@ -38,13 +38,15 @@ Options:
   --input FILE|-         JSON object; use - to read stdin. Required for configuration writes.
   --yes                  Authorize one start/stop action; does not authorize other actions.
   --run-id RUN-ID        Exact run identity returned by projects status/runtime list.
+  --host ALIAS          Explicit remote Runtime inspection; queries otherwise stay local.
 
 Updates are partial objects. Nested commands, links and snippets merge by UUID;
 omit an ID to add a nested item. Omitted fields/items are preserved.
 hosts tag accepts {\"groups\":[\"development\"]}; groups create accepts {\"name\":\"development\"}.
 Run lazyterm schema --json for writable field names and examples.
 No SSH login, Host exec, SFTP, password or private-key endpoints are provided.
-Project start supports Local commands of either kind/lifecycle through a background runner.
+Project start supports Local/Host commands of either kind/lifecycle through a background runner.
+Host runs require noninteractive SSH authentication, known host keys and remote Python 3.
 It does not change the saved command definition.
 Run without arguments to open the TUI.
 ";
@@ -91,7 +93,8 @@ struct Arguments {
     positional: Vec<String>,
     input: Option<String>,
     yes: bool,
-    run_id: Option<u64>,
+    run_id: Option<String>,
+    host: Option<String>,
 }
 
 impl Arguments {
@@ -110,11 +113,20 @@ impl Arguments {
                     );
                 }
                 "--run-id" if parsed.run_id.is_none() => {
-                    parsed.run_id = Some(
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| invalid("Missing --run-id value."))?;
+                    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+                    {
+                        return Err(invalid("Invalid --run-id."));
+                    }
+                    parsed.run_id = Some(value.clone());
+                }
+                "--host" if parsed.host.is_none() => {
+                    parsed.host = Some(
                         iter.next()
-                            .ok_or_else(|| invalid("Missing --run-id value."))?
-                            .parse()
-                            .map_err(|_| invalid("Invalid --run-id."))?,
+                            .ok_or_else(|| invalid("Missing --host value."))?
+                            .clone(),
                     );
                 }
                 value if value.starts_with('-') => {
@@ -256,6 +268,7 @@ fn dispatch(context: &Context, args: &Arguments) -> Result<Value> {
         && args.input.is_none()
         && !args.yes
         && args.run_id.is_none()
+        && args.host.is_none()
     {
         return Ok(schema());
     }
@@ -280,6 +293,7 @@ fn dispatch(context: &Context, args: &Arguments) -> Result<Value> {
     if (args.input.is_some() && !write)
         || (args.yes && !control)
         || (args.run_id.is_some() && action != "stop")
+        || (args.host.is_some() && (resource != "runtime" || action != "list"))
     {
         return Err(invalid("An option is not valid for this action."));
     }
@@ -299,7 +313,7 @@ fn dispatch(context: &Context, args: &Arguments) -> Result<Value> {
             project_operation(context, args, action)
         }
         "runtime" if action == "stop" => project_operation(context, args, "stop"),
-        "runtime" => runtime(context),
+        "runtime" => runtime(context, args),
         _ => {
             let metadata = context.metadata()?;
             let value = metadata_collection(&metadata, resource)?;
@@ -814,28 +828,69 @@ fn snapshot_value(snapshot: &crate::project_runner::Snapshot) -> Value {
     json!({"project_id":snapshot.owner.key.0,"command_id":snapshot.owner.key.1,
         "run_id":snapshot.owner.run_id.to_string(),"process_group":snapshot.owner.process_group,
         "active":snapshot.active(),"status":snapshot.status.label(),"directory":snapshot.directory,
-        "execution_lifecycle":"Persistent"})
+        "execution_lifecycle":"Persistent","source":"managed","target":snapshot.target})
+}
+
+fn external_value(run: &crate::project_monitor::ExternalRun) -> Value {
+    json!({"project_id":run.key.0,"command_id":run.key.1,"run_id":run.run_id(),
+        "source":"external","target":"Local","status":"external_running","active":true,
+        "pid":run.root.pid,"directory":run.directory,"ports":run.ports,
+        "execution_lifecycle":null})
+}
+
+fn managed_owners(context: &Context, metadata: &Metadata) -> Vec<crate::projects::ProjectOwner> {
+    metadata
+        .projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .commands
+                .iter()
+                .map(move |command| (project.id, command.id))
+        })
+        .filter_map(|key| {
+            crate::project_runner::inspect(&context.data.join("project-logs"), key)
+                .ok()
+                .flatten()
+        })
+        .filter(|snapshot| snapshot.active() && snapshot.target == ProjectTarget::Local)
+        .map(|snapshot| snapshot.owner)
+        .collect()
 }
 
 fn project_operation(context: &Context, args: &Arguments, action: &str) -> Result<Value> {
     let metadata = context.metadata()?;
     let root = context.data.join("project-logs");
     if action == "status" {
+        let owners = managed_owners(context, &metadata);
+        let external = crate::project_monitor::inspect(&metadata.projects, &owners);
         let mut result = Vec::new();
         for project in &metadata.projects {
             for command in &project.commands {
                 let key = (project.id, command.id);
                 let observed = crate::project_runner::inspect(&root, key);
-                let state = match observed {
+                let mut state = match observed {
                     Ok(Some(snapshot)) => snapshot_value(&snapshot),
                     Ok(None) => json!({"status":"unobserved","active":null}),
                     Err(_) => {
                         json!({"status":"unavailable","active":null,"error":"Runner unavailable; use the TUI recovery workflow."})
                     }
                 };
+                let external_runs: Vec<Value> = external
+                    .as_ref()
+                    .ok()
+                    .and_then(|runs| runs.get(&key))
+                    .into_iter()
+                    .flatten()
+                    .map(external_value)
+                    .collect();
+                if state["active"] != true && !external_runs.is_empty() {
+                    state = external_runs[0].clone();
+                }
                 result.push(json!({"project_id":project.id,"command_id":command.id,
                     "project":project.name,"command":command.name,
-                    "target":execution_target(project, command),"run":state}));
+                    "target":execution_target(project, command),"run":state,
+                    "external_runs":external_runs,"external_inspection_error":external.as_ref().err()}));
             }
         }
         return Ok(json!(result));
@@ -851,23 +906,85 @@ fn project_operation(context: &Context, args: &Arguments, action: &str) -> Resul
         .iter()
         .find(|command| command.id == key.1)
         .ok_or_else(|| fail("not_found", "Command UUID not found."))?;
-    if *execution_target(project, command) != ProjectTarget::Local {
-        return Err(fail(
-            "unsupported",
-            "CLI lifecycle/output currently supports Local runner commands only; use the TUI for Host-targeted Projects.",
-        ));
-    }
     match action {
         "start" => {
             nonempty(&command.command)?;
-            crate::projects::working_directory(project, command)?;
-            let handle = crate::project_runner::start(&root, project, command)?;
+            let target = execution_target(project, command);
+            let handle = if let ProjectTarget::Host(alias) = target {
+                if !context
+                    .catalog()?
+                    .hosts
+                    .iter()
+                    .any(|host| &host.alias == alias)
+                {
+                    return Err(fail(
+                        "not_found",
+                        "Project Host is missing; refresh the Host configuration.",
+                    ));
+                }
+                crate::project_runner::start_with_config(
+                    &root,
+                    project,
+                    command,
+                    Some(context.home.join(".ssh/config")),
+                )?
+            } else {
+                crate::projects::working_directory(project, command)?;
+                let runs = crate::project_monitor::inspect(
+                    &metadata.projects,
+                    &managed_owners(context, &metadata),
+                )
+                .map_err(|message| fail("inspection_failed", message))?;
+                if runs.get(&key).is_some_and(|runs| !runs.is_empty()) {
+                    return Err(fail(
+                        "conflict",
+                        "This command is already running externally; inspect status before acting.",
+                    ));
+                }
+                crate::project_runner::start(&root, project, command)?
+            };
             Ok(snapshot_value(&handle.snapshot))
         }
         "stop" => {
             let run_id = args
                 .run_id
+                .as_deref()
                 .ok_or_else(|| invalid("--run-id is required; query status first."))?;
+            if run_id.starts_with("external:") {
+                if let Some(snapshot) = crate::project_runner::inspect(&root, key)?
+                    && snapshot.active()
+                {
+                    return Err(fail(
+                        "conflict",
+                        "A managed run replaced the external run; query status again.",
+                    ));
+                }
+                let runs = crate::project_monitor::inspect(
+                    &metadata.projects,
+                    &managed_owners(context, &metadata),
+                )
+                .map_err(|message| fail("inspection_failed", message))?;
+                let run = runs
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .find(|run| run.run_id() == run_id)
+                    .ok_or_else(|| {
+                        fail(
+                            "conflict",
+                            "External run identity changed; query status again before stopping.",
+                        )
+                    })?;
+                crate::project_monitor::stop_external(std::slice::from_ref(run))
+                    .map_err(|message| fail("conflict", message))?;
+                let mut result = external_value(run);
+                result["active"] = false.into();
+                result["status"] = "stopped".into();
+                return Ok(result);
+            }
+            let run_id = run_id
+                .parse()
+                .map_err(|_| invalid("Invalid managed --run-id."))?;
             Ok(snapshot_value(&crate::project_runner::stop_observed(
                 &root, key, run_id,
             )?))
@@ -886,31 +1003,60 @@ fn project_operation(context: &Context, args: &Arguments, action: &str) -> Resul
     }
 }
 
-fn runtime(context: &Context) -> Result<Value> {
+fn runtime(context: &Context, args: &Arguments) -> Result<Value> {
     let metadata = context.metadata()?;
-    let mut owners = Vec::new();
-    for project in &metadata.projects {
-        for command in &project.commands {
-            if *execution_target(project, command) == ProjectTarget::Local
-                && let Ok(Some(snapshot)) = crate::project_runner::inspect(
-                    &context.data.join("project-logs"),
-                    (project.id, command.id),
-                )
-                && snapshot.active()
-            {
-                owners.push(snapshot.owner);
+    let owners = managed_owners(context, &metadata);
+    let target = if let Some(alias) = &args.host {
+        if !context
+            .catalog()?
+            .hosts
+            .iter()
+            .any(|host| &host.alias == alias)
+        {
+            return Err(fail("not_found", "Runtime Host alias not found."));
+        }
+        crate::runtime::RuntimeTarget::Host(alias.clone())
+    } else {
+        crate::runtime::RuntimeTarget::Local
+    };
+    let mut entries = crate::runtime::inspect_with_config(
+        &target,
+        &owners,
+        &[],
+        Some(&context.home.join(".ssh/config")),
+    )
+    .map_err(|message| fail("inspection_failed", message))?;
+    let external = if target == crate::runtime::RuntimeTarget::Local {
+        crate::project_monitor::inspect(&metadata.projects, &owners)
+    } else {
+        Ok(Default::default())
+    };
+    if let Ok(runs) = &external {
+        for entry in &mut entries {
+            entry.external_project = runs
+                .values()
+                .flatten()
+                .find(|run| {
+                    run.processes
+                        .iter()
+                        .any(|process| Some(process.pid) == entry.pid)
+                })
+                .cloned();
+            if entry.external_project.is_some() {
+                entry.origin = crate::runtime::RuntimeOrigin::ExternalProject;
+                entry.origin_reason =
+                    "Matched Project directory, command, user and process identity.".into();
             }
         }
     }
-    let entries = crate::runtime::inspect(&crate::runtime::RuntimeTarget::Local, &owners, &[])
-        .map_err(|message| fail("inspection_failed", message))?;
     Ok(
-        json!({"target":"Local","entries":entries.iter().map(|entry| json!({
+        json!({"target":target.label(),"external_inspection_error":external.err(),"entries":entries.iter().map(|entry| json!({
         "protocol":entry.protocol,"address":entry.address,"port":entry.port,"pid":entry.pid,
         "process":entry.process,"user":entry.user,"command":entry.command,
         "working_directory":entry.working_directory,"origin":entry.origin.label(),
         "origin_reason":entry.origin_reason,"kind":entry.kind.label(),
         "project":entry.project.as_ref().map(|owner| json!({"project_id":owner.key.0,"command_id":owner.key.1,"run_id":owner.run_id.to_string()})),
+        "external_project":entry.external_project.as_ref().map(external_value),
     })).collect::<Vec<_>>()}),
     )
 }
@@ -977,8 +1123,9 @@ fn schema() -> Value {
         "tunnels":{"label":"database","host_alias":"example","custom_host":false,"kind":"Local","bind_address":"127.0.0.1","local_port":13306,
             "remote_host":"127.0.0.1","remote_port":3306,"lifecycle":"App","auto_reconnect":false},
         "targets":["Local",{"Host":"existing-host-alias"}],
-        "read_scope":"Hosts, groups, Projects, Snippet templates, Tunnel definitions, Local Runtime and managed runner status/output",
-        "execution_scope":"Local Project start/stop for App/Persistent and Task/Service definitions; CLI runs use a Persistent background runner without changing configuration; runtime stop is the same managed-run operation; --yes authorizes one action",
+        "read_scope":"Hosts, groups, Projects, Snippet templates, Tunnel definitions, Local Runtime or explicit runtime list --host ALIAS, managed runner status/output and recognized Local external Project processes",
+        "execution_scope":"Local/Host Project start/stop for App/Persistent and Task/Service definitions; CLI runs use a local Persistent background runner without changing configuration; Host runs require Python 3 and noninteractive SSH, stay tied to that SSH connection and clean up after disconnect; recognized Local external Project runs can be stopped with their opaque external run ID; runtime stop is the same Project-run operation; --yes authorizes one action",
+        "runtime":{"default_target":"Local","remote":"runtime list --host EXISTING-ALIAS","remote_authentication":"BatchMode, strict known_hosts, no credential prompt","external_stop":"Project UUID + command UUID + external run ID + --yes; no PID kill"},
         "excluded":["SSH login","Host exec","SFTP","SSH key deployment","credential access","MCP","arbitrary PID termination"]
     })
 }

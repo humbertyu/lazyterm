@@ -320,6 +320,7 @@ pub struct App {
     pub tunnel_statuses: std::collections::HashMap<uuid::Uuid, TunnelStatus>,
     pub metadata: Metadata,
     pub metadata_error: bool,
+    configuration_checked_at: Option<Instant>,
     #[cfg(test)]
     pub(crate) metadata_save_path: Option<PathBuf>,
     pub active_group: Option<HostGroup>,
@@ -936,6 +937,7 @@ impl App {
                 .collect(),
             metadata,
             metadata_error,
+            configuration_checked_at: None,
             #[cfg(test)]
             metadata_save_path: None,
             active_group: None,
@@ -6479,6 +6481,94 @@ impl App {
         self.switch_section(visible[(index + visible.len() - 1) % visible.len()]);
     }
 
+    pub fn poll_configuration(&mut self) {
+        if self
+            .configuration_checked_at
+            .is_some_and(|time| time.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.configuration_checked_at = Some(Instant::now());
+        // Never replace the context underneath an edit or a pending confirmation.
+        if self.host_dialog.is_some()
+            || self.host_group_dialog.is_some()
+            || self.host_action_dialog.is_some()
+            || self.tunnel_dialog.is_some()
+            || self.snippet_dialog.is_some()
+            || self.package_dialog.is_some()
+            || self.credential_export_dialog.is_some()
+            || self.credential_import_dialog.is_some()
+            || self.import_confirmation.is_some()
+            || self.snippet_confirmation.is_some()
+            || self.snippet_delete_confirmation.is_some()
+            || self.workspace.form.is_some()
+            || self.workspace.delete.is_some()
+            || self.workspace.confirmation.is_some()
+            || self.tags_dialog.is_some()
+            || self.connection_dialog.is_some()
+            || self.host_password_dialog.is_some()
+            || self.file_dialog.is_some()
+            || self.credentials_modal()
+            || self.settings_picker.is_some()
+            || self.sync_dialog.is_some()
+            || self.sync_worker.is_some()
+            || self.runtime_kill_confirmation.is_some()
+            || self.runtime_force_kill_confirmation.is_some()
+            || self.host_picker_open
+            || self.runtime_host_picker_open
+        {
+            return;
+        }
+        let Ok(path) = self.metadata_path() else {
+            return;
+        };
+        let result = (|| -> io::Result<()> {
+            if self.metadata.changed_on_disk(&path)? || self.metadata_error {
+                let metadata = Metadata::read_existing(&path)?;
+                if metadata.version != 3 {
+                    return Err(io::Error::other(
+                        "Configuration version changed; restart LazyTerm to migrate it.",
+                    ));
+                }
+                let project_id = self.selected_project().map(|project| project.id);
+                self.show_hidden_files = metadata.show_hidden_files;
+                self.metadata = metadata;
+                self.metadata_error = false;
+                if let Some(id) = project_id {
+                    self.workspace.selected_project = self
+                        .metadata
+                        .projects
+                        .iter()
+                        .position(|p| p.id == id)
+                        .unwrap_or(0);
+                }
+                self.workspace.selected_project = self
+                    .workspace
+                    .selected_project
+                    .min(self.metadata.projects.len().saturating_sub(1));
+                self.project_service.restore(&self.metadata.projects);
+                self.refresh_host_key_sources();
+                self.clamp_selection();
+                self.notice = Some("Configuration updated by another client; refreshed.".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.metadata_error = true;
+            self.notice = Some(format!(
+                "Configuration refresh failed; keeping current data: {error}"
+            ));
+        }
+        #[cfg(not(test))]
+        {
+            let hosts = HostCatalog::load();
+            if hosts.error.is_none() && hosts.hosts != self.hosts.hosts {
+                self.hosts = hosts;
+                self.clamp_selection();
+            }
+        }
+    }
+
     fn refresh_hosts(&mut self) {
         self.hosts = HostCatalog::load();
         self.refresh_host_key_sources();
@@ -8813,6 +8903,52 @@ mod tests {
 
         assert_eq!(app.local_files.path, root.join("one"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_configuration_refresh_preserves_edits_and_rejects_missing_or_invalid_files() {
+        let fixture = crate::projects::tests::Fixture::new("cli-refresh");
+        let path = fixture.root.join("hosts.json");
+        let mut initial = Metadata::default();
+        initial.projects.push(fixture.project.clone());
+        initial.save_to(&path).unwrap();
+        let mut app = App::with_catalog(HostCatalog::default(), Metadata::read_from(&path));
+        app.metadata_save_path = Some(path.clone());
+        app.section = NavSection::Projects;
+        let mut external = Metadata::read_from(&path).unwrap();
+        external.projects[0].name = "changed through CLI".into();
+        external.save_to(&path).unwrap();
+        app.file_dialog = Some(FileDialog::CreateDir {
+            pane: FilePane::Local,
+            value: "draft".into(),
+            cursor: 5,
+        });
+        app.poll_configuration();
+        assert_ne!(app.metadata.projects[0].name, "changed through CLI");
+        app.file_dialog = None;
+        app.configuration_checked_at = None;
+        app.poll_configuration();
+        assert_eq!(app.metadata.projects[0].name, "changed through CLI");
+        assert_eq!(app.section, NavSection::Projects);
+        let valid = fs::read(&path).unwrap();
+        fs::write(&path, b"{broken").unwrap();
+        app.configuration_checked_at = None;
+        app.poll_configuration();
+        assert!(app.metadata_error);
+        assert_eq!(app.metadata.projects.len(), 1);
+        fs::remove_file(&path).unwrap();
+        app.configuration_checked_at = None;
+        app.poll_configuration();
+        assert_eq!(app.metadata.projects.len(), 1);
+        fs::write(&path, valid).unwrap();
+        let mut external = Metadata::read_from(&path).unwrap();
+        external.projects[0].name = "recovered".into();
+        external.save_to(&path).unwrap();
+        app.configuration_checked_at = None;
+        app.poll_configuration();
+        assert!(!app.metadata_error);
+        assert_eq!(app.metadata.projects[0].name, "recovered");
+        assert!(app.save_metadata());
     }
 
     #[test]

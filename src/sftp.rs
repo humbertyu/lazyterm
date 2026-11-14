@@ -1422,7 +1422,7 @@ mod tests {
         app.metadata_save_path = Some(fixture.root.join("app-hosts.json"));
         app.set_host_context(Some("lazyterm-fixture".into()));
         app.handle_event(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyCode::Char('2'),
             crossterm::event::KeyModifiers::NONE,
         ));
         app.start_sftp_listing("lazyterm-fixture".into(), remote_root.display().to_string());
@@ -1448,7 +1448,7 @@ mod tests {
         ));
         assert_eq!(app.section, crate::app::NavSection::Hosts);
         app.handle_event(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyCode::Char('2'),
             crossterm::event::KeyModifiers::NONE,
         ));
         assert_eq!(app.section, crate::app::NavSection::Files);
