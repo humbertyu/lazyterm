@@ -57,6 +57,7 @@ pub enum FileDialog {
         pane: FilePane,
         old_name: String,
         value: String,
+        cursor: usize,
     },
     Delete {
         pane: FilePane,
@@ -66,10 +67,46 @@ pub enum FileDialog {
     CreateDir {
         pane: FilePane,
         value: String,
+        cursor: usize,
     },
     TransferConflict {
         request: TransferRequest,
     },
+}
+
+fn edit_file_name(value: &mut String, cursor: &mut usize, key: KeyCode) {
+    let previous = || {
+        value[..*cursor]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i)
+    };
+    let next = || {
+        value[*cursor..]
+            .chars()
+            .next()
+            .map_or(*cursor, |character| *cursor + character.len_utf8())
+    };
+    match key {
+        KeyCode::Left => *cursor = previous(),
+        KeyCode::Right => *cursor = next(),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = value.len(),
+        KeyCode::Backspace if *cursor > 0 => {
+            let start = previous();
+            value.drain(start..*cursor);
+            *cursor = start;
+        }
+        KeyCode::Delete if *cursor < value.len() => {
+            let end = next();
+            value.drain(*cursor..end);
+        }
+        KeyCode::Char(character) if !character.is_control() => {
+            value.insert(*cursor, character);
+            *cursor += character.len_utf8();
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1703,6 +1740,7 @@ impl App {
                 self.file_dialog = Some(FileDialog::Rename {
                     pane: self.active_file_pane,
                     old_name: name.clone(),
+                    cursor: name.len(),
                     value: name,
                 });
             }
@@ -1727,6 +1765,7 @@ impl App {
         self.file_dialog = Some(FileDialog::CreateDir {
             pane: self.active_file_pane,
             value: String::new(),
+            cursor: 0,
         });
     }
 
@@ -1878,44 +1917,40 @@ impl App {
                 pane,
                 old_name,
                 mut value,
+                mut cursor,
             } => match key {
                 KeyCode::Esc => self.file_dialog = None,
-                KeyCode::Backspace => {
-                    value.pop();
-                    self.file_dialog = Some(FileDialog::Rename {
-                        pane,
-                        old_name,
-                        value,
-                    });
-                }
                 KeyCode::Enter => self.submit_file_rename(pane, old_name, value),
-                KeyCode::Char(character) if !character.is_control() => {
-                    value.push(character);
+                _ => {
+                    edit_file_name(&mut value, &mut cursor, key);
                     self.file_dialog = Some(FileDialog::Rename {
                         pane,
                         old_name,
                         value,
+                        cursor,
                     });
                 }
-                _ => {}
             },
             FileDialog::Delete { pane, name, is_dir } => match key {
                 KeyCode::Char('y') | KeyCode::Enter => self.submit_file_delete(pane, name, is_dir),
                 KeyCode::Char('n') | KeyCode::Esc => self.file_dialog = None,
                 _ => {}
             },
-            FileDialog::CreateDir { pane, mut value } => match key {
+            FileDialog::CreateDir {
+                pane,
+                mut value,
+                mut cursor,
+            } => match key {
                 KeyCode::Esc => self.file_dialog = None,
-                KeyCode::Backspace => {
-                    value.pop();
-                    self.file_dialog = Some(FileDialog::CreateDir { pane, value });
-                }
                 KeyCode::Enter => self.submit_create_dir(pane, value),
-                KeyCode::Char(character) if !character.is_control() => {
-                    value.push(character);
-                    self.file_dialog = Some(FileDialog::CreateDir { pane, value });
+                _ => {
+                    edit_file_name(&mut value, &mut cursor, key);
+                    self.file_dialog = Some(FileDialog::CreateDir {
+                        pane,
+                        value,
+                        cursor,
+                    });
                 }
-                _ => {}
             },
             FileDialog::TransferConflict { request } => match key {
                 KeyCode::Char('y') | KeyCode::Enter => {
@@ -8467,6 +8502,55 @@ mod tests {
         assert!(app.show_hidden_files);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_name_dialogs_edit_at_the_cursor_without_navigating_panes() {
+        let mut app = app_fixture();
+        app.section = NavSection::Files;
+        for pane in [FilePane::Local, FilePane::Remote] {
+            for rename in [true, false] {
+                app.active_file_pane = pane;
+                app.file_dialog = Some(if rename {
+                    FileDialog::Rename {
+                        pane,
+                        old_name: "ab.txt".into(),
+                        value: "ab.txt".into(),
+                        cursor: 6,
+                    }
+                } else {
+                    FileDialog::CreateDir {
+                        pane,
+                        value: "ab.txt".into(),
+                        cursor: 6,
+                    }
+                });
+                for key in [
+                    KeyCode::Home,
+                    KeyCode::Right,
+                    KeyCode::Char('中'),
+                    KeyCode::Left,
+                    KeyCode::Delete,
+                    KeyCode::Char('文'),
+                    KeyCode::Backspace,
+                    KeyCode::End,
+                    KeyCode::Left,
+                    KeyCode::Char('!'),
+                ] {
+                    press(&mut app, key, KeyModifiers::NONE);
+                }
+                let (value, cursor) = match app.file_dialog.as_ref().unwrap() {
+                    FileDialog::Rename { value, cursor, .. }
+                    | FileDialog::CreateDir { value, cursor, .. } => (value, cursor),
+                    _ => unreachable!(),
+                };
+                assert_eq!(value, "ab.tx!t");
+                assert_eq!(*cursor, 6);
+                assert_eq!(app.active_file_pane, pane);
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                assert!(app.file_dialog.is_none());
+            }
+        }
     }
 
     #[test]

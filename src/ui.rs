@@ -3579,9 +3579,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         "Enter save tags  Esc cancel"
     } else if let Some(dialog) = &app.file_dialog {
         match dialog {
-            FileDialog::Rename { .. } => "Type new name  Enter confirm  Esc cancel",
+            FileDialog::Rename { .. } => "Left/Right move cursor  Enter save  Esc cancel",
             FileDialog::Delete { .. } => "y / Enter confirm  n / Esc cancel",
-            FileDialog::CreateDir { .. } => "Type directory name  Enter confirm  Esc cancel",
+            FileDialog::CreateDir { .. } => "Left/Right move cursor  Enter save  Esc cancel",
             FileDialog::TransferConflict { .. } => "y / Enter overwrite  n / Esc cancel",
         }
     } else if app.searching {
@@ -3687,23 +3687,32 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
     match dialog {
         FileDialog::Rename {
-            old_name, value, ..
+            old_name,
+            value,
+            cursor,
+            ..
         } => {
             let area = centered_rect(68, 7, frame.area());
             frame.render_widget(Clear, area);
+            let block = action_panel(" RENAME FILE ", "Enter save  Esc cancel", BORDER.into());
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(format!("Rename \"{old_name}\"")),
-                    input_line("Name", value, true, false),
-                    Line::from(Span::styled(
-                        "Enter confirm   Esc cancel",
-                        Style::default().fg(MUTED.into()),
-                    )),
-                ])
-                .style(Style::default().fg(TEXT.into()))
-                .block(panel(" RENAME FILE "))
-                .wrap(Wrap { trim: true }),
-                area,
+                Paragraph::new(format!("Rename \"{old_name}\""))
+                    .style(Style::default().fg(TEXT.into()))
+                    .wrap(Wrap { trim: false }),
+                Rect {
+                    height: inner.height.min(2),
+                    ..inner
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(file_name_input(value, *cursor, inner.width)),
+                Rect {
+                    y: inner.y.saturating_add(2),
+                    height: inner.height.saturating_sub(2).min(1),
+                    ..inner
+                },
             );
         }
         FileDialog::Delete { name, is_dir, .. } => {
@@ -3733,22 +3742,15 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
                 area,
             );
         }
-        FileDialog::CreateDir { value, .. } => {
+        FileDialog::CreateDir { value, cursor, .. } => {
             let area = centered_rect(68, 7, frame.area());
             frame.render_widget(Clear, area);
+            let block = action_panel(" NEW DIRECTORY ", "Enter save  Esc cancel", BORDER.into());
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
             frame.render_widget(
-                Paragraph::new(vec![
-                    input_line("Name", value, true, false),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "Enter confirm   Esc cancel",
-                        Style::default().fg(MUTED.into()),
-                    )),
-                ])
-                .style(Style::default().fg(TEXT.into()))
-                .block(panel(" NEW DIRECTORY "))
-                .wrap(Wrap { trim: true }),
-                area,
+                Paragraph::new(file_name_input(value, *cursor, inner.width)),
+                inner,
             );
         }
         FileDialog::TransferConflict { request } => {
@@ -3780,6 +3782,52 @@ fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
             );
         }
     }
+}
+
+fn file_name_input(value: &str, cursor: usize, width: u16) -> Line<'static> {
+    let mut line = input_line("Name", "", true, false);
+    line.spans.pop();
+    let available = usize::from(width).saturating_sub(8);
+    if available == 0 {
+        return line;
+    }
+    let mut start = cursor;
+    let mut used = value[cursor..]
+        .chars()
+        .next()
+        .map_or(1, |c| c.width().unwrap_or(0).max(1));
+    for (index, character) in value[..cursor].char_indices().rev() {
+        let size = character.width().unwrap_or(0);
+        if used + size > available {
+            break;
+        }
+        used += size;
+        start = index;
+    }
+    line.spans.push(Span::styled(
+        value[start..cursor].to_string(),
+        Style::default().fg(TEXT.into()),
+    ));
+    let mut characters = value[cursor..].chars();
+    let caret = characters.next().unwrap_or(' ');
+    line.spans.push(Span::styled(
+        caret.to_string(),
+        Style::default()
+            .fg(TEXT.into())
+            .add_modifier(Modifier::REVERSED),
+    ));
+    let mut tail = String::new();
+    for character in characters {
+        let size = character.width().unwrap_or(0);
+        if used + size > available {
+            break;
+        }
+        used += size;
+        tail.push(character);
+    }
+    line.spans
+        .push(Span::styled(tail, Style::default().fg(TEXT.into())));
+    line
 }
 
 fn render_settings_picker(frame: &mut Frame, app: &App) {
@@ -4578,6 +4626,46 @@ mod tests {
         app::{App, TransferStatus, TransferTask},
         hosts::{Host, HostCatalog},
     };
+
+    #[test]
+    fn file_name_dialogs_keep_actions_on_bottom_and_show_the_edit_position() {
+        for (width, height) in [(90, 24), (44, 14)] {
+            for dialog in [
+                FileDialog::Rename {
+                    pane: FilePane::Local,
+                    old_name: "before.txt".into(),
+                    value: "after.txt".into(),
+                    cursor: 2,
+                },
+                FileDialog::CreateDir {
+                    pane: FilePane::Remote,
+                    value: "after.txt".into(),
+                    cursor: 2,
+                },
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| render_file_dialog(frame, &dialog))
+                    .unwrap();
+                let area = centered_rect(68, 7, Rect::new(0, 0, width, height));
+                let buffer = terminal.backend().buffer();
+                let bottom: String = (area.x..area.right())
+                    .map(|x| buffer[(x, area.bottom() - 1)].symbol())
+                    .collect();
+                assert!(bottom.contains("Enter save  Esc cancel"));
+                let caret = buffer
+                    .content
+                    .iter()
+                    .find(|cell| cell.modifier.contains(Modifier::REVERSED))
+                    .unwrap();
+                assert_eq!(caret.symbol(), "t");
+            }
+        }
+        let value = format!("{}中文.txt", "a".repeat(200));
+        let line = file_name_input(&value, value.len(), 30);
+        assert!(line.width() <= 30);
+        assert!(line.to_string().contains("中文.txt"));
+    }
 
     #[test]
     fn host_action_notice_renders_as_centered_dialog() {
