@@ -438,6 +438,12 @@ impl ProjectService {
         handle: crate::project_runner::Handle,
         lifecycle: ProjectLifecycle,
     ) {
+        // A live independent runner survives TUI exit, regardless of the saved policy.
+        let lifecycle = if handle.active() {
+            ProjectLifecycle::Persistent
+        } else {
+            lifecycle
+        };
         let snapshot = &handle.snapshot;
         self.tasks.insert(
             snapshot.owner.key,
@@ -1230,6 +1236,33 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn app_definition_restores_cli_runner_as_background_without_changing_policy() {
+        let mut fixture = Fixture::new("cli-app-runner");
+        let command = fixture.listener_command(true);
+        assert_eq!(command.lifecycle, ProjectLifecycle::App);
+        fixture.project.commands.push(command.clone());
+        let key = (fixture.project.id, command.id);
+        let _cleanup = PersistentCleanup::new(&fixture, key);
+        let handle =
+            crate::project_runner::start(&fixture.root.join("logs"), &fixture.project, &command)
+                .unwrap();
+        let mut service = fixture.service();
+        service.restore(std::slice::from_ref(&fixture.project));
+        until(&mut service, |_| fixture.ready().is_some());
+        let (_, port) = fixture.ready().unwrap();
+        assert_eq!(service.tasks[&key].lifecycle, ProjectLifecycle::Persistent);
+        assert_eq!(fixture.project.commands[0].lifecycle, ProjectLifecycle::App);
+        assert_eq!(service.tasks[&key].owner, handle.snapshot.owner);
+        drop(service);
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+        let mut restored = fixture.service();
+        restored.restore(std::slice::from_ref(&fixture.project));
+        assert!(restored.start(&fixture.project, &command).is_err());
+        restored.stop(key).unwrap();
+        until(&mut restored, |service| !service.active(key));
     }
 
     #[test]

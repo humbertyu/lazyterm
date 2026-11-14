@@ -105,8 +105,13 @@ version, open the TUI once to perform its backed-up migration.
 
 ## Process Actions
 
-These endpoints support **Local Project commands with Persistent lifecycle**.
-Host-targeted or app-scoped starts, external PID termination, Tunnel lifecycle
+These endpoints support **Local Project commands with either saved lifecycle
+(App/Persistent) and either kind (Task/Service)**. Each CLI start runs through an
+independent background runner and reports `execution_lifecycle: "Persistent"`.
+The saved definition stays unchanged: its lifecycle controls future TUI starts,
+while a CLI-started run survives CLI/TUI exit until completion or explicit stop.
+Tasks finish normally; they do not need to be reclassified as Services.
+Host-targeted starts, external PID termination, Tunnel lifecycle
 control, and remote Runtime inspection remain in the TUI.
 
 ```sh
@@ -128,7 +133,8 @@ managed starts. It does not detect every externally started copy.
 Before stopping, query status and pass the returned run ID. The existing runner
 protocol authenticates the run and verifies ownership; a replaced run ID fails
 with a conflict rather than stopping the replacement. TERM/KILL behavior is the
-same as the TUI Project supervisor. Persistent processes survive CLI and TUI exit.
+same as the TUI Project supervisor. CLI-started processes survive CLI and TUI exit.
+Agents must not rewrite command definitions to work around execution errors.
 
 `runtime list` inspects local TCP listeners and provides command/path/origin
 evidence when the OS exposes it. Managed persistent Project attribution includes
@@ -164,3 +170,33 @@ that client's skill loader. Only instructions are installed; configuration and
 credentials remain in LazyTerm's normal locations. Ensure the `lazyterm` binary
 is on the Agent's PATH. The Skill uses `lazyterm schema --json` for the current
 contract and does not require MCP or a separate server.
+
+The Skill treats LazyTerm as the default inventory for this machine's Hosts,
+Projects, web links, and local development services. Users can ask "有哪些主机",
+"看看哪些服务在跑", "哪个程序占用 3000 端口", or "把这个项目的启动命令记下来"
+without mentioning LazyTerm. An explicitly named tool or target machine takes
+precedence. Inventory queries do not imply permission to start/stop services,
+and missing saved entries do not prove that a server or process does not exist.
+
+### Local Development
+
+To test frequent code changes, pin a local Skill package to the checkout's
+development executable instead of installing a separate copy:
+
+```sh
+cargo build
+python3 scripts/package_skill.py \
+  --binary "$PWD/target/debug/lazyterm" \
+  --output /tmp/lazyterm-workbuddy-skill.zip
+```
+
+Import the ZIP into your Agent client. It contains the portable Skill plus
+`references/local-runtime.md` identifying the absolute executable path.
+Subsequent `cargo build` (or `cargo run`) updates that executable; no CLI
+reinstallation or Skill reimport is needed for binary-only changes. Restart an
+already running TUI to use the new build. Skill instruction changes require a
+new package and reimport. Moving the checkout also requires repackaging.
+The package contains no executable, application configuration, or credentials.
+Do not distribute a locally pinned package to other machines.
+
+Omit `--binary` to generate a portable package that uses `lazyterm` on PATH.

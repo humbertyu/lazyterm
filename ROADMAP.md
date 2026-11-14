@@ -242,7 +242,7 @@ Goal: let a user-approved Agent discover the Hosts, Projects, and local/remote r
 - [ ] Add explicit remote Runtime inspection without introducing a generic Host execution endpoint.
 - [x] List Snippet packages, descriptions, and command templates for Agent reference. Agents execute approved commands through their own tools; the Snippet UI runner is not their execution API.
 - [x] Expose managed persistent Project status and bounded, redacted output summaries.
-- [x] Add explicitly authorized Local/Persistent Project start/stop and equivalent managed-run Runtime stop; reject stale run IDs.
+- [x] Add explicitly authorized Local Project start/stop for both App/Persistent and Task/Service definitions. CLI runs use a background runner without editing saved policies or types; expose actual run lifecycle and reject stale run IDs during managed-run stop.
 - [ ] Extend lifecycle/status coverage to Host-targeted Projects and externally started processes, with equivalent identity and authorization checks.
 - [x] Require `--yes` for each process action and revalidate authenticated managed-run identity immediately before stopping. This flag expresses client authorization; the Skill must respect the user's actual authorization.
 - [x] Omit saved credential fields, private key contents, Keychain data, runner authentication sockets/tokens, and raw unbounded logs. Redact recognized secret patterns in command/output text; arbitrary unlabelled application secrets cannot be guaranteed detectable.

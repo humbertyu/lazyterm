@@ -329,6 +329,15 @@ fn invalid_configuration_and_payloads_do_not_fall_through_to_tui() {
 
 #[test]
 fn persistent_project_cli_controls_only_the_observed_run() {
+    project_cli_controls_only_the_observed_run("Persistent", "Service");
+}
+
+#[test]
+fn app_task_cli_start_preserves_definition_and_controls_background_run() {
+    project_cli_controls_only_the_observed_run("App", "Task");
+}
+
+fn project_cli_controls_only_the_observed_run(lifecycle: &str, kind: &str) {
     let mut client = Client::new();
     let helper =
         shell_words::quote(std::env::current_exe().unwrap().to_str().unwrap()).into_owned();
@@ -337,11 +346,12 @@ fn persistent_project_cli_controls_only_the_observed_run() {
     let created = client.ok(&["projects","create"], Some(json!({
         "name":"disposable","base_path":client.root,"commands":[{
             "name":"wait","command":format!("printf 'password=hidden-cli-secret\\n'; exec {helper} --ignored --exact disposable_listener --nocapture"),
-            "kind":"Service","lifecycle":"Persistent"
+            "kind":kind,"lifecycle":lifecycle
         }]
     })));
     let project = created["id"].as_str().unwrap().to_string();
     let config = client.ok(&["projects", "get", &project], None);
+    let before = fs::read(client.data().join("hosts.json")).unwrap();
     let command = config["commands"][0]["id"].as_str().unwrap().to_string();
     client.error(
         &["projects", "start", &project, &command],
@@ -354,6 +364,9 @@ fn persistent_project_cli_controls_only_the_observed_run() {
     client
         .runs
         .push((project.clone(), command.clone(), run_id.clone()));
+    assert_eq!(run["execution_lifecycle"], "Persistent");
+    assert_eq!(before, fs::read(client.data().join("hosts.json")).unwrap());
+    assert_eq!(client.ok(&["projects", "get", &project], None), config);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let status = client.ok(&["projects", "status"], None);
@@ -427,6 +440,7 @@ fn persistent_project_cli_controls_only_the_observed_run() {
         "stopping a Project must preserve an unrelated listener"
     );
     client.runs.clear();
+    assert_eq!(before, fs::read(client.data().join("hosts.json")).unwrap());
 }
 
 #[test]

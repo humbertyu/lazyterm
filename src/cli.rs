@@ -44,7 +44,8 @@ omit an ID to add a nested item. Omitted fields/items are preserved.
 hosts tag accepts {\"groups\":[\"development\"]}; groups create accepts {\"name\":\"development\"}.
 Run lazyterm schema --json for writable field names and examples.
 No SSH login, Host exec, SFTP, password or private-key endpoints are provided.
-Project start currently supports Local commands with Persistent lifecycle.
+Project start supports Local commands of either kind/lifecycle through a background runner.
+It does not change the saved command definition.
 Run without arguments to open the TUI.
 ";
 
@@ -812,7 +813,8 @@ fn validate_tunnel(
 fn snapshot_value(snapshot: &crate::project_runner::Snapshot) -> Value {
     json!({"project_id":snapshot.owner.key.0,"command_id":snapshot.owner.key.1,
         "run_id":snapshot.owner.run_id.to_string(),"process_group":snapshot.owner.process_group,
-        "active":snapshot.active(),"status":snapshot.status.label(),"directory":snapshot.directory})
+        "active":snapshot.active(),"status":snapshot.status.label(),"directory":snapshot.directory,
+        "execution_lifecycle":"Persistent"})
 }
 
 fn project_operation(context: &Context, args: &Arguments, action: &str) -> Result<Value> {
@@ -857,12 +859,6 @@ fn project_operation(context: &Context, args: &Arguments, action: &str) -> Resul
     }
     match action {
         "start" => {
-            if command.lifecycle != ProjectLifecycle::Persistent {
-                return Err(fail(
-                    "unsupported",
-                    "CLI start requires Persistent lifecycle so the command survives CLI exit.",
-                ));
-            }
             nonempty(&command.command)?;
             crate::projects::working_directory(project, command)?;
             let handle = crate::project_runner::start(&root, project, command)?;
@@ -982,7 +978,7 @@ fn schema() -> Value {
             "remote_host":"127.0.0.1","remote_port":3306,"lifecycle":"App","auto_reconnect":false},
         "targets":["Local",{"Host":"existing-host-alias"}],
         "read_scope":"Hosts, groups, Projects, Snippet templates, Tunnel definitions, Local Runtime and managed runner status/output",
-        "execution_scope":"Local Persistent Project start/stop; runtime stop is the same managed-run operation; --yes authorizes one action",
+        "execution_scope":"Local Project start/stop for App/Persistent and Task/Service definitions; CLI runs use a Persistent background runner without changing configuration; runtime stop is the same managed-run operation; --yes authorizes one action",
         "excluded":["SSH login","Host exec","SFTP","SSH key deployment","credential access","MCP","arbitrary PID termination"]
     })
 }

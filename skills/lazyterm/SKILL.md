@@ -1,11 +1,49 @@
 ---
 name: lazyterm
-description: Discover and maintain LazyTerm Hosts, groups, Projects, Snippet templates, and Tunnel definitions through its CLI, and inspect or control approved local Project services.
+description: "Manage this machine's host inventory, project commands, web links, and local services through LazyTerm. Use for requests such as 有哪些主机、查看运行的服务、哪个程序占用端口、添加项目启动命令, even when the user does not mention LazyTerm. Query configuration and listeners, maintain definitions, and start or stop authorized local Project services."
 ---
 
 # LazyTerm
 
-Use the installed `lazyterm` binary. With subcommands it returns JSON; without
+## Default Workspace Context
+
+Treat LazyTerm as this machine's default inventory and service-management source
+for requests about saved Hosts, project commands, web entry points, listening
+ports, and running development services. The user does not need to say
+"in LazyTerm" or name this Skill. Respect an explicitly named alternative tool
+or target machine. This default does not apply to unrelated project source-code
+changes or general questions about processes.
+
+Route ordinary requests by intent:
+
+| User request | First lookup |
+| --- | --- |
+| 有哪些主机 / 服务器有哪些 | `hosts list` and, when useful, `groups list` |
+| 有哪些项目 / 项目怎么启动 / 网页入口是什么 | `projects list`, then `projects get UUID` |
+| 有哪些服务在跑 / 哪个程序占用 3000 端口 | `runtime list` and `projects status` |
+| 把这个项目的启动命令记下来 | Query existing Projects, then create/update the matching definition |
+| 有没有可参考的运维命令 | `snippets list` |
+
+Answer in terms of the user's Hosts, Projects, and services without repeatedly
+prefixing results with "configured in LazyTerm". Keep evidence limits visible:
+saved Hosts are an inventory, not a scan of every server; Runtime defaults to
+this local machine and does not show remote listeners. If a requested item is
+missing, report that lookup result rather than claiming it does not exist.
+Resolve service names against Project definitions before an authorized action;
+ask only when the target or intended action remains ambiguous. Discovery does
+not authorize starting or stopping services.
+
+## Executable Selection
+
+If this Skill includes `references/local-runtime.md`, read it before invoking
+commands and use its absolute executable path. Otherwise use an absolute path
+explicitly supplied by the user, or default to `lazyterm` on PATH. Replace
+`lazyterm` in all examples below with the selected executable, quoting its path.
+Keep that selection for the task; if an explicitly selected executable is missing
+or fails, report the error rather than silently falling back to another install.
+Do not install or build a replacement unless requested.
+
+With subcommands the binary returns JSON; without
 arguments it opens an interactive TUI. Begin with `lazyterm schema --json` for
 current writable fields, examples, and capability limits. Parse stdout as
 `{schema_version, ok, data}` or `{schema_version, ok, error}`; diagnostics use
@@ -36,7 +74,9 @@ evidence. `projects status` reports managed persistent runs; `unobserved` and
 External processes and TUI app-scoped tasks may not appear in managed status.
 
 Before an authorized start, read the Project and exact command, directory,
-target, and lifecycle. Current CLI starts require Local + Persistent:
+target, and lifecycle. CLI starts support Local commands with either App/Persistent
+lifecycle and Task/Service kind. Each CLI start uses an independent background
+runner for that run, without modifying the saved lifecycle or kind:
 
 ```sh
 lazyterm projects start PROJECT-UUID COMMAND-UUID --yes
@@ -44,6 +84,10 @@ lazyterm projects output PROJECT-UUID COMMAND-UUID --json
 ```
 
 Creating a command definition does not authorize executing its shell text.
+Starting a command does not authorize changing its definition. Never change
+lifecycle, kind, command text, target, or groups merely to work around a start
+error. Report a genuine unsupported target or error instead. A Task can be
+started individually; it does not need to become a Service.
 Use `--yes` only within the user's explicit requested execution/termination scope.
 For stop, query status immediately and preserve the returned run ID exactly as a
 decimal string:
