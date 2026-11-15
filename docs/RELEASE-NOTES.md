@@ -1,21 +1,27 @@
-# LazyTerm 0.9.0 Beta 1
+# LazyTerm 0.9.0 Beta 2
 
 LazyTerm is a local-first terminal workspace for SSH Hosts, SFTP files,
 Tunnels, Snippets, Runtime, Projects, Credentials and Settings. This is a
 public testing build, not a stable release.
 
+## Changes Since Beta 1
+
+- Align the Credentials list borders and selection styling with other tabs.
+- Move Credentials actions to the shared footer and remove obsolete key/Host
+  actions from its navigation hint.
+
 ## Download and Install
 
 - macOS 15 or later; Intel and Apple Silicon use the same
-  `lazyterm-v0.9.0-beta.1-universal-apple-darwin.tar.gz`.
+  `lazyterm-v0.9.0-beta.2-universal-apple-darwin.tar.gz`.
 - Download `SHA256SUMS` and compare the archive's SHA-256 before installing.
 - Extract it and install `lazyterm` to `~/.local/bin`; Rust is not required.
 - The included `docs/BETA-TESTING.md` covers installation and test scenarios.
-  [Read the guide online](https://github.com/humbertyu/lazyterm/blob/v0.9.0-beta.1/docs/BETA-TESTING.md).
+  [Read the guide online](https://github.com/humbertyu/lazyterm/blob/v0.9.0-beta.2/docs/BETA-TESTING.md).
 
 ## Agent and Skill
 
-Download `lazyterm-v0.9.0-beta.1-skill.zip` from this release and install its
+Download `lazyterm-v0.9.0-beta.2-skill.zip` from this release and install its
 `lazyterm` folder using your Agent client's Skill loader or supported Skill
 directory. The binary archive also includes `skills/lazyterm/SKILL.md`.
 The guide includes a ready-to-use Agent installation prompt.

@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: LazyTerm version / 版本
-      placeholder: "lazyterm 0.9.0-beta.1"
+      placeholder: "lazyterm 0.9.0-beta.2"
     validations:
       required: true
   - type: input

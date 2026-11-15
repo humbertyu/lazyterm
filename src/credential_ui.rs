@@ -15,11 +15,13 @@ const ACCENT: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role:
 const TEXT: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Text);
 const MUTED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Muted);
 const BG: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Panel);
+const BORDER: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Border);
+const SELECTED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Selection);
 fn panel(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT.into()))
+        .border_style(Style::default().fg(BORDER.into()))
         .style(Style::default().bg(BG.into()).fg(TEXT.into()))
 }
 
@@ -30,7 +32,7 @@ fn panel_l(app: &App, title: &str) -> Block<'static> {
             crate::i18n::text(app.metadata.language, title)
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT.into()))
+        .border_style(Style::default().fg(BORDER.into()))
         .style(Style::default().bg(BG.into()).fg(TEXT.into()))
 }
 
@@ -98,10 +100,11 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(if inner.width < 84 { 4 } else { 2 }),
     ])
     .split(inner);
-    let content = if rows[0].width >= 84 {
-        Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(rows[0])
+    let body = if state.open { rows[0] } else { inner };
+    let content = if body.width >= 84 {
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(body)
     } else {
-        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(rows[0])
+        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(body)
     };
     let items = app.visible_credentials();
     let password_count = items
@@ -132,7 +135,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
         }
         list_rows.push(ListItem::new(vec![
             Line::from(Span::styled(
-                format!("  {}", item.credential.name),
+                item.credential.name.clone(),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
@@ -157,7 +160,7 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
             .highlight_symbol("> ")
             .highlight_style(
                 Style::default()
-                    .fg(ACCENT.into())
+                    .bg(SELECTED.into())
                     .add_modifier(Modifier::BOLD),
             )
             .block(panel_l(app, "KEYCHAIN & SSH KEYS")),
@@ -250,12 +253,14 @@ pub fn render_page(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "a password  g generate key  i import  e edit  d remove  p copy  r refresh\nEsc back".into()
     };
-    frame.render_widget(
-        Paragraph::new(help)
-            .style(Style::default().fg(MUTED.into()))
-            .wrap(Wrap { trim: false }),
-        rows[1],
-    );
+    if state.open {
+        frame.render_widget(
+            Paragraph::new(help)
+                .style(Style::default().fg(MUTED.into()))
+                .wrap(Wrap { trim: false }),
+            rows[1],
+        );
+    }
 }
 
 fn render_host_key_selector(frame: &mut Frame, app: &App) {

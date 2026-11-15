@@ -1,7 +1,7 @@
 # LazyTerm
 
 **0.9 beta testing:** download the macOS Universal Binary from
-[GitHub Releases](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.1).
+[GitHub Releases](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.2).
 [测试指南 / Beta guide](docs/BETA-TESTING.md) includes installation, known
 limits, feedback instructions, and a prompt you can give your Agent to install
 LazyTerm and its Skill. With Homebrew: `brew tap humbertyu/brew`, then

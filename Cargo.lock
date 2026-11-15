@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "lazyterm"
-version = "0.9.0-beta.1"
+version = "0.9.0-beta.2"
 dependencies = [
  "age",
  "arboard",

@@ -3682,7 +3682,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             "↑↓ select  Enter / Space change  Esc / Tab back  q quit"
         }
     } else if app.section == NavSection::Credentials {
-        "↑↓ select  a password  g generate key  i import  Enter assign  u upload key  q quit"
+        "↑↓ select  a password  g generate key  i import  e edit  d remove  p copy  r refresh  q quit"
     } else {
         "q quit"
     };
