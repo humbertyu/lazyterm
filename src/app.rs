@@ -3327,8 +3327,9 @@ impl App {
             if process.finished.is_none() {
                 process.finished = process.child.try_wait().ok().flatten();
             }
-            if process.finished.is_some() && closed_readers >= 2 {
-                let status = process.finished.expect("checked above");
+            if let Some(status) = process.finished
+                && closed_readers >= 2
+            {
                 let code = status.code().unwrap_or(-1);
                 if let Some(run) = self.snippet_runs.iter_mut().find(|run| run.id == id) {
                     run.status = if code == 255 {
@@ -5324,14 +5325,13 @@ impl App {
                 let package_id = self.metadata.snippet_packages[self.selected_package].id;
                 self.open_snippet_form(package_id, None);
             }
-            KeyCode::Char('b') => {
+            KeyCode::Char('b')
                 if self.metadata.snippet_packages[self.selected_package]
                     .snippets
                     .get(self.selected_snippet)
-                    .is_some()
-                {
-                    self.open_snippet_host_picker();
-                }
+                    .is_some() =>
+            {
+                self.open_snippet_host_picker();
             }
             _ => {}
         }

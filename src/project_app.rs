@@ -1400,14 +1400,13 @@ impl App {
                     self.workspace.form = Some(form);
                 }
             }
-            _ if choices.is_empty() => {
-                if form
+            _ if choices.is_empty()
+                && form
                     .editor
                     .edit(form.selected, &mut form.fields[form.selected], key)
-                    && matches!(key, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
-                {
-                    form.error = None;
-                }
+                && matches!(key, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) =>
+            {
+                form.error = None;
             }
             _ => {}
         }
