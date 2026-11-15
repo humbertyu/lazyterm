@@ -4,7 +4,7 @@ LazyTerm is early-stage software. This roadmap describes intended release bounda
 
 ## Current
 
-The integrated v0.1-v0.6 workflows are the implementation baseline: native SSH, embedded SFTP, tunnels, snippets, Runtime, Projects, credential import/export, crash recovery, and the macOS Universal Binary release pipeline. v0.1 and v0.2 are historical implementation milestones, not pending feature lists; their remaining items below are specific coverage, scope, or acceptance gaps. Initial v0.7 Git configuration sync is available for testing; its remaining implementation and acceptance work is explicitly deferred below while development moves to v0.8 Agent interoperability on `v0.8-agent-friendly`. The former v0.7 Stable Core milestone remains v0.9. No public release is implied.
+The integrated v0.1-v0.6 workflows are the implementation baseline: native SSH, embedded SFTP, tunnels, snippets, Runtime, Projects, credential import/export, crash recovery, and the macOS Universal Binary release pipeline. v0.1 and v0.2 are historical implementation milestones, not pending feature lists. v0.8 Agent interoperability is implemented and covered by CLI/PTY/disposable SSH fixtures; manual Agent/platform acceptance remains open. Development now moves to v0.9 Stable Core on `v0.9-stable-core`. Initial v0.7 Git sync remains experimental and its remaining work stays paused. No public release is implied.
 
 ## Delivery Strategy
 
@@ -23,7 +23,7 @@ Build the integrated core workflows first: Hosts -> SSH / Files -> Tunnels -> Sn
 | Owner | Incomplete / Unverified | Required Before |
 |---|---|---|
 | Hosts | Broader OpenSSH grammar/Include collision coverage; favorites | Managed CRUD acceptance / product scope |
-| SSH | Manual host-key, key/agent, ProxyCommand, terminal-restoration acceptance; cancellable preflight and restricted-account behavior | Declaring native SSH accepted |
+| SSH | Manual key/agent, ProxyCommand, terminal-restoration and restricted-account acceptance; background first-use host-key approval remains excluded | Declaring native SSH accepted |
 | Hosts / UI | Keyboard usability acceptance; legacy metadata cleanup if needed | Beta scope review |
 | Files | Manual edge-case acceptance for external config edits, refresh failures, and rename behavior | Declaring Files accepted |
 | Runtime / Projects | Cross-platform and user acceptance; remote persistent-runner rediscovery remains deferred | Declaring integrated workflows accepted |
@@ -60,7 +60,7 @@ The historical implementation is substantially complete; this is not a claim tha
 
 - Safe writing: backups, atomic replacement, private permissions on newly created files, protection of neighboring managed markers, and preservation of manually added advanced options/comments inside managed blocks are implemented and tested. Full OpenSSH grammar and every alias collision across complex Include expansion still need broader coverage.
 - SSH acceptance: automated disposable fixtures cover password authentication, ProxyJump, and related connection flows. Complete manual acceptance of first-time host-key confirmation, changed-key rejection, key/agent authentication, ProxyCommand, and terminal restoration on success, failure, and interruption remains open.
-- SSH responsiveness: preflight currently blocks the event loop and cannot be cancelled. It runs a remote `true` command, so restricted-command accounts may fail preflight despite supporting the intended session.
+- SSH responsiveness (updated 2026-11-14): native connection preparation runs in a cancellable worker using a private `ssh -M -N` master; it no longer blocks the event loop or executes remote `true`. The terminal client attaches to the authenticated master. Restricted-account and terminal-restoration manual acceptance remain open.
 - Error handling: a missing/unlaunchable SSH executable stays in a TUI error dialog; managed process cleanup and recovery are implemented. Full cross-platform terminal/process acceptance remains open.
 - Persistence: groups and tags are implemented; favorites are not. The legacy `view` metadata property remains readable but no longer selects separate Groups/Hosts pages.
 - Environment: local checks ran with Rust 1.92.0 and system OpenSSH 9.9p2 (LibreSSL 3.3.6) on macOS 15.8.1 Apple Silicon. The release workflow targets macOS 15 Intel and Apple Silicon; its hosted native run is still a release gate.
@@ -291,12 +291,20 @@ Release gate: an Agent using the CLI can accurately discover LazyTerm state, aut
 
 Goal: declare the core local workflow stable.
 
-- [ ] The v0.1-v0.8 release gates are met or remaining exclusions are documented.
-- [ ] Data and configuration formats have a migration policy.
-- [ ] Security review covers credentials, host keys, process arguments, logs, and file permissions.
-- [ ] Supported operating systems and OpenSSH versions are explicit.
-- [ ] Install, upgrade, backup, and uninstall instructions are complete.
+- [x] Document remaining exclusions and carry-over gates from v0.1-v0.8 in `docs/v0.9-acceptance.md`; this does not accept the untested workflows.
+- [x] Document schema versions, upgrade/migration, backup retention, concurrent writers and rollback boundaries in `docs/DATA-MIGRATION.md`.
+- [x] Source security review covers credentials, host keys, process arguments, logs and file permissions; the 2026-11-15 default macOS dependency audit passed with recorded maintenance warnings. Final candidate/platform acceptance remains below.
+- [x] State supported operating systems, tested OpenSSH baseline and remote CLI requirements in `docs/INSTALL.md`.
+- [x] Document install, upgrade, backup, recovery and uninstall in `docs/INSTALL.md` and `docs/DATA-MIGRATION.md`; publication/tap and native hosted validation remain release gates.
+- [x] Enable real SSH/SFTP and Agent CLI/PTY tests in macOS CI and both architecture release jobs.
+- [x] Reject stale Host key assignment and verify cross-Include collision/symlink writes with disposable configuration.
+- [ ] Record candidate-specific automated, manual Agent/TUI and native arm64/Intel acceptance results.
 - [ ] No known release-blocking defects remain.
+
+Started 2026-11-14 after v0.8 commit `87d377c`. Keep the package version unchanged
+until a release candidate is deliberately selected. v0.7 synchronization is not
+resumed by this milestone. Acceptance evidence and explicit exclusions live in
+`docs/v0.9-acceptance.md`.
 
 ## Later, only if justified
 

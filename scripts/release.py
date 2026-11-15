@@ -16,7 +16,11 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 UNIVERSAL = "universal-apple-darwin"
-DOCUMENTS = ("README.md", "LICENSE", "docs/INSTALL.md", "docs/SECURITY-REVIEW.md")
+DOCUMENTS = (
+    "README.md", "LICENSE", "docs/INSTALL.md", "docs/SECURITY-REVIEW.md",
+    "docs/DATA-MIGRATION.md", "docs/CLI.md", "docs/v0.9-acceptance.md",
+    "docs/v0.6-acceptance.md",
+)
 
 
 def capture(*args):
@@ -173,7 +177,9 @@ def formula(release_version, base_url, hashes):
   sha256 "{universal_hash}"
 
   depends_on :macos
-  depends_on macos: :sequoia
+  on_macos do
+    depends_on macos: :sequoia
+  end
 
   def install
     bin.install "lazyterm"

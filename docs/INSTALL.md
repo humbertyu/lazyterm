@@ -16,6 +16,14 @@ The release candidate is `0.6.0-beta.1`. These instructions describe the prepare
 | Linux | Experimental source builds; no release package or full acceptance guarantee |
 | Windows | Not supported by this Unix process/socket implementation; a credential adapter alone does not imply application support |
 
+Agent CLI remote Runtime queries require noninteractive SSH authentication and
+existing Host-key trust, including any ProxyJump hops. Host-targeted CLI Project
+runs additionally require Python 3, `sh` and `ps` on the POSIX remote; a local
+runner holds the connection and cleans its remote group after disconnect.
+Remote detached services and rediscovery are not supported. See [CLI.md](CLI.md).
+OpenSSH 9.9p2 is the tested baseline, not a verified minimum version; older
+OpenSSH versions have not passed the release acceptance matrix.
+
 Local release checks run on macOS 15.8.1 Apple Silicon, including execution of the Intel package under Rosetta. The release workflow additionally builds and tests natively on macOS 15 Intel and Apple Silicon runners; those hosted runs must succeed before publishing. CJK glyph size depends on the terminal font and fallback; use a monospace font covering the selected language. Full localization, first-use host-key dialogs in background operations, and encrypted-key passphrase storage are not release guarantees. Trust a new host through system OpenSSH before using background workflows.
 
 ## Download a Binary
@@ -44,11 +52,19 @@ The packaging command generates `dist/lazyterm.rb` with one universal download U
 
 ```sh
 brew tap humbertyu/lazyterm
-brew install humbertyu/lazyterm/lazyterm
-brew test humbertyu/lazyterm/lazyterm
+brew install lazyterm
+brew test lazyterm
 ```
 
 The tap is release infrastructure to provision; the commands are not a claim that it already exists. The generated Formula can also be placed in another organization's tap. It installs a prebuilt binary, so users do not need Rust. Uploading a Formula as a release asset alone does not register a tap or Homebrew/core package. Homebrew/core submission is not part of this beta.
+
+If Homebrew refuses to load an untrusted third-party formula, review the tap
+and run `brew trust --formula humbertyu/lazyterm/lazyterm`, then retry installation.
+
+The tap command registers the package repository once. Subsequent installs and
+upgrades use the short formula name: `brew upgrade lazyterm`. If another tap
+provides a formula with the same name, use `humbertyu/lazyterm/lazyterm` to select
+this one explicitly.
 
 ## Build From Source
 
@@ -73,6 +89,11 @@ The repository's `projects/lazyterm.json` records the local Projects workspace c
 ## Upgrade, Backup, and Uninstall
 
 Quit LazyTerm before replacing its binary. Stop or intentionally retain persistent Project services; existing independent runners continue using the executable they started with, so stop/restart them after upgrading. Do not run an older version against upgraded metadata. Back up both `~/.ssh` and `~/Library/Application Support/lazyterm/` before an upgrade. Settings configuration export excludes managed passwords and private keys; export encrypted credentials separately and retain private keys through your own secure backup.
+
+Metadata schema 3 uses UUID entity IDs. TUI startup migrates older supported
+schemas with a backup; CLI reads do not migrate. See [DATA-MIGRATION.md](DATA-MIGRATION.md)
+for exact backup locations, retention, write/failure boundaries and recovery.
+The [Stable Core checklist](v0.9-acceptance.md) records outstanding acceptance.
 
 Upgrade a tap installation with `brew update` and `brew upgrade humbertyu/lazyterm/lazyterm`; otherwise verify and replace the standalone binary. Uninstall with `brew uninstall humbertyu/lazyterm/lazyterm` or remove `~/.local/bin/lazyterm`. Neither command should remove your SSH configuration, private keys, LazyTerm metadata, or Keychain entries. Delete saved credentials in the application before removing local data if that is your intent. Removing the binary alone does not stop independent Project services; stop them first.
 

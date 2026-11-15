@@ -43,7 +43,10 @@ jobs:
           fi
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked -- --test-threads=1
+      - name: Unit, CLI, PTY and disposable SSH/SFTP checks
+        env:
+          LAZYTERM_SFTP_FIXTURE: '1'
+        run: cargo test --locked -- --test-threads=1
       - name: Disposable SSH password, routing and forced-exit fixture
         run: |
           python3 -m venv "$RUNNER_TEMP/lazyterm-ssh-fixture"

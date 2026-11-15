@@ -96,6 +96,18 @@ pub(crate) fn strip_external_include_directives(
 
 fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata> {
     use serde_json::Value;
+    fn matching_index(items: &[Value], incoming: &Value, field: &str) -> Option<usize> {
+        let key = if field == "tunnels" { "label" } else { "name" };
+        items
+            .iter()
+            .position(|item| incoming["id"].is_string() && item["id"] == incoming["id"])
+            .or_else(|| {
+                items.iter().position(|item| {
+                    item[key] == incoming[key]
+                        && (field != "credentials" || item["kind"] == incoming["kind"])
+                })
+            })
+    }
     fn merge(local: &mut Value, incoming: Value, field: &str) {
         match (local, incoming) {
             (Value::Object(local), Value::Object(incoming)) => {
@@ -138,16 +150,9 @@ fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata>
                         | "credentials"
                 ) =>
             {
-                let key = if field == "tunnels" { "label" } else { "name" };
                 for mut item in incoming {
-                    if let Some(existing) = local.iter_mut().find(|existing| {
-                        let same_identity = existing["id"].is_string()
-                            && item["id"].is_string()
-                            && existing["id"] == item["id"];
-                        same_identity
-                            || (existing[key] == item[key]
-                                && (field != "credentials" || existing["kind"] == item["kind"]))
-                    }) {
+                    if let Some(index) = matching_index(local, &item, field) {
+                        let existing = &mut local[index];
                         item["id"] = existing["id"].clone();
                         merge(existing, item, field);
                     } else {
@@ -182,10 +187,7 @@ fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata>
                 .as_array()
                 .and_then(|items| items.iter().find(|item| item["id"] == *id))
                 && let Some(destination) = document["credentials"].as_array().and_then(|items| {
-                    items.iter().find(|item| {
-                        item["id"] == source["id"]
-                            || (item["name"] == source["name"] && item["kind"] == source["kind"])
-                    })
+                    matching_index(items, source, "credentials").map(|index| &items[index])
                 })
             {
                 *id = destination["id"].clone();
@@ -197,19 +199,11 @@ fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata>
     let mut targets = BTreeMap::new();
     if let Some(projects) = source["projects"].as_array() {
         for project in projects {
-            let destination = document["projects"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|item| item["id"] == project["id"] || item["name"] == project["name"])
-                .unwrap();
+            let projects = document["projects"].as_array().unwrap();
+            let destination = &projects[matching_index(projects, project, "projects").unwrap()];
             for link in project["links"].as_array().into_iter().flatten() {
-                let target = destination["links"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|item| item["id"] == link["id"] || item["name"] == link["name"])
-                    .unwrap();
+                let links = destination["links"].as_array().unwrap();
+                let target = &links[matching_index(links, link, "links").unwrap()];
                 let source_ref = format!(
                     "config:{}:{}",
                     project["id"].as_str().unwrap_or_default(),
@@ -241,16 +235,9 @@ fn merge_metadata(current: Metadata, incoming: Metadata) -> io::Result<Metadata>
     }
     for credential in source["credentials"].as_array().into_iter().flatten() {
         if let Some(reference) = credential["password_ref"].as_str() {
-            let target = document["credentials"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|item| {
-                    item["id"] == credential["id"]
-                        || (item["name"] == credential["name"]
-                            && item["kind"] == credential["kind"])
-                })
-                .unwrap();
+            let credentials = document["credentials"].as_array().unwrap();
+            let target =
+                &credentials[matching_index(credentials, credential, "credentials").unwrap()];
             if let Some(target_ref) = target["password_ref"].as_str() {
                 targets.insert(reference.into(), target_ref.into());
             }
@@ -1261,6 +1248,198 @@ mod tests {
         assert_eq!(merged.projects[0].commands[0].id, command_id);
         assert_eq!(merged.projects[0].commands[0].name, "Renamed command");
         assert_eq!(merged.projects[0].commands[0].command, "new");
+    }
+
+    #[test]
+    fn uuid_matches_take_precedence_over_earlier_name_collisions_and_secret_targets() {
+        let id = |number| uuid::Uuid::from_u128(number).to_string();
+        let local: Metadata = serde_json::from_value(serde_json::json!({
+            "version":3,
+            "projects":[
+                {"id":id(1),"name":"Renamed","base_path":"/unrelated"},
+                {"id":id(2),"name":"Original","base_path":"/original",
+                 "commands":[
+                    {"id":id(3),"name":"run","command":"leave alone"},
+                    {"id":id(4),"name":"old run","command":"old"}],
+                 "links":[
+                    {"id":id(5),"name":"Home","url":"https://unrelated.test","password_ref":"first-link"},
+                    {"id":id(6),"name":"Old Home","url":"https://original.test","password_ref":"correct-link"}]}],
+            "credentials":[
+                {"id":id(7),"name":"Login","kind":"Password","password_ref":"first-secret"},
+                {"id":id(8),"name":"Old Login","kind":"Password","password_ref":"correct-secret"}]
+        })).unwrap();
+        let incoming: Metadata = serde_json::from_value(serde_json::json!({
+            "version":3,
+            "projects":[{"id":id(2),"name":"Renamed","base_path":"/updated",
+                "commands":[{"id":id(4),"name":"run","command":"updated"}],
+                "links":[{"id":id(6),"name":"Home","url":"https://updated.test",
+                    "password_ref":"source-link"}]}],
+            "credentials":[{"id":id(8),"name":"Login","kind":"Password",
+                "password_ref":"source-secret"}],
+            "host_passwords":{"fixture":id(8)}
+        }))
+        .unwrap();
+        let unrelated_project = local.projects[0].clone();
+        let unrelated_command = local.projects[1].commands[0].clone();
+        let unrelated_link = local.projects[1].links[0].clone();
+        let unrelated_credential = local.credentials[0].clone();
+        let result = merge_metadata(local, incoming.clone()).unwrap();
+        assert_eq!(result.projects.len(), 2);
+        assert_eq!(result.projects[0], unrelated_project);
+        assert_eq!(result.projects[1].base_path, PathBuf::from("/updated"));
+        assert_eq!(result.projects[1].commands[0], unrelated_command);
+        assert_eq!(result.projects[1].commands[1].command, "updated");
+        assert_eq!(result.projects[1].links[0], unrelated_link);
+        assert_eq!(result.projects[1].links[1].url, "https://updated.test");
+        assert_eq!(result.credentials[0], unrelated_credential);
+        assert_eq!(result.host_passwords["fixture"], uuid::Uuid::from_u128(8));
+        assert_eq!(
+            result.credential_import_targets["source-link"],
+            "correct-link"
+        );
+        assert_eq!(
+            result.credential_import_targets["source-secret"],
+            "correct-secret"
+        );
+        assert_eq!(
+            result.credential_import_targets[&format!("config:{}:{}", id(2), id(6))],
+            format!("config:{}:{}", id(2), id(6))
+        );
+        let once = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            serde_json::to_value(merge_metadata(result, incoming).unwrap()).unwrap(),
+            once
+        );
+    }
+
+    #[test]
+    fn migrated_projects_survive_repeated_import_and_documented_backup_recovery() {
+        let root = fixture("upgrade-import-recovery");
+        let _cleanup = TemporaryDirectory(root.clone());
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        let config = home.join(".ssh/config");
+        let ssh_original =
+            b"# local routing\nHost local\n HostName 192.0.2.5\n ProxyJump gateway\n";
+        fs::write(&config, ssh_original).unwrap();
+        let path = root.join("data/hosts.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "version":2,
+            "future_field":{"keep":true},
+            "projects":[{"id":1,"name":"Workspace","base_path":"/workspace",
+                "groups":["Development","Checks"],
+                "commands":[{"id":2,"name":"start","command":"npm start","group":"Development"}],
+                "links":[{"id":3,"name":"Home","url":"http://localhost:3000/",
+                    "username":"tester","password_storage":"Config","password":"local-fixture-secret",
+                    "password_ref":"config:1:3"}]}]
+        })).unwrap();
+        fs::write(&path, &legacy).unwrap();
+        let migrated = Metadata::read_from(&path).unwrap();
+        let before_import = fs::read(&path).unwrap();
+        assert_eq!(migrated.projects[0].groups, ["Development", "Checks"]);
+        assert_eq!(
+            fs::read(path.with_extension("config.lazyterm.bak")).unwrap(),
+            legacy
+        );
+
+        let mut bundle = archive(&root.join("source"));
+        bundle["metadata"] = serde_json::to_value(&migrated).unwrap();
+        bundle["metadata"]["projects"][0]["name"] = "Renamed workspace".into();
+        bundle["metadata"]["projects"][0]["links"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("password");
+        bundle["metadata"]["projects"][0]["links"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("password_ref");
+        let bytes = serde_json::to_vec(&bundle).unwrap();
+        let mut once = None;
+        for _ in 0..2 {
+            let imported =
+                apply_configuration(parse_configuration(&bytes, &home).unwrap(), &path).unwrap();
+            let project = &imported.projects[0];
+            assert_eq!(imported.projects.len(), 1);
+            assert_eq!(project.id, migrated.projects[0].id);
+            assert_eq!(project.commands, migrated.projects[0].commands);
+            assert_eq!(project.groups, migrated.projects[0].groups);
+            assert_eq!(project.links, migrated.projects[0].links);
+            assert_eq!(imported.extra, migrated.extra);
+            let saved = fs::read(&path).unwrap();
+            if let Some(previous) = &once {
+                assert_eq!(&saved, previous);
+            }
+            once = Some(saved);
+        }
+        let backups = fs::read_dir(root.join("data/hosts.json.backups"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(backups.contains(&legacy));
+        let restore = backups
+            .iter()
+            .find(|bytes| **bytes == before_import)
+            .unwrap();
+        let mut ssh_backups = fs::read_dir(root.join("data/import-backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        ssh_backups.sort();
+        let first = &ssh_backups[0];
+        let manifest: Vec<(usize, String)> =
+            serde_json::from_slice(&fs::read(first.join("manifest.json")).unwrap()).unwrap();
+        let (index, _) = manifest
+            .iter()
+            .find(|(_, name)| Path::new(name) == config)
+            .unwrap();
+        let ssh_restore = fs::read(first.join(format!("{index:04}.bak"))).unwrap();
+        assert_eq!(ssh_restore, ssh_original);
+        // Follow the documented offline restore using the retained exact previous bytes.
+        crate::hosts::safe_write_private(&path, restore).unwrap();
+        crate::hosts::safe_write(&config, &ssh_restore).unwrap();
+        fs::remove_file(home.join(".ssh/config.d/work.conf")).unwrap();
+        let restored = Metadata::read_from(&path).unwrap();
+        assert_eq!(restored.projects, migrated.projects);
+        assert_eq!(restored.extra, migrated.extra);
+        assert_eq!(fs::read(&config).unwrap(), ssh_original);
+    }
+
+    #[test]
+    fn stale_import_rolls_back_existing_and_new_ssh_files_without_erasing_projects() {
+        let root = fixture("import-save-conflict");
+        let _cleanup = TemporaryDirectory(root.clone());
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        let config = home.join(".ssh/config");
+        let original = b"Host local\n HostName 192.0.2.1\n";
+        fs::write(&config, original).unwrap();
+        let path = root.join("data/hosts.json");
+        Metadata::default().save_to(&path).unwrap();
+        let stale = Metadata::read_for_import(&path).unwrap();
+        let mut current = Metadata::read_from(&path).unwrap();
+        current.projects.push(crate::projects::ProjectDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Concurrent workspace".into(),
+            base_path: root.clone(),
+            groups: vec!["Keep this group".into()],
+            ..Default::default()
+        });
+        current.save_to(&path).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let bytes = serde_json::to_vec(&archive(&root.join("source"))).unwrap();
+        let imported = parse_configuration(&bytes, &home).unwrap();
+        let error = apply_configuration_inner(imported, &path, stale, true, false)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Configuration changed on disk"));
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert_eq!(fs::read(&config).unwrap(), original);
+        assert!(!home.join(".ssh/config.d/work.conf").exists());
+        assert_eq!(
+            Metadata::read_from(&path).unwrap().projects,
+            current.projects
+        );
     }
 
     #[test]

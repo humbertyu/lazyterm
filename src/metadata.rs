@@ -309,6 +309,8 @@ impl Metadata {
     pub(crate) fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         fs::create_dir_all(parent)?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::other("Missing metadata filename"))?
@@ -319,9 +321,11 @@ impl Metadata {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
             }
-            options.open(destination)
+            let file = options.open(destination)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            Ok::<_, io::Error>(file)
         };
         let lock = open_private(&parent.join(format!("{name}.lock")), false)?;
         lock.lock()?;
@@ -362,6 +366,7 @@ impl Metadata {
         if let Some(bytes) = &current {
             let backups = parent.join(format!("{name}.backups"));
             fs::create_dir_all(&backups)?;
+            fs::set_permissions(&backups, fs::Permissions::from_mode(0o700))?;
             let backup = backups.join(format!("{timestamp:020}-{}.json", std::process::id()));
             let mut file = open_private(&backup, false)?;
             file.write_all(bytes)?;
@@ -382,7 +387,7 @@ impl Metadata {
         }
         let bytes = serde_json::to_vec_pretty(self)?;
         log("attempt")?;
-        if let Err(error) = crate::hosts::safe_write(path, &bytes) {
+        if let Err(error) = crate::hosts::safe_write_private(path, &bytes) {
             let _ = log("failed");
             return Err(error);
         }
@@ -666,6 +671,63 @@ mod tests {
                 .count()
                 >= 3
         );
+    }
+
+    #[test]
+    fn saves_restrict_legacy_permissions_and_bound_private_backup_retention() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = crate::projects::tests::Fixture::new("private-retention");
+        let path = fixture.root.join("hosts.json");
+        fs::write(&path, br#"{"version":3}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut metadata = Metadata::read_from(&path).unwrap();
+        metadata.projects.push(fixture.project.clone());
+        for index in 0..35 {
+            metadata.extra.insert("revision".into(), index.into());
+            metadata.save_to(&path).unwrap();
+        }
+        let backups = fixture.root.join("hosts.json.backups");
+        let snapshots = fs::read_dir(&backups)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 30);
+        for snapshot in &snapshots {
+            let saved = Metadata::read_existing(snapshot).unwrap();
+            assert_eq!(saved.projects, metadata.projects);
+            assert!(saved.extra["revision"].as_u64().unwrap() >= 4);
+        }
+        for (target, mode) in [
+            (fixture.root.clone(), 0o700),
+            (backups, 0o700),
+            (path, 0o600),
+            (fixture.root.join("hosts.config.lazyterm.bak"), 0o600),
+            (fixture.root.join("hosts.json.lock"), 0o600),
+            (fixture.root.join("hosts.json.writes.jsonl"), 0o600),
+        ]
+        .into_iter()
+        .chain(snapshots.into_iter().map(|path| (path, 0o600)))
+        {
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                mode,
+                "{}",
+                target.display()
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_journal_symlink_blocks_save_without_touching_other_files() {
+        let fixture = crate::projects::tests::Fixture::new("journal-symlink");
+        let path = fixture.root.join("hosts.json");
+        let unrelated = fixture.root.join("unrelated");
+        fs::write(&unrelated, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&unrelated, fixture.root.join("hosts.json.writes.jsonl"))
+            .unwrap();
+        assert!(Metadata::default().save_to(&path).is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
     }
 
     #[test]

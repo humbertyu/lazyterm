@@ -270,7 +270,27 @@ impl HostCatalog {
 
     pub fn set_identity(&mut self, alias: &str, path: &Path) -> io::Result<()> {
         let config_path = Self::config_path().ok_or_else(|| io::Error::other("HOME is not set"))?;
-        let _lock = config_lock(config_path.parent().unwrap())?;
+        self.set_identity_from_paths(&config_path, config_path.parent().unwrap(), alias, path)
+    }
+
+    fn set_identity_from_paths(
+        &mut self,
+        config_path: &Path,
+        ssh_dir: &Path,
+        alias: &str,
+        path: &Path,
+    ) -> io::Result<()> {
+        let _lock = config_lock(ssh_dir)?;
+        let current = Self::load_from(config_path, ssh_dir);
+        if let Some(error) = current.error {
+            return Err(io::Error::other(error));
+        }
+        let loaded = self.hosts.iter().find(|entry| entry.alias == alias);
+        if loaded.is_none() || loaded != current.hosts.iter().find(|entry| entry.alias == alias) {
+            return Err(io::Error::other(
+                "SSH Host changed; refresh before assigning its key.",
+            ));
+        }
         let path_text = path
             .to_str()
             .ok_or_else(|| io::Error::other("Key path is not valid UTF-8"))?;
@@ -278,7 +298,7 @@ impl HostCatalog {
             return Err(io::Error::other("Invalid key path"));
         }
         let mut changes = Vec::new();
-        for (file, contents) in Self::config_snapshot()? {
+        for (file, contents) in Self::snapshot_from(config_path, ssh_dir)? {
             if let Some(updated) = replace_identity(&contents, alias, path_text)? {
                 changes.push((file, updated));
             }
@@ -290,7 +310,7 @@ impl HostCatalog {
         }
         if let Some((file, updated)) = changes.pop() {
             safe_write(Path::new(&file), updated.as_bytes())?;
-            *self = Self::load();
+            *self = Self::load_from(config_path, ssh_dir);
             return Ok(());
         }
         Err(io::Error::other("Host was not found in SSH config"))
@@ -938,6 +958,14 @@ fn parse_host_directive(line: &str) -> io::Result<Option<(String, Vec<String>)>>
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    safe_write_with_permissions(path, contents, false)
+}
+
+pub(crate) fn safe_write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    safe_write_with_permissions(path, contents, true)
+}
+
+fn safe_write_with_permissions(path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -947,21 +975,30 @@ pub(crate) fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let existing = fs::metadata(path).ok();
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = if private {
+        fs::Permissions::from_mode(0o600)
+    } else {
+        existing
+            .as_ref()
+            .map(|metadata| metadata.permissions())
+            .unwrap_or_else(|| fs::Permissions::from_mode(0o600))
+    };
     let backup = path.with_extension("config.lazyterm.bak");
     if path.exists() {
-        fs::copy(path, &backup)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(metadata) = &existing {
-                fs::set_permissions(
-                    &backup,
-                    fs::Permissions::from_mode(metadata.permissions().mode()),
-                )?;
-            }
-        }
+        atomic_replace(&backup, &fs::read(path)?, permissions.clone())?;
     }
+    atomic_replace(path, contents, permissions)
+}
 
+fn atomic_replace(path: &Path, contents: &[u8], permissions: fs::Permissions) -> io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Refusing to replace a symbolic-link configuration or backup",
+        ));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(
         ".lazyterm-config-{}-{suffix}.tmp",
@@ -975,13 +1012,12 @@ pub(crate) fn safe_write(path: &Path, contents: &[u8]) -> io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(&temp)?;
-    #[cfg(unix)]
-    if let Some(metadata) = &existing {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))?;
-    }
     use io::Write;
-    if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+    if let Err(error) = file
+        .write_all(contents)
+        .and_then(|()| file.set_permissions(permissions))
+        .and_then(|()| file.sync_all())
+    {
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
@@ -1334,6 +1370,110 @@ mod tests {
     }
 
     #[test]
+    fn assigning_identity_rejects_external_host_changes_without_writing() {
+        let fixture = crate::projects::tests::Fixture::new("stale-key");
+        let ssh_dir = fixture.root.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        let config = ssh_dir.join("config");
+        fs::write(&config, "Host web\n HostName old.example\n User deploy\n").unwrap();
+        let mut catalog = HostCatalog::load_from(&config, &ssh_dir);
+        let changed = "Host web\n HostName new.example\n User root\n";
+        fs::write(&config, changed).unwrap();
+        let error = catalog
+            .set_identity_from_paths(&config, &ssh_dir, "web", Path::new("/keys/new"))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(fs::read_to_string(&config).unwrap(), changed);
+        fs::remove_file(&config).unwrap();
+        assert!(
+            catalog
+                .set_identity_from_paths(&config, &ssh_dir, "web", Path::new("/keys/new"))
+                .is_err()
+        );
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn include_alias_collisions_refuse_create_rename_edit_and_key_assignment() {
+        let fixture = crate::projects::tests::Fixture::new("include-collision");
+        let ssh_dir = fixture.root.join(".ssh");
+        let include_dir = ssh_dir.join("config.d");
+        fs::create_dir_all(&include_dir).unwrap();
+        let config = ssh_dir.join("config");
+        let first = include_dir.join("a.conf");
+        let second = include_dir.join("b.conf");
+        fs::write(&config, "Include config.d/*.conf\nHost spare\n User ops\n").unwrap();
+        fs::write(&first, "Host web\n HostName first.example\n").unwrap();
+        fs::write(&second, "Host web\n User deploy\n").unwrap();
+        let before = HostCatalog::snapshot_from(&config, &ssh_dir).unwrap();
+        let mut catalog = HostCatalog::load_from(&config, &ssh_dir);
+        let mut host = catalog
+            .hosts
+            .iter()
+            .find(|host| host.alias == "web")
+            .unwrap()
+            .clone();
+        assert!(
+            catalog
+                .upsert_from_paths(&config, &ssh_dir, &host, None)
+                .is_err()
+        );
+        assert!(
+            catalog
+                .upsert_from_paths(&config, &ssh_dir, &host, Some("spare"))
+                .is_err()
+        );
+        host.hostname = Some("changed.example".into());
+        assert!(
+            catalog
+                .upsert_from_paths(&config, &ssh_dir, &host, Some("web"))
+                .is_err()
+        );
+        assert!(
+            catalog
+                .set_identity_from_paths(&config, &ssh_dir, "web", Path::new("/keys/new"))
+                .is_err()
+        );
+        assert_eq!(
+            HostCatalog::snapshot_from(&config, &ssh_dir).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn repeated_symlink_include_edits_the_source_once_and_keeps_other_options() {
+        let fixture = crate::projects::tests::Fixture::new("include-symlink");
+        let ssh_dir = fixture.root.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        let config = ssh_dir.join("config");
+        let source = ssh_dir.join("hosts.conf");
+        let link = ssh_dir.join("linked.conf");
+        fs::write(&config, "Include hosts.conf linked.conf\n").unwrap();
+        let contents = "Host web\n HostName first.example\n # routing stays\n ProxyJump bastion\n";
+        fs::write(&source, contents).unwrap();
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let mut catalog = HostCatalog::load_from(&config, &ssh_dir);
+        assert_eq!(catalog.hosts.len(), 1);
+        catalog
+            .set_identity_from_paths(&config, &ssh_dir, "web", Path::new("/keys/new"))
+            .unwrap();
+        let updated = fs::read_to_string(&source).unwrap();
+        assert!(updated.contains("IdentityFile \"/keys/new\""));
+        assert!(updated.contains("# routing stays\n ProxyJump bastion\n"));
+        assert_eq!(fs::read_to_string(&link).unwrap(), updated);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "Include hosts.conf linked.conf\n"
+        );
+    }
+
+    #[test]
     fn manual_host_edit_rejects_shared_or_ambiguous_host_blocks() {
         let host = Host {
             alias: "renamed".into(),
@@ -1433,6 +1573,27 @@ mod tests {
             b"Host original\n"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_symlinks_never_overwrite_their_target_or_live_configuration() {
+        let fixture = crate::projects::tests::Fixture::new("backup-symlink");
+        let config = fixture.root.join("config");
+        let unrelated = fixture.root.join("unrelated");
+        fs::write(&config, b"Host original\n").unwrap();
+        fs::write(&unrelated, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&unrelated, config.with_extension("config.lazyterm.bak"))
+            .unwrap();
+        assert!(safe_write(&config, b"Host changed\n").is_err());
+        assert_eq!(fs::read(&config).unwrap(), b"Host original\n");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+        assert!(fs::read_dir(&fixture.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
 
     #[test]
