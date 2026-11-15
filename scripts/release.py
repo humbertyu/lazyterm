@@ -12,6 +12,7 @@ import subprocess
 import struct
 import tarfile
 import tempfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
@@ -20,7 +21,10 @@ DOCUMENTS = (
     "README.md", "LICENSE", "docs/INSTALL.md", "docs/SECURITY-REVIEW.md",
     "docs/DATA-MIGRATION.md", "docs/CLI.md", "docs/v0.9-acceptance.md",
     "docs/v0.6-acceptance.md",
+    "docs/BETA-TESTING.md", "skills/lazyterm/SKILL.md",
 )
+DIRECTORIES = tuple(sorted({str(parent) for path in DOCUMENTS
+                            for parent in Path(path).parents if str(parent) != "."}))
 
 
 def capture(*args):
@@ -117,7 +121,7 @@ def package(binary, info, output, stamp):
 
 def inspect_archive(path, release_version, target):
     prefix = archive_name(release_version, target)[:-7] + "/"
-    expected = set(DOCUMENTS) | {"lazyterm", "build-info.json", "docs"}
+    expected = set(DOCUMENTS) | {"lazyterm", "build-info.json", *DIRECTORIES}
     with tarfile.open(path, "r:gz") as archive:
         members = archive.getmembers()
         names = set()
@@ -241,6 +245,10 @@ def assemble(args):
     generated = output / "lazyterm.rb"
     generated.write_text(formula(release_version, base, hashes))
     paths.append(generated)
+    skill = output / ("lazyterm-v" + release_version + "-skill.zip")
+    with zipfile.ZipFile(skill, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(ROOT / "skills/lazyterm/SKILL.md", "lazyterm/SKILL.md")
+    paths.append(skill)
     (output / "SHA256SUMS").write_text("".join("{}  {}\n".format(digest(path), path.name) for path in paths))
     print(output / "SHA256SUMS")
 

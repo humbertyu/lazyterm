@@ -1,5 +1,11 @@
 # LazyTerm
 
+**0.9 beta testing:** download the macOS Universal Binary from
+[GitHub Releases](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.1).
+[测试指南 / Beta guide](docs/BETA-TESTING.md) includes installation, known
+limits, feedback instructions, and a prompt you can give your Agent to install
+LazyTerm and its Skill. Release downloads become available after publication.
+
 Agent CLI: [commands, JSON contract, and Skill setup](docs/CLI.md). Use
 `lazyterm hosts list --json`, `lazyterm projects status --json`, or
 `lazyterm schema --json` without opening the TUI.

@@ -1,0 +1,40 @@
+name: Beta feedback / 测试反馈
+description: Report a reproducible beta issue without sharing credentials or private configuration.
+title: "[Beta] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿上传密码、私钥、配置/凭据导出包或完整日志。Please review screenshots and output before attaching them.
+  - type: input
+    id: version
+    attributes:
+      label: LazyTerm version / 版本
+      placeholder: "lazyterm 0.9.0-beta.1"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS, CPU, terminal and Agent client / 环境
+      placeholder: "macOS 15, Apple Silicon, Terminal; WorkBuddy if applicable"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce / 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior / 预期与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: "lazyterm --diagnostics"
+      description: This command does not read SSH config or passwords. Review any additional attachments.
+      render: text

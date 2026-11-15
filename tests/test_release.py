@@ -8,12 +8,13 @@ import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
+import zipfile
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("release", Path(__file__).resolve().parents[1] / "scripts/release.py")
 release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
-VERSION = "0.6.0-beta.1"
+VERSION = "0.9.0-beta.1"
 
 
 def make_archive(root, target, extra=None, dirty=False):
@@ -22,10 +23,10 @@ def make_archive(root, target, extra=None, dirty=False):
     binary = b"\xcf\xfa\xed\xfe" + struct.pack("<I", 0x100000C if target.startswith("aarch64") else 0x1000007)
     info = {"version": VERSION, "target": target, "source_dirty": dirty, "commit": "same-source", "binary_sha256": hashlib.sha256(binary).hexdigest()}
     with tarfile.open(root / name, "w:gz") as archive:
-        for document in release.DOCUMENTS + ("lazyterm", "build-info.json", "docs"):
+        for document in release.DOCUMENTS + ("lazyterm", "build-info.json") + release.DIRECTORIES:
             entry = tarfile.TarInfo(prefix + document)
             data = binary if document == "lazyterm" else json.dumps(info).encode() if document == "build-info.json" else b"fixture"
-            if document == "docs":
+            if document in release.DIRECTORIES:
                 entry.type = tarfile.DIRTYPE
                 archive.addfile(entry)
             else:
@@ -77,6 +78,13 @@ class ReleaseTests(unittest.TestCase):
                 checksum, filename = line.split("  ")
                 self.assertEqual(checksum, release.digest(root / filename))
             self.assertNotIn("PLACEHOLDER", formula)
+            with zipfile.ZipFile(root / ("lazyterm-v" + VERSION + "-skill.zip")) as archive:
+                self.assertEqual(archive.namelist(), ["lazyterm/SKILL.md"])
+                self.assertEqual(
+                    archive.read("lazyterm/SKILL.md"),
+                    (release.ROOT / "skills/lazyterm/SKILL.md").read_bytes(),
+                )
+            self.assertIn("skills/lazyterm/SKILL.md", release.DOCUMENTS)
 
     def test_universal_rejects_duplicate_mismatched_and_overlapping_slices(self):
         arm = b"\xcf\xfa\xed\xfe" + struct.pack("<I", 0x100000C)

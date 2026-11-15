@@ -1,6 +1,9 @@
 # Installation and Supported Environments
 
-The release candidate is `0.6.0-beta.1`. These instructions describe the prepared release layout; no public release or Homebrew tap is implied until the maintainer publishes them.
+The release candidate is `0.9.0-beta.1`. Download its Universal Binary from
+[GitHub Releases](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.1)
+once published. See [beta testing and Agent/Skill setup](BETA-TESTING.md) for the
+quick start. A Homebrew tap is not required for this beta and is not yet published.
 
 ## Supported Environment
 
@@ -31,11 +34,11 @@ Local release checks run on macOS 15.8.1 Apple Silicon, including execution of t
 Download the universal archive and `SHA256SUMS` from the same release. Both Apple Silicon and Intel use the same download; macOS selects the native executable slice without Rosetta. Replace the version below when a newer release is published.
 
 ```sh
-shasum -a 256 lazyterm-v0.6.0-beta.1-universal-apple-darwin.tar.gz
+shasum -a 256 lazyterm-v0.9.0-beta.1-universal-apple-darwin.tar.gz
 # Compare the complete digest with its line in SHA256SUMS.
-tar -xzf lazyterm-v0.6.0-beta.1-universal-apple-darwin.tar.gz
+tar -xzf lazyterm-v0.9.0-beta.1-universal-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 755 lazyterm-v0.6.0-beta.1-universal-apple-darwin/lazyterm "$HOME/.local/bin/lazyterm"
+install -m 755 lazyterm-v0.9.0-beta.1-universal-apple-darwin/lazyterm "$HOME/.local/bin/lazyterm"
 export PATH="$HOME/.local/bin:$PATH"
 lazyterm --version
 lazyterm --diagnostics

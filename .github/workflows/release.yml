@@ -89,6 +89,7 @@ jobs:
             dist/*-universal-apple-darwin.tar.gz
             dist/SHA256SUMS
             dist/lazyterm.rb
+            dist/*-skill.zip
           if-no-files-found: error
 
   verify-universal:
@@ -130,5 +131,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS dist/lazyterm.rb \
-            --draft --verify-tag --title "LazyTerm $TAG" --notes-file docs/RELEASE-NOTES.md
+          flags=()
+          if [[ "$TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" dist/*.tar.gz dist/*-skill.zip dist/SHA256SUMS dist/lazyterm.rb \
+            --draft --verify-tag "${flags[@]}" --title "LazyTerm $TAG" --notes-file docs/RELEASE-NOTES.md
