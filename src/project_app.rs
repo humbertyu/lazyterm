@@ -60,6 +60,7 @@ struct ExternalStop {
 }
 
 pub struct WorkspaceForm {
+    pub editor: crate::form::Editor,
     pub project_id: Option<uuid::Uuid>,
     pub editing_id: Option<uuid::Uuid>,
     pub fields: Vec<String>,
@@ -71,6 +72,17 @@ pub struct WorkspaceForm {
 }
 
 impl WorkspaceForm {
+    pub fn is_choice(&self, index: usize) -> bool {
+        (self.link_form && index >= 4)
+            || (!self.group_form
+                && !self.link_form
+                && if self.project_id.is_some() {
+                    index >= 4
+                } else {
+                    index == 2
+                })
+    }
+
     pub fn labels(&self) -> &[&str] {
         if self.group_form {
             &["Group name"]
@@ -955,6 +967,7 @@ impl App {
                 return;
             }
             WorkspaceForm {
+                editor: Default::default(),
                 project_id: Some(project.id),
                 editing_id: command.as_ref().map(|command| command.id),
                 fields: command.map_or_else(
@@ -1011,6 +1024,7 @@ impl App {
                 return;
             }
             WorkspaceForm {
+                editor: Default::default(),
                 project_id: None,
                 editing_id: project.as_ref().map(|project| project.id),
                 fields: project.map_or_else(
@@ -1044,6 +1058,7 @@ impl App {
             return;
         };
         self.workspace.form = Some(WorkspaceForm {
+            editor: Default::default(),
             project_id: Some(project.id),
             editing_id: None,
             fields: vec![original_group.clone().unwrap_or_default()],
@@ -1064,6 +1079,7 @@ impl App {
             return;
         }
         self.workspace.form = Some(WorkspaceForm {
+            editor: Default::default(),
             project_id: Some(project.id),
             editing_id: link.map(|link| link.id),
             fields: link.map_or_else(
@@ -1342,12 +1358,6 @@ impl App {
             KeyCode::BackTab | KeyCode::Up => {
                 form.selected = (form.selected + form.fields.len() - 1) % form.fields.len()
             }
-            KeyCode::Backspace if choices.is_empty() => {
-                form.fields[form.selected].pop();
-            }
-            KeyCode::Char(value) if !value.is_control() && choices.is_empty() => {
-                form.fields[form.selected].push(value)
-            }
             KeyCode::Enter => {
                 let mut form = self.workspace.form.take().expect("checked");
                 if form.link_form && !form.fields.get(3).is_none_or(String::is_empty) {
@@ -1388,6 +1398,15 @@ impl App {
                 if let Err(error) = self.save_workspace_form(&form, None, None) {
                     form.error = Some(error);
                     self.workspace.form = Some(form);
+                }
+            }
+            _ if choices.is_empty() => {
+                if form
+                    .editor
+                    .edit(form.selected, &mut form.fields[form.selected], key)
+                    && matches!(key, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
+                {
+                    form.error = None;
                 }
             }
             _ => {}
@@ -2235,7 +2254,7 @@ mod tests {
     }
 
     #[test]
-    fn link_password_rendering_shows_active_input_and_masks_inactive_input() {
+    fn link_password_rendering_masks_active_and_inactive_input() {
         for (width, height) in [(120, 40), (80, 24)] {
             let fixture = Fixture::new("password-render");
             let mut app = grouped_app(&fixture);
@@ -2264,10 +2283,13 @@ mod tests {
                 .unwrap();
             let text = format!("{}", terminal.backend());
             assert!(
-                text.contains("DO-NOT-RENDER-PASSWORD"),
+                !text.contains("DO-NOT-RENDER-PASSWORD"),
                 "{width}x{height}: {text}"
             );
-            assert!(!text.contains("********"), "{width}x{height}: {text}");
+            assert!(
+                text.contains("**********************_"),
+                "{width}x{height}: {text}"
+            );
             app.workspace.form.as_mut().unwrap().selected = 0;
             terminal
                 .draw(|frame| crate::ui::render(frame, &app))

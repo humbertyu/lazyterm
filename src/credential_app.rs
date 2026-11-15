@@ -763,6 +763,7 @@ fn upload_authentication_failed(error: &str) -> bool {
 }
 
 pub struct CredentialForm {
+    pub editor: crate::form::Editor,
     pub kind: FormKind,
     pub id: Option<uuid::Uuid>,
     pub fields: Vec<String>,
@@ -1463,6 +1464,7 @@ impl App {
             ]
         };
         self.credential_manager.form = Some(CredentialForm {
+            editor: Default::default(),
             kind,
             id: editing.map(|item| item.id),
             fields,
@@ -1712,14 +1714,15 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Tab => form.selected = (form.selected + 1) % count,
                 KeyCode::Enter => self.save_credential_form(),
-                KeyCode::Backspace => {
-                    form.fields[form.selected].pop();
+                _ => {
+                    if form
+                        .editor
+                        .edit(form.selected, &mut form.fields[form.selected], key)
+                        && matches!(key, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
+                    {
+                        form.error = None;
+                    }
                 }
-                KeyCode::Char(c) if !c.is_control() => {
-                    form.fields[form.selected].push(c);
-                    form.error = None;
-                }
-                _ => {}
             }
             return;
         }

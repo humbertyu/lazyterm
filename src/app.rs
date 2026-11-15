@@ -366,6 +366,7 @@ pub struct App {
 
 #[derive(Clone, Debug)]
 pub struct SyncSettingsDialog {
+    pub editor: crate::form::Editor,
     pub remote: String,
     pub branch: String,
     pub selected: usize,
@@ -490,6 +491,7 @@ pub enum FilesState {
 }
 
 pub struct HostDialog {
+    pub editor: crate::form::Editor,
     pub fields: [String; 6],
     pub tags: Vec<String>,
     pub tag_picker_open: bool,
@@ -504,6 +506,7 @@ pub struct HostDialog {
 }
 
 pub struct HostGroupDialog {
+    pub editor: crate::form::Editor,
     pub name: String,
     pub original_name: Option<String>,
     pub deleting: bool,
@@ -516,6 +519,7 @@ pub struct HostActionDialog {
 }
 
 pub struct TunnelDialog {
+    pub editor: crate::form::Editor,
     pub fields: [String; 8],
     pub kind: TunnelKind,
     pub editing_id: Option<uuid::Uuid>,
@@ -524,6 +528,7 @@ pub struct TunnelDialog {
 }
 
 pub struct SnippetDialog {
+    pub editor: crate::form::Editor,
     pub fields: [String; 4],
     pub package_id: uuid::Uuid,
     pub editing_id: Option<uuid::Uuid>,
@@ -531,12 +536,14 @@ pub struct SnippetDialog {
 }
 
 pub struct PackageDialog {
+    pub editor: crate::form::Editor,
     pub fields: [String; 2],
     pub editing_id: Option<uuid::Uuid>,
     pub selected_field: usize,
 }
 
 pub struct CredentialExportDialog {
+    pub editor: crate::form::Editor,
     pub fields: [String; 2],
     pub selected_field: usize,
     pub error: Option<String>,
@@ -549,6 +556,7 @@ pub enum ImportKind {
 }
 
 pub struct CredentialImportDialog {
+    pub editor: crate::form::Editor,
     pub password: String,
     pub error: Option<String>,
 }
@@ -719,6 +727,7 @@ pub enum HostPasswordPurpose {
 }
 
 pub struct HostPasswordDialog {
+    pub editor: crate::form::Editor,
     pub alias: String,
     pub username: String,
     pub password: Zeroizing<String>,
@@ -3379,6 +3388,7 @@ impl App {
     ) {
         self.connection_dialog = None;
         self.host_password_dialog = Some(HostPasswordDialog {
+            editor: Default::default(),
             alias,
             username,
             password: Zeroizing::new(String::new()),
@@ -3533,6 +3543,22 @@ impl App {
             return InputAction::None;
         };
         let shared = matches!(dialog.purpose, HostPasswordPurpose::Authentication);
+        let editable = dialog.selected_field == 1 || (!shared && dialog.selected_field == 0);
+        let username_space = dialog.selected_field == 0
+            && matches!(key, KeyCode::Char(character) if character.is_whitespace());
+        if editable && !username_space {
+            let value = if dialog.selected_field == 0 {
+                &mut dialog.username
+            } else {
+                &mut dialog.password
+            };
+            if dialog.editor.edit(dialog.selected_field, value, key) {
+                if matches!(key, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
+                    dialog.error = None;
+                }
+                return InputAction::None;
+            }
+        }
         match key {
             KeyCode::Esc => {
                 if shared && let Some(challenge) = self.authentication_challenge.take() {
@@ -3924,6 +3950,7 @@ impl App {
             9 => self.export_metadata(),
             10 => {
                 self.credential_export_dialog = Some(CredentialExportDialog {
+                    editor: Default::default(),
                     fields: [String::new(), String::new()],
                     selected_field: 0,
                     error: None,
@@ -3933,6 +3960,7 @@ impl App {
             12 => self.import_credentials(),
             13 => {
                 self.sync_dialog = Some(SyncSettingsDialog {
+                    editor: Default::default(),
                     remote: self.sync_settings.remote.clone(),
                     branch: if self.sync_settings.branch.is_empty() {
                         "main".into()
@@ -4100,20 +4128,22 @@ impl App {
         let Some(dialog) = self.sync_dialog.as_mut() else {
             return;
         };
+        if dialog.selected < 2 {
+            let value = if dialog.selected == 0 {
+                &mut dialog.remote
+            } else {
+                &mut dialog.branch
+            };
+            if dialog.editor.edit(dialog.selected, value, key) {
+                return;
+            }
+        }
         match key {
             KeyCode::Esc if dialog.testing => {}
             KeyCode::Esc => self.sync_dialog = None,
             KeyCode::Tab | KeyCode::Down => dialog.selected = (dialog.selected + 1) % 5,
             KeyCode::BackTab | KeyCode::Up => dialog.selected = dialog.selected.wrapping_add(4) % 5,
-            KeyCode::Backspace if dialog.selected == 0 => {
-                dialog.remote.pop();
-            }
-            KeyCode::Backspace if dialog.selected == 1 => {
-                dialog.branch.pop();
-            }
-            KeyCode::Char(character) if dialog.selected == 0 => dialog.remote.push(character),
-            KeyCode::Char(character) if dialog.selected == 1 => dialog.branch.push(character),
-            KeyCode::Enter if dialog.selected == 2 => {
+            KeyCode::Enter if dialog.selected <= 2 => {
                 let settings = crate::sync::SyncSettings {
                     remote: dialog.remote.trim().to_string(),
                     branch: dialog.branch.trim().to_string(),
@@ -4126,7 +4156,7 @@ impl App {
                         self.sync_settings = settings;
                         self.notice = Some("Git sync settings saved.".into());
                     }
-                    Err(error) => self.notice = Some(error),
+                    Err(error) => dialog.editor.error = Some(error),
                 }
             }
             KeyCode::Enter if dialog.selected == 3 && !dialog.testing => {
@@ -4140,7 +4170,7 @@ impl App {
                         self.sync_test_pending = Some(test);
                         self.notice = Some("Testing Git remote connection...".into());
                     }
-                    Err(error) => self.notice = Some(error),
+                    Err(error) => dialog.editor.error = Some(error),
                 }
             }
             KeyCode::Enter if dialog.selected == 4 && !dialog.testing => {
@@ -4156,7 +4186,7 @@ impl App {
                         self.sync_settings = settings.clone();
                         self.start_sync_prepare(settings);
                     }
-                    Err(error) => self.notice = Some(error),
+                    Err(error) => dialog.editor.error = Some(error),
                 }
             }
             _ => {}
@@ -4171,10 +4201,17 @@ impl App {
             .chars()
             .filter(|character| !character.is_control())
             .collect::<String>();
-        match dialog.selected {
-            0 => dialog.remote.push_str(&value),
-            1 => dialog.branch.push_str(&value),
-            _ => {}
+        if dialog.selected < 2 {
+            let destination = if dialog.selected == 0 {
+                &mut dialog.remote
+            } else {
+                &mut dialog.branch
+            };
+            for character in value.chars() {
+                dialog
+                    .editor
+                    .edit(dialog.selected, destination, KeyCode::Char(character));
+            }
         }
     }
 
@@ -4248,6 +4285,16 @@ impl App {
         let Some(dialog) = self.credential_export_dialog.as_mut() else {
             return;
         };
+        if dialog.editor.edit(
+            dialog.selected_field,
+            &mut dialog.fields[dialog.selected_field],
+            key,
+        ) {
+            if matches!(key, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
+                dialog.error = None;
+            }
+            return;
+        }
         match key {
             KeyCode::Esc => {
                 dialog.fields.iter_mut().for_each(String::zeroize);
@@ -4262,10 +4309,6 @@ impl App {
                     (dialog.selected_field + dialog.fields.len() - 1) % dialog.fields.len();
                 dialog.error = None;
             }
-            KeyCode::Backspace => {
-                dialog.fields[dialog.selected_field].pop();
-                dialog.error = None;
-            }
             KeyCode::Enter => {
                 let Some(mut dialog) = self.credential_export_dialog.take() else {
                     return;
@@ -4275,24 +4318,20 @@ impl App {
                 let confirmation = Zeroizing::new(std::mem::take(&mut dialog.fields[1]));
                 if password.len() < 8 {
                     self.credential_export_dialog = Some(CredentialExportDialog {
+                        editor: Default::default(),
                         fields: [password.to_string(), confirmation.to_string()],
                         selected_field,
                         error: Some("Use at least 8 characters.".into()),
                     });
                 } else if password.as_str() != confirmation.as_str() {
                     self.credential_export_dialog = Some(CredentialExportDialog {
+                        editor: Default::default(),
                         fields: [password.to_string(), confirmation.to_string()],
                         selected_field,
                         error: Some("The two passwords do not match.".into()),
                     });
                 } else {
                     self.export_credentials(password);
-                }
-            }
-            KeyCode::Char(value) => {
-                if !value.is_control() {
-                    dialog.fields[dialog.selected_field].push(value);
-                    dialog.error = None;
                 }
             }
             _ => {}
@@ -4316,6 +4355,7 @@ impl App {
                 .any(|item| item.password_ref.is_some())
         {
             self.credential_export_dialog = Some(CredentialExportDialog {
+                editor: Default::default(),
                 fields: [String::new(), String::new()],
                 selected_field: 0,
                 error: Some("No saved credentials are available to export.".into()),
@@ -4473,6 +4513,7 @@ impl App {
             return;
         };
         self.credential_import_dialog = Some(CredentialImportDialog {
+            editor: Default::default(),
             password: String::new(),
             error: None,
         });
@@ -4677,15 +4718,17 @@ impl App {
         let Some(dialog) = self.credential_import_dialog.as_mut() else {
             return;
         };
+        if dialog.editor.edit(0, &mut dialog.password, key) {
+            if matches!(key, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
+                dialog.error = None;
+            }
+            return;
+        }
         match key {
             KeyCode::Esc => {
                 dialog.password.zeroize();
                 self.credential_import_dialog = None;
                 self.pending_credential_import_path = None;
-            }
-            KeyCode::Backspace => {
-                dialog.password.pop();
-                dialog.error = None;
             }
             KeyCode::Enter => {
                 let Some(mut dialog) = self.credential_import_dialog.take() else {
@@ -4708,16 +4751,11 @@ impl App {
                         self.import_confirmation = Some(ImportKind::Credentials);
                     }
                     Err(error) => {
-                        self.notice = Some(format!(
-                            "Credential import rejected: {}",
-                            crate::diagnostics::redact_sensitive_text(&error)
-                        ));
+                        dialog.error = Some(crate::diagnostics::redact_sensitive_text(&error));
+                        self.credential_import_dialog = Some(dialog);
+                        self.pending_credential_import_path = Some(path);
                     }
                 }
-            }
-            KeyCode::Char(value) if !value.is_control() => {
-                dialog.password.push(value);
-                dialog.error = None;
             }
             _ => {}
         }
@@ -4996,6 +5034,7 @@ impl App {
                     && (self.selected_group().is_some() || self.selected_host().is_none()) =>
             {
                 self.host_group_dialog = Some(HostGroupDialog {
+                    editor: Default::default(),
                     name: String::new(),
                     original_name: None,
                     deleting: false,
@@ -5008,6 +5047,7 @@ impl App {
             {
                 if let Some(HostGroup::Tag(name)) = self.selected_group() {
                     self.host_group_dialog = Some(HostGroupDialog {
+                        editor: Default::default(),
                         name: name.clone(),
                         original_name: Some(name),
                         deleting: false,
@@ -5021,6 +5061,7 @@ impl App {
             {
                 if let Some(HostGroup::Tag(name)) = self.selected_group() {
                     self.host_group_dialog = Some(HostGroupDialog {
+                        editor: Default::default(),
                         name: name.clone(),
                         original_name: Some(name),
                         deleting: true,
@@ -5051,6 +5092,7 @@ impl App {
             KeyCode::Char('d') if self.section == NavSection::Hosts => {
                 if let Some(host) = self.selected_host() {
                     self.host_dialog = Some(HostDialog {
+                        editor: Default::default(),
                         fields: [
                             host.alias.clone(),
                             String::new(),
@@ -5299,6 +5341,7 @@ impl App {
     fn open_snippet_form(&mut self, package_id: uuid::Uuid, snippet: Option<SnippetDefinition>) {
         let editing_id = snippet.as_ref().map(|item| item.id);
         self.snippet_dialog = Some(SnippetDialog {
+            editor: Default::default(),
             fields: snippet.map_or_else(
                 || std::array::from_fn(|_| String::new()),
                 |item| {
@@ -5318,6 +5361,7 @@ impl App {
 
     fn open_package_form(&mut self, package: Option<SnippetPackage>) {
         self.package_dialog = Some(PackageDialog {
+            editor: Default::default(),
             fields: package.as_ref().map_or_else(
                 || [String::new(), String::new()],
                 |item| [item.name.clone(), item.description.clone()],
@@ -5375,6 +5419,13 @@ impl App {
         let Some(dialog) = self.package_dialog.as_mut() else {
             return;
         };
+        if dialog.editor.edit(
+            dialog.selected_field,
+            &mut dialog.fields[dialog.selected_field],
+            key,
+        ) {
+            return;
+        }
         match key {
             KeyCode::Esc => self.package_dialog = None,
             KeyCode::Tab | KeyCode::Down => dialog.selected_field = (dialog.selected_field + 1) % 2,
@@ -5385,12 +5436,12 @@ impl App {
                 dialog.fields[dialog.selected_field].pop();
             }
             KeyCode::Enter => {
-                let Some(dialog) = self.package_dialog.take() else {
+                let Some(mut dialog) = self.package_dialog.take() else {
                     return;
                 };
                 let name = dialog.fields[0].trim();
                 if name.is_empty() {
-                    self.notice = Some("Package name is required.".to_string());
+                    dialog.editor.error = Some("Package name is required.".to_string());
                     self.package_dialog = Some(dialog);
                     return;
                 }
@@ -5431,6 +5482,15 @@ impl App {
         let Some(dialog) = self.snippet_dialog.as_mut() else {
             return;
         };
+        if dialog.selected_field < 3
+            && dialog.editor.edit(
+                dialog.selected_field,
+                &mut dialog.fields[dialog.selected_field],
+                key,
+            )
+        {
+            return;
+        }
         match key {
             KeyCode::Esc => self.snippet_dialog = None,
             KeyCode::Tab | KeyCode::Down => {
@@ -5450,13 +5510,14 @@ impl App {
                 dialog.fields[3] = (!dangerous).to_string();
             }
             KeyCode::Enter => {
-                let Some(dialog) = self.snippet_dialog.take() else {
+                let Some(mut dialog) = self.snippet_dialog.take() else {
                     return;
                 };
                 let name = dialog.fields[0].trim();
                 let command = dialog.fields[1].trim();
                 if name.is_empty() || command.is_empty() {
-                    self.notice = Some("Snippet name and command are required.".to_string());
+                    dialog.editor.error =
+                        Some("Snippet name and command are required.".to_string());
                     self.snippet_dialog = Some(dialog);
                     return;
                 }
@@ -5599,6 +5660,7 @@ impl App {
             |host| self.tags(host).to_vec(),
         );
         self.host_dialog = Some(HostDialog {
+            editor: Default::default(),
             fields: host.map_or_else(
                 || std::array::from_fn(|_| String::new()),
                 |host| {
@@ -5676,10 +5738,11 @@ impl App {
             fields[5].clear();
         }
         self.tunnel_dialog = Some(TunnelDialog {
+            editor: Default::default(),
             fields,
             kind,
             editing_id: tunnel.map(|tunnel| tunnel.id),
-            selected_field: 0,
+            selected_field: 8,
             deleting: false,
         });
     }
@@ -5690,6 +5753,7 @@ impl App {
             return;
         };
         self.tunnel_dialog = Some(TunnelDialog {
+            editor: Default::default(),
             fields: [
                 tunnel.label,
                 tunnel.host_alias,
@@ -5743,6 +5807,7 @@ impl App {
                     Some(HostPickerItem::Host(alias)) => {
                         if let Some(dialog) = self.tunnel_dialog.as_mut() {
                             dialog.fields[1] = alias;
+                            dialog.editor.reset();
                         }
                         self.host_picker_group = None;
                         self.host_picker_selection = 0;
@@ -5761,6 +5826,21 @@ impl App {
             return;
         }
         match key {
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self
+                    .tunnel_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| !dialog.deleting && dialog.selected_field == 8) =>
+            {
+                let kind = self.tunnel_dialog.as_ref().unwrap().kind;
+                let next = match (kind, key == KeyCode::Left) {
+                    (TunnelKind::Local, false) | (TunnelKind::Dynamic, true) => TunnelKind::Remote,
+                    (TunnelKind::Remote, false) | (TunnelKind::Local, true) => TunnelKind::Dynamic,
+                    _ => TunnelKind::Local,
+                };
+                self.set_tunnel_dialog_kind(next);
+                return;
+            }
             KeyCode::F(1) => {
                 self.set_tunnel_dialog_kind(TunnelKind::Local);
                 return;
@@ -5775,7 +5855,7 @@ impl App {
             }
             _ => {}
         }
-        if key == KeyCode::Enter
+        if key == KeyCode::Char(' ')
             && self
                 .tunnel_dialog
                 .as_ref()
@@ -5811,20 +5891,26 @@ impl App {
             return;
         }
 
+        if dialog.selected_field < dialog.fields.len()
+            && dialog.editor.edit(
+                dialog.selected_field,
+                &mut dialog.fields[dialog.selected_field],
+                key,
+            )
+        {
+            return;
+        }
         match key {
             KeyCode::Esc => self.tunnel_dialog = None,
             KeyCode::Tab | KeyCode::Down => {
-                dialog.selected_field = (dialog.selected_field + 1) % dialog.fields.len()
+                dialog.selected_field = (dialog.selected_field + 1) % (dialog.fields.len() + 1)
             }
             KeyCode::BackTab | KeyCode::Up => {
                 dialog.selected_field =
-                    (dialog.selected_field + dialog.fields.len() - 1) % dialog.fields.len()
-            }
-            KeyCode::Backspace => {
-                dialog.fields[dialog.selected_field].pop();
+                    (dialog.selected_field + dialog.fields.len()) % (dialog.fields.len() + 1)
             }
             KeyCode::Enter => {
-                let Some(dialog) = self.tunnel_dialog.take() else {
+                let Some(mut dialog) = self.tunnel_dialog.take() else {
                     return;
                 };
                 let label = dialog.fields[0].trim();
@@ -5834,7 +5920,7 @@ impl App {
                 let local_port = match dialog.fields[3].trim().parse::<u16>() {
                     Ok(port) if port > 0 => port,
                     _ => {
-                        self.notice =
+                        dialog.editor.error =
                             Some("Local port must be an integer from 1 to 65535.".to_string());
                         self.tunnel_dialog = Some(dialog);
                         return;
@@ -5846,7 +5932,7 @@ impl App {
                     match dialog.fields[5].trim().parse::<u16>() {
                         Ok(port) if port > 0 => Some(port),
                         _ => {
-                            self.notice = Some(
+                            dialog.editor.error = Some(
                                 "Destination port must be an integer from 1 to 65535.".to_string(),
                             );
                             self.tunnel_dialog = Some(dialog);
@@ -5857,7 +5943,8 @@ impl App {
                 let connect_timeout_secs = match dialog.fields[6].trim().parse::<u64>() {
                     Ok(value) if value > 0 => value.min(300),
                     _ => {
-                        self.notice = Some("Connect timeout must be 1-300 seconds.".to_string());
+                        dialog.editor.error =
+                            Some("Connect timeout must be 1-300 seconds.".to_string());
                         self.tunnel_dialog = Some(dialog);
                         return;
                     }
@@ -5865,20 +5952,20 @@ impl App {
                 let keepalive_interval_secs = match dialog.fields[7].trim().parse::<u64>() {
                     Ok(value) => value.min(3600),
                     _ => {
-                        self.notice =
+                        dialog.editor.error =
                             Some("KeepAlive interval must be 0-3600 seconds.".to_string());
                         self.tunnel_dialog = Some(dialog);
                         return;
                     }
                 };
                 if label.is_empty() || host_alias.is_empty() || bind_address.is_empty() {
-                    self.notice =
+                    dialog.editor.error =
                         Some("Label, SSH host, and Bind address are required.".to_string());
                     self.tunnel_dialog = Some(dialog);
                     return;
                 }
                 if dialog.kind != TunnelKind::Dynamic && remote_host.is_empty() {
-                    self.notice = Some("Destination address is required.".to_string());
+                    dialog.editor.error = Some("Destination address is required.".to_string());
                     self.tunnel_dialog = Some(dialog);
                     return;
                 }
@@ -5921,9 +6008,6 @@ impl App {
                 self.notice = Some(format!("Saved tunnel {label}."));
                 self.save_metadata();
             }
-            KeyCode::Char(value) if !value.is_control() => {
-                dialog.fields[dialog.selected_field].push(value)
-            }
             _ => {}
         }
     }
@@ -5965,6 +6049,7 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(alias) = aliases.get(dialog.proxy_jump_picker_selected) {
                         dialog.fields[5] = alias.clone();
+                        dialog.editor.reset();
                         dialog.proxy_jump_picker_open = false;
                     }
                 }
@@ -6094,6 +6179,16 @@ impl App {
             }
             return;
         }
+        if dialog.selected_field != 2
+            && !(dialog.selected_field == 6 && key == KeyCode::Char(' '))
+            && dialog.editor.edit(
+                dialog.selected_field,
+                &mut dialog.fields[host_field_index(dialog.selected_field)],
+                key,
+            )
+        {
+            return;
+        }
         match key {
             KeyCode::Esc => self.host_dialog = None,
             KeyCode::Tab | KeyCode::Down => dialog.selected_field = (dialog.selected_field + 1) % 7,
@@ -6108,7 +6203,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let Some(dialog) = self.host_dialog.take() else {
+                let Some(mut dialog) = self.host_dialog.take() else {
                     return;
                 };
                 let port = if dialog.fields[3].is_empty() {
@@ -6117,7 +6212,7 @@ impl App {
                     match dialog.fields[3].parse::<u16>() {
                         Ok(port) if port > 0 => Some(port),
                         _ => {
-                            self.notice =
+                            dialog.editor.error =
                                 Some("Port must be an integer from 1 to 65535.".to_string());
                             self.host_dialog = Some(dialog);
                             return;
@@ -6127,7 +6222,7 @@ impl App {
                 if dialog.fields[0].trim().is_empty()
                     || dialog.fields[0].chars().any(char::is_whitespace)
                 {
-                    self.notice =
+                    dialog.editor.error =
                         Some("Host alias is required and cannot contain whitespace.".to_string());
                     self.host_dialog = Some(dialog);
                     return;
@@ -6187,7 +6282,10 @@ impl App {
                         self.save_metadata();
                         self.clamp_selection();
                     }
-                    Err(error) => self.notice = Some(format!("Could not save host: {error}")),
+                    Err(error) => {
+                        dialog.editor.error = Some(format!("Could not save host: {error}"));
+                        self.host_dialog = Some(dialog);
+                    }
                 }
             }
             KeyCode::Char(value) if !value.is_control() => {
@@ -6266,18 +6364,22 @@ impl App {
         }
 
         let dialog = self.host_group_dialog.as_mut().unwrap();
+        if dialog.editor.edit(0, &mut dialog.name, key) {
+            return;
+        }
         match key {
             KeyCode::Esc => self.host_group_dialog = None,
             KeyCode::Backspace => {
                 dialog.name.pop();
             }
             KeyCode::Enter => {
-                let Some(dialog) = self.host_group_dialog.take() else {
+                let Some(mut dialog) = self.host_group_dialog.take() else {
                     return;
                 };
                 let name = dialog.name.trim().to_string();
                 if name.is_empty() || name.contains(',') {
-                    self.notice = Some("Group name is required and cannot contain commas.".into());
+                    dialog.editor.error =
+                        Some("Group name is required and cannot contain commas.".into());
                     self.host_group_dialog = Some(dialog);
                     return;
                 }
@@ -6285,7 +6387,7 @@ impl App {
                     group.eq_ignore_ascii_case(&name)
                         && dialog.original_name.as_deref() != Some(group.as_str())
                 }) {
-                    self.notice = Some(format!("Group {name} already exists."));
+                    dialog.editor.error = Some(format!("Group {name} already exists."));
                     self.host_group_dialog = Some(dialog);
                     return;
                 }
@@ -7353,6 +7455,7 @@ mod tests {
     fn credential_export_keeps_feedback_inside_dialog() {
         let mut app = app_fixture();
         app.credential_export_dialog = Some(CredentialExportDialog {
+            editor: Default::default(),
             fields: ["short".into(), "short".into()],
             selected_field: 1,
             error: None,
@@ -7372,6 +7475,7 @@ mod tests {
         );
 
         app.credential_export_dialog = Some(CredentialExportDialog {
+            editor: Default::default(),
             fields: ["long-enough".into(), "different".into()],
             selected_field: 1,
             error: None,
@@ -9394,6 +9498,199 @@ mod tests {
     }
 
     #[test]
+    fn text_forms_share_unicode_cursor_editing_without_switching_workspaces() {
+        for form in 0..11 {
+            let mut app = grouped_fixture();
+            let value = "a中文z".to_string();
+            match form {
+                0 => {
+                    app.open_host_form(None);
+                    app.host_dialog.as_mut().unwrap().fields[0] = value;
+                }
+                1 => {
+                    app.open_tunnel_form(None);
+                    let dialog = app.tunnel_dialog.as_mut().unwrap();
+                    dialog.selected_field = 0;
+                    dialog.fields[0] = value;
+                }
+                2 => {
+                    app.open_package_form(None);
+                    app.package_dialog.as_mut().unwrap().fields[0] = value;
+                }
+                3 => {
+                    app.open_snippet_form(uuid::Uuid::nil(), None);
+                    app.snippet_dialog.as_mut().unwrap().fields[0] = value;
+                }
+                4 => {
+                    app.host_group_dialog = Some(HostGroupDialog {
+                        editor: Default::default(),
+                        name: value,
+                        original_name: None,
+                        deleting: false,
+                    })
+                }
+                5 => {
+                    app.section = NavSection::Credentials;
+                    app.handle_credentials_key(KeyCode::Char('a'));
+                    app.credential_manager.form.as_mut().unwrap().fields[0] = value;
+                }
+                6 => {
+                    app.credential_export_dialog = Some(CredentialExportDialog {
+                        editor: Default::default(),
+                        fields: [value, String::new()],
+                        selected_field: 0,
+                        error: None,
+                    })
+                }
+                7 => {
+                    app.credential_import_dialog = Some(CredentialImportDialog {
+                        editor: Default::default(),
+                        password: value,
+                        error: None,
+                    })
+                }
+                8 => {
+                    app.section = NavSection::Projects;
+                    app.handle_projects_key(KeyCode::Char('a'));
+                    app.workspace.form.as_mut().unwrap().fields[0] = value;
+                }
+                9 => {
+                    app.prompt_host_password(
+                        "web".into(),
+                        "deploy".into(),
+                        None,
+                        true,
+                        HostPasswordPurpose::Authentication,
+                    );
+                    let dialog = app.host_password_dialog.as_mut().unwrap();
+                    dialog.selected_field = 1;
+                    *dialog.password = value;
+                }
+                _ => {
+                    app.sync_dialog = Some(SyncSettingsDialog {
+                        editor: Default::default(),
+                        remote: value,
+                        branch: "main".into(),
+                        selected: 0,
+                        testing: false,
+                    })
+                }
+            }
+            let section = app.section;
+            for key in [
+                KeyCode::Home,
+                KeyCode::Right,
+                KeyCode::Delete,
+                KeyCode::Char('日'),
+                KeyCode::End,
+                KeyCode::Left,
+                KeyCode::Backspace,
+            ] {
+                press(&mut app, key, KeyModifiers::NONE);
+            }
+            let value = match form {
+                0 => &app.host_dialog.as_ref().unwrap().fields[0],
+                1 => &app.tunnel_dialog.as_ref().unwrap().fields[0],
+                2 => &app.package_dialog.as_ref().unwrap().fields[0],
+                3 => &app.snippet_dialog.as_ref().unwrap().fields[0],
+                4 => &app.host_group_dialog.as_ref().unwrap().name,
+                5 => &app.credential_manager.form.as_ref().unwrap().fields[0],
+                6 => &app.credential_export_dialog.as_ref().unwrap().fields[0],
+                7 => &app.credential_import_dialog.as_ref().unwrap().password,
+                8 => &app.workspace.form.as_ref().unwrap().fields[0],
+                9 => app.host_password_dialog.as_ref().unwrap().password.as_str(),
+                _ => &app.sync_dialog.as_ref().unwrap().remote,
+            };
+            assert_eq!(value, "a日z", "form {form}");
+            assert_eq!(app.section, section);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn validation_errors_stay_in_the_form_and_typing_clears_them() {
+        let mut app = grouped_fixture();
+        app.notice = None;
+        app.open_host_form(None);
+        app.handle_host_dialog_key(KeyCode::Enter);
+        assert!(app.host_dialog.as_ref().unwrap().editor.error.is_some());
+        assert!(app.notice.is_none());
+        app.handle_host_dialog_key(KeyCode::Char('x'));
+        assert!(app.host_dialog.as_ref().unwrap().editor.error.is_none());
+        app.host_dialog = None;
+
+        app.open_tunnel_form(None);
+        app.tunnel_dialog.as_mut().unwrap().selected_field = 0;
+        app.handle_tunnel_dialog_key(KeyCode::Enter);
+        assert!(app.tunnel_dialog.as_ref().unwrap().editor.error.is_some());
+        app.handle_tunnel_dialog_key(KeyCode::Char('x'));
+        assert!(app.tunnel_dialog.as_ref().unwrap().editor.error.is_none());
+        app.tunnel_dialog = None;
+
+        app.open_package_form(None);
+        app.handle_package_dialog_key(KeyCode::Enter);
+        assert!(app.package_dialog.as_ref().unwrap().editor.error.is_some());
+        app.handle_package_dialog_key(KeyCode::Char('x'));
+        assert!(app.package_dialog.as_ref().unwrap().editor.error.is_none());
+        app.package_dialog = None;
+
+        app.open_snippet_form(uuid::Uuid::nil(), None);
+        app.handle_snippet_dialog_key(KeyCode::Enter);
+        assert!(app.snippet_dialog.as_ref().unwrap().editor.error.is_some());
+        app.handle_snippet_dialog_key(KeyCode::Char('x'));
+        assert!(app.snippet_dialog.as_ref().unwrap().editor.error.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn tunnel_host_field_uses_space_to_pick_and_enter_to_save_in_add_and_edit() {
+        let mut app = grouped_fixture();
+        app.section = NavSection::Tunnels;
+        app.metadata_error = true;
+        app.open_tunnel_form(None);
+        app.tunnel_dialog.as_mut().unwrap().fields = [
+            "web-db".into(),
+            "web".into(),
+            "127.0.0.1".into(),
+            "15432".into(),
+            "db.internal".into(),
+            "5432".into(),
+            "10".into(),
+            "30".into(),
+        ];
+        for editing in [false, true] {
+            if editing {
+                app.open_tunnel_form(Some(app.metadata.tunnels[0].clone()));
+            }
+            app.tunnel_dialog.as_mut().unwrap().selected_field = 1;
+            app.handle_key(KeyCode::Char(' '));
+            assert!(app.tunnel_host_picker_open);
+            let index = app
+                .host_picker_items()
+                .iter()
+                .position(|item| matches!(item, HostPickerItem::Host(alias) if alias == "web"))
+                .unwrap();
+            app.host_picker_selection = index;
+            app.handle_key(KeyCode::Enter);
+            assert!(!app.tunnel_host_picker_open);
+            assert_eq!(app.tunnel_dialog.as_ref().unwrap().fields[1], "web");
+            app.handle_key(KeyCode::Enter);
+            assert!(app.tunnel_dialog.is_none());
+            assert!(!app.tunnel_host_picker_open);
+            assert_eq!(app.metadata.tunnels.len(), 1);
+            assert_eq!(app.metadata.tunnels[0].host_alias, "web");
+        }
+        app.open_tunnel_form(None);
+        app.tunnel_dialog.as_mut().unwrap().selected_field = 1;
+        app.handle_key(KeyCode::Enter);
+        assert!(app.tunnel_dialog.is_some());
+        assert!(!app.tunnel_host_picker_open);
+        app.handle_key(KeyCode::Esc);
+        assert!(app.tunnel_dialog.is_none());
+        assert_eq!(app.metadata.tunnels.len(), 1);
+    }
+
+    #[test]
     fn local_tunnel_form_creates_and_removes_a_definition() {
         let mut app = grouped_fixture();
         app.section = NavSection::Tunnels;
@@ -9491,6 +9788,31 @@ mod tests {
         assert_eq!(app.metadata.tunnels[1].kind, TunnelKind::Dynamic);
         assert_eq!(app.metadata.tunnels[1].remote_host, None);
         assert_eq!(app.metadata.tunnels[1].remote_port, None);
+    }
+
+    #[test]
+    fn tunnel_mode_is_a_choice_field_and_tab_moves_to_the_label() {
+        let mut app = grouped_fixture();
+        app.section = NavSection::Tunnels;
+        app.open_tunnel_form(None);
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().selected_field, 8);
+        let fields = app.tunnel_dialog.as_ref().unwrap().fields.clone();
+        app.handle_key(KeyCode::Backspace);
+        app.handle_key(KeyCode::Char('x'));
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().fields, fields);
+        app.handle_key(KeyCode::Right);
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().kind, TunnelKind::Remote);
+        app.handle_key(KeyCode::Char(' '));
+        assert_eq!(
+            app.tunnel_dialog.as_ref().unwrap().kind,
+            TunnelKind::Dynamic
+        );
+        app.handle_key(KeyCode::Left);
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().kind, TunnelKind::Remote);
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().selected_field, 0);
+        app.handle_key(KeyCode::BackTab);
+        assert_eq!(app.tunnel_dialog.as_ref().unwrap().selected_field, 8);
     }
 
     #[test]

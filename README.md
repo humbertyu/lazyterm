@@ -68,6 +68,19 @@ The host-management scope covers common connection fields: alias, hostname, user
 
 In the Hosts view, use `a` to add a host, `e` to edit an ordinary single-alias Host block, and `d` to delete one after confirmation. Existing OpenSSH hosts can also be managed; shared or ambiguous blocks require explicit SSH config editing. Press `Enter` to hand an SSH session to the system OpenSSH client.
 
+Host, Tunnel, Snippet, Package, Project and Credentials Add/Edit dialogs share
+single-line fields, inline validation and bottom-border actions:
+Tab/Shift-Tab or Up/Down changes fields, Enter saves from the current field, and
+Esc cancels. Text fields support Left/Right, Home/End, Backspace and Delete,
+including Unicode text; long values scroll to keep the cursor visible.
+Password fields show one asterisk per entered character. Existing saved secrets
+remain concealed and a blank replacement preserves them. Choice fields use
+Left/Right or Space, and checkboxes use Space.
+In a Tunnel's SSH host / IP field, type an alias/IP directly or use
+Space to choose an existing Host; Enter in the picker chooses the Host and
+returns to the form. The Mode field uses Left/Right or Space to switch
+Local/Remote/Dynamic; F1/F2/F3 remain available as direct shortcuts.
+
 Runtime shows TCP listeners on the local machine or on a selected Host. The top row has clickable `Local` and `Hosts` selectors followed by the current machine name; category tabs sit below it. Press `h` or `s` to open the Groups/Hosts picker, `l` to return to Local, and `r` to refresh the inspection. Each machine keeps its own category, selected listener, and list position for the current app session. Switching machines shows its cached list while a fresh inspection runs; termination is disabled until that inspection succeeds. Older requests cannot replace the current machine's results. `Enter` keeps the selected listener focused and its details visible. Categories and listener rows also support mouse selection.
 
 Entries are classified as `APP`, `SYSTEM`, or `UNKNOWN`, with application listeners shown first. Select a listener and press `k` to confirm sending `TERM`, or `K` to open a separate confirmation for `KILL`, using its visible PID; both confirmations name the target machine and block machine switching until dismissed. Runtime also queries the full command line and working directory for the PID when the platform permits it, so an Agent-started `node`, `python`, or similar process can be traced back to its project directory and command. Runtime uses `lsof` when available and falls back to `ss`; process names, paths, working directories, and PIDs may be unavailable without sufficient permissions.

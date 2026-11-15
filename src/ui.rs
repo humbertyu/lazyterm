@@ -723,14 +723,14 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             area,
         );
     } else if let Some(form) = &app.workspace.form {
-        let area = centered_rect(86, (form.fields.len() * 3 + 5) as u16, frame.area());
+        let area = centered_rect(86, (form.fields.len() * 2 + 5) as u16, frame.area());
         frame.render_widget(Clear, area);
         let title = format!(
             " {} {} ",
             if form.editing_id.is_some() || form.original_group.is_some() {
                 "EDIT"
             } else {
-                "ADD"
+                "NEW"
             },
             if form.group_form {
                 "GROUP"
@@ -742,11 +742,25 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
                 "PROJECT"
             }
         );
-        let block = panel(&title);
+        let choice_selected = form.is_choice(form.selected);
+        let block = form_panel(
+            &title,
+            if form.link_form && form.selected == 5 {
+                "Tab / ↑↓ field  Space toggle  Enter save  Esc cancel"
+            } else if choice_selected {
+                "Tab / ↑↓ field  ←→/Space choice  Enter save  Esc cancel"
+            } else {
+                "Tab / ↑↓ field  Enter save  Esc cancel"
+            },
+            area,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let compact = area.height < (form.fields.len() * 3 + 4) as u16;
-        let field_height = if compact { 2 } else { 3 };
+        let field_height = if usize::from(inner.height) >= form.fields.len() * 2 + 2 {
+            2
+        } else {
+            1
+        };
         let visible_count = (usize::from(inner.height.saturating_sub(2)) / field_height)
             .max(1)
             .min(form.fields.len());
@@ -763,51 +777,18 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             .enumerate()
         {
             let active = index == form.selected;
-            let inner =
-                if compact {
-                    let fields = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
-                        .split(rows[row_index]);
-                    frame.render_widget(
-                        Paragraph::new(form.labels()[index]).style(
-                            Style::default().fg(if active { GREEN.into() } else { MUTED.into() }),
-                        ),
-                        fields[0],
-                    );
-                    fields[1]
-                } else {
-                    let block = Block::default()
-                        .borders(Borders::ALL)
-                        .title(form.labels()[index])
-                        .border_style(Style::default().fg(if active {
-                            GREEN.into()
-                        } else {
-                            BORDER.into()
-                        }));
-                    let inner = block.inner(rows[row_index]);
-                    frame.render_widget(block, rows[row_index]);
-                    inner
-                };
-            let choice = (form.link_form && (index == 4 || index == 5))
-                || (!form.group_form
-                    && !form.link_form
-                    && (if form.project_id.is_some() {
-                        index >= 4
-                    } else {
-                        index == 2
-                    }));
+            let inner = rows[row_index];
+            let choice = form.is_choice(index);
             let value = if form.link_form && index == 3 {
-                let display = if active && !value.is_empty() {
-                    value.as_str()
-                } else if !value.is_empty() {
-                    "********"
-                } else if form.editing_id.is_some()
+                let display = if value.is_empty()
+                    && form.editing_id.is_some()
                     && app
                         .selected_project_link()
                         .is_some_and(|link| link.password_ref.is_some() || link.password.is_some())
                 {
                     "(saved; blank keeps it)"
                 } else {
-                    ""
+                    value.as_str()
                 };
                 display.to_string()
             } else if choice {
@@ -815,28 +796,29 @@ fn render_workspace_dialog(frame: &mut Frame, app: &App) {
             } else {
                 value.clone()
             };
-            let line = input_value(&value, active, false);
-            let width = line.width();
+            let line = if form.link_form && index == 5 {
+                checkbox_line(form.labels()[index], value == "Yes", active)
+            } else {
+                let masked = form.link_form && index == 3 && !form.fields[index].is_empty();
+                form_input_line(
+                    form.labels()[index],
+                    &value,
+                    active,
+                    masked,
+                    if choice || value != form.fields[index] {
+                        value.len()
+                    } else {
+                        form.editor.position(index, &value)
+                    },
+                    inner.width,
+                )
+            };
             frame.render_widget(
-                Paragraph::new(line)
-                    .style(Style::default().fg(TEXT.into()))
-                    .scroll((
-                        0,
-                        width
-                            .saturating_sub(inner.width as usize)
-                            .min(u16::MAX as usize) as u16,
-                    )),
+                Paragraph::new(line).style(Style::default().fg(TEXT.into())),
                 inner,
             );
         }
-        if let Some(error) = &form.error {
-            frame.render_widget(
-                Paragraph::new(error.as_str())
-                    .style(Style::default().fg(Color::Red))
-                    .wrap(Wrap { trim: false }),
-                rows[visible_count],
-            );
-        }
+        render_form_error(frame, inner, form.error.as_deref());
     } else if let Some(target) = &app.workspace.delete {
         let message = match target {
             crate::project_app::WorkspaceDelete::Project { name, .. } => {
@@ -2385,25 +2367,23 @@ fn render_sync_settings_dialog(frame: &mut Frame, dialog: &crate::app::SyncSetti
         height,
     };
     frame.render_widget(Clear, area);
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .margin(1)
-    .split(area);
-    frame.render_widget(
-        Paragraph::new("Git configuration sync").style(
-            Style::default()
-                .fg(GREEN.into())
-                .add_modifier(Modifier::BOLD),
-        ),
-        rows[0],
+    let block = form_panel(
+        " Git configuration sync ",
+        "Tab / ↑↓ field  Enter save/action  Esc cancel",
+        area,
     );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(2),
+    ])
+    .split(inner);
     for (index, (label, value)) in [
         ("Remote", dialog.remote.as_str()),
         ("Branch", dialog.branch.as_str()),
@@ -2413,16 +2393,15 @@ fn render_sync_settings_dialog(frame: &mut Frame, dialog: &crate::app::SyncSetti
     {
         let selected = dialog.selected == index;
         frame.render_widget(
-            Paragraph::new(format!("{label}: {value}"))
-                .style(Style::default().fg(if selected { GREEN.into() } else { TEXT.into() }))
-                .block(Block::default().borders(Borders::BOTTOM).border_style(
-                    Style::default().fg(if selected {
-                        GREEN.into()
-                    } else {
-                        BORDER.into()
-                    }),
-                )),
-            rows[index + 1],
+            Paragraph::new(form_input_line(
+                label,
+                value,
+                selected,
+                false,
+                dialog.editor.position(index, value),
+                rows[index].width,
+            )),
+            rows[index],
         );
     }
     let controls = [
@@ -2457,22 +2436,16 @@ fn render_sync_settings_dialog(frame: &mut Frame, dialog: &crate::app::SyncSetti
             } else {
                 MUTED.into()
             })),
-            rows[offset + 3],
+            rows[offset + 2],
         );
     }
     frame.render_widget(
         Paragraph::new("Use a private remote. Git auth uses your agent/helper; passwords and key files are excluded.")
             .style(Style::default().fg(MUTED.into()))
             .wrap(Wrap { trim: true }),
-        rows[6],
+        rows[5],
     );
-    frame.render_widget(
-        Block::default()
-            .title("Sync settings")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(BORDER.into())),
-        area,
-    );
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
 }
 
 fn render_sync_conflicts(frame: &mut Frame, prepared: &crate::sync_engine::Prepared) {
@@ -3021,7 +2994,7 @@ fn panel_l(app: &App, title: &str) -> Block<'static> {
         .style(Style::default().bg(PANEL.into()))
 }
 
-fn action_panel<'a>(title: &'a str, footer: &str, border: Color) -> Block<'a> {
+pub(crate) fn action_panel<'a>(title: &'a str, footer: &str, border: Color) -> Block<'a> {
     Block::default()
         .title(title)
         .title_bottom(Span::styled(
@@ -3031,6 +3004,23 @@ fn action_panel<'a>(title: &'a str, footer: &str, border: Color) -> Block<'a> {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(PANEL.into()))
+}
+
+pub(crate) fn form_panel<'a>(title: &'a str, footer: &str, area: Rect) -> Block<'a> {
+    use unicode_width::UnicodeWidthStr;
+    let mut footer = footer.to_string();
+    if area.width < 64 {
+        footer = footer.replace("Tab / ↑↓ field", "Tab field");
+    }
+    if footer.width() + 4 > usize::from(area.width) {
+        footer = footer.replace("Tab field  ", "");
+    }
+    if footer.width() + 4 > usize::from(area.width)
+        && let Some(start) = footer.find("Enter ")
+    {
+        footer = footer[start..].to_string();
+    }
+    action_panel(title, &footer, BORDER.into())
 }
 
 fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
@@ -3269,22 +3259,33 @@ fn render_snippet_runs(frame: &mut Frame, area: Rect, app: &App) {
 fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, app: &App) {
     let area = centered_rect(82, 16, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(if dialog.editing_id.is_some() {
-        " EDIT SNIPPET "
-    } else {
-        " NEW SNIPPET "
-    });
+    let block = form_panel(
+        if dialog.editing_id.is_some() {
+            " EDIT SNIPPET "
+        } else {
+            " NEW SNIPPET "
+        },
+        if dialog.selected_field == 3 {
+            "Tab / ↑↓ field  Space toggle  Enter save  Esc cancel"
+        } else {
+            "Tab / ↑↓ field  Enter save  Esc cancel"
+        },
+        area,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let labels = ["Name", "Command", "Description"];
-    let rows = Layout::vertical([Constraint::Length(1); 4]).split(inner);
+    let field_height = if inner.height >= 8 { 2 } else { 1 };
+    let rows = Layout::vertical([Constraint::Length(field_height); 4]).split(inner);
     for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
         frame.render_widget(
-            Paragraph::new(input_line(
+            Paragraph::new(form_input_line(
                 label,
                 value,
                 index == dialog.selected_field,
                 false,
+                dialog.editor.position(index, value),
+                rows[index].width,
             )),
             rows[index],
         );
@@ -3299,7 +3300,7 @@ fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, 
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "Package: {}   Tab / ↑↓ field   Enter save   Esc cancel",
+            "Package: {}",
             app.metadata
                 .snippet_packages
                 .iter()
@@ -3309,45 +3310,45 @@ fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, 
         .style(Style::default().fg(MUTED.into()))
         .wrap(Wrap { trim: true }),
         Rect {
-            y: inner.y + 6,
-            height: inner.height.saturating_sub(6),
+            y: inner.y.saturating_add(field_height * 4),
+            height: inner.height.saturating_sub(field_height * 4),
             ..inner
         },
     );
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
 }
 
 fn render_package_dialog(frame: &mut Frame, dialog: &crate::app::PackageDialog) {
     let area = centered_rect(72, 11, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(if dialog.editing_id.is_some() {
-        " EDIT PACKAGE "
-    } else {
-        " NEW PACKAGE "
-    });
+    let block = form_panel(
+        if dialog.editing_id.is_some() {
+            " EDIT PACKAGE "
+        } else {
+            " NEW PACKAGE "
+        },
+        "Tab / ↑↓ field  Enter save  Esc cancel",
+        area,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let labels = ["Name", "Description"];
-    let rows = Layout::vertical([Constraint::Length(1); 2]).split(inner);
+    let rows = Layout::vertical([Constraint::Length(if inner.height >= 4 { 2 } else { 1 }); 2])
+        .split(inner);
     for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
         frame.render_widget(
-            Paragraph::new(input_line(
+            Paragraph::new(form_input_line(
                 label,
                 value,
                 index == dialog.selected_field,
                 false,
+                dialog.editor.position(index, value),
+                rows[index].width,
             )),
             rows[index],
         );
     }
-    frame.render_widget(
-        Paragraph::new("Tab / ↑↓ field    Enter save    Esc cancel")
-            .style(Style::default().fg(MUTED.into())),
-        Rect {
-            y: inner.y + 4,
-            height: inner.height.saturating_sub(4),
-            ..inner
-        },
-    );
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
 }
 
 fn render_snippet_confirmation(frame: &mut Frame, pending: &crate::app::PendingSnippetRun) {
@@ -3488,6 +3489,20 @@ fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    if app.workspace.form.is_some()
+        || app.host_dialog.is_some()
+        || app.host_group_dialog.is_some()
+        || app.tunnel_dialog.is_some()
+        || app.snippet_dialog.is_some()
+        || app.package_dialog.is_some()
+        || app.credential_manager.form.is_some()
+        || app.credential_export_dialog.is_some()
+        || app.credential_import_dialog.is_some()
+        || app.host_password_dialog.is_some()
+        || app.sync_dialog.is_some()
+    {
+        return;
+    }
     let confirmation_open = app.workspace.delete.is_some()
         || app.workspace.confirmation.is_some()
         || app.import_confirmation.is_some()
@@ -3897,10 +3912,12 @@ fn render_settings_picker(frame: &mut Frame, app: &App) {
 fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
     let area = centered_rect(72, 20, frame.area());
     frame.render_widget(Clear, area);
-    let actions = if dialog.selected_field == 6 && !dialog.fields[5].is_empty() {
-        "Tab / ↑↓ field  Enter save  Esc cancel"
-    } else {
+    let actions = if dialog.selected_field == 2
+        || (dialog.selected_field == 6 && dialog.fields[5].is_empty())
+    {
         "Tab / ↑↓ field  Space select  Enter save  Esc cancel"
+    } else {
+        "Tab / ↑↓ field  Enter save  Esc cancel"
     };
     let block = if dialog.deleting {
         action_panel(
@@ -3909,9 +3926,9 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
             Color::Rgb(221, 132, 112),
         )
     } else if dialog.editing {
-        action_panel(" EDIT HOST ", actions, BORDER.into())
+        form_panel(" EDIT HOST ", actions, area)
     } else {
-        action_panel(" NEW HOST ", actions, BORDER.into())
+        form_panel(" NEW HOST ", actions, area)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3958,13 +3975,15 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
             }]
             .clone()
         };
-        let mut line = input_line(
+        let mut line = form_input_line(
             label,
             &value,
             index == dialog.selected_field
                 && !dialog.tag_picker_open
                 && !dialog.proxy_jump_picker_open,
             false,
+            dialog.editor.position(index, &value),
+            rows[index].width,
         );
         if index == 6 && value.is_empty() {
             line.spans.push(Span::styled(
@@ -3978,6 +3997,7 @@ fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
         }
         frame.render_widget(Paragraph::new(line), rows[index]);
     }
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
 }
 
 fn render_proxy_jump_picker(frame: &mut Frame, app: &App, dialog: &crate::app::HostDialog) {
@@ -4116,16 +4136,22 @@ fn render_host_group_dialog(frame: &mut Frame, dialog: &crate::app::HostGroupDia
         } else {
             " NEW GROUP "
         };
+        let block = form_panel(title, "Enter save  Esc cancel", area);
+        let inner = block.inner(area);
         frame.render_widget(
-            Paragraph::new(input_line("Name", &dialog.name, true, false))
-                .style(Style::default().fg(TEXT.into()))
-                .block(action_panel(
-                    title,
-                    "Type name  Enter save  Esc cancel",
-                    BORDER.into(),
-                )),
+            Paragraph::new(form_input_line(
+                "Name",
+                &dialog.name,
+                true,
+                false,
+                dialog.editor.position(0, &dialog.name),
+                inner.width,
+            ))
+            .style(Style::default().fg(TEXT.into()))
+            .block(block),
             area,
         );
+        render_form_error(frame, inner, dialog.editor.error.as_deref());
     }
 }
 
@@ -4150,7 +4176,17 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
     let block = if dialog.deleting {
         action_panel(title, "y/Enter yes  n/Esc no", Color::Rgb(221, 132, 112))
     } else {
-        panel(title)
+        form_panel(
+            title,
+            if dialog.selected_field == 8 {
+                "Tab / ↑↓ field  ←→/Space choice  Enter save  Esc cancel"
+            } else if dialog.selected_field == 1 {
+                "Tab / ↑↓ field  Space select  Enter save  Esc cancel"
+            } else {
+                "Tab / ↑↓ field  Enter save  Esc cancel"
+            },
+            area,
+        )
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -4195,7 +4231,18 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Mode  ", Style::default().fg(MUTED.into())),
+            Span::styled(
+                if dialog.selected_field == 8 {
+                    "> Mode  "
+                } else {
+                    "  Mode  "
+                },
+                Style::default().fg(if dialog.selected_field == 8 {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
+            ),
             Span::styled(
                 "[F1 Local]  ",
                 Style::default().fg(if mode == "Local" {
@@ -4228,36 +4275,31 @@ fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
             height: 1,
         },
     );
-    let rows = Layout::vertical([Constraint::Length(1); 8]).split(Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(2),
-        width: inner.width,
-        height: inner.height.saturating_sub(2),
-    });
+    let rows = Layout::vertical([Constraint::Length(if inner.height >= 18 { 2 } else { 1 }); 8])
+        .split(Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(2),
+            width: inner.width,
+            height: inner.height.saturating_sub(2),
+        });
     for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
-        frame.render_widget(
-            Paragraph::new(input_line(
-                label,
-                value,
-                index == dialog.selected_field,
-                false,
-            )),
-            rows[index],
+        let mut line = form_input_line(
+            label,
+            value,
+            index == dialog.selected_field,
+            false,
+            dialog.editor.position(index, value),
+            rows[index].width,
         );
+        if index == 1 && value.is_empty() {
+            line.spans.push(Span::styled(
+                " IP/alias | Space select",
+                Style::default().fg(MUTED.into()),
+            ));
+        }
+        frame.render_widget(Paragraph::new(line), rows[index]);
     }
-    let help_area = Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(11),
-        width: inner.width,
-        height: inner.height.saturating_sub(11),
-    };
-    frame.render_widget(
-        Paragraph::new(
-            "Use a Host alias from ~/.ssh/config, or enter an IP/domain    Tab / ↑↓ field    Enter save    Esc cancel",
-        )
-            .style(Style::default().fg(MUTED.into())),
-        help_area,
-    );
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
 }
 
 fn render_tunnel_host_picker(frame: &mut Frame, app: &App) {
@@ -4342,7 +4384,7 @@ fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPassw
         HostPasswordPurpose::Authentication => "SSH authentication",
         HostPasswordPurpose::UploadKey { .. } => "Install SSH public key",
     };
-    let mut lines = vec![
+    let lines = vec![
         Line::from(format!("Host: {}", dialog.alias)),
         Line::from(""),
         if matches!(dialog.purpose, HostPasswordPurpose::Authentication) {
@@ -4351,18 +4393,22 @@ fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPassw
                 dialog.username
             ))
         } else {
-            input_line(
+            form_input_line(
                 "Username",
                 &dialog.username,
                 dialog.selected_field == 0,
                 false,
+                dialog.editor.position(0, &dialog.username),
+                area.width.saturating_sub(2),
             )
         },
-        input_line(
+        form_input_line(
             "Password",
             dialog.password.as_str(),
             dialog.selected_field == 1,
             true,
+            dialog.editor.position(1, dialog.password.as_str()),
+            area.width.saturating_sub(2),
         ),
         if dialog.save_allowed {
             checkbox_line(
@@ -4374,18 +4420,17 @@ fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPassw
             Line::from("  Add this host to Hosts to save its password.")
         },
     ];
-    if let Some(error) = &dialog.error {
-        lines.push(Line::from(Span::styled(
-            error.as_str(),
-            Style::default().fg(Color::Rgb(221, 132, 112)),
-        )));
-    }
     let title = format!(" {purpose} ");
-    let block = action_panel(
+    let block = form_panel(
         &title,
-        "Tab/↑↓ field  Space toggle  Enter connect  Esc cancel",
-        GREEN.into(),
+        if dialog.selected_field == 2 && dialog.save_allowed {
+            "Tab / ↑↓ field  Space toggle  Enter connect  Esc cancel"
+        } else {
+            "Tab / ↑↓ field  Enter connect  Esc cancel"
+        },
+        area,
     );
+    let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -4394,46 +4439,75 @@ fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPassw
             .wrap(Wrap { trim: false }),
         area,
     );
+    render_form_error(frame, inner, dialog.error.as_deref());
 }
 
 pub(crate) fn input_line(label: &str, value: &str, focused: bool, masked: bool) -> Line<'static> {
+    form_input_line(label, value, focused, masked, value.len(), u16::MAX)
+}
+
+pub(crate) fn form_input_line(
+    label: &str,
+    value: &str,
+    focused: bool,
+    masked: bool,
+    cursor: usize,
+    width: u16,
+) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
     let shown = if masked {
         "*".repeat(value.chars().count())
     } else {
         value.to_string()
     };
+    let position = if masked {
+        value[..cursor].chars().count()
+    } else {
+        cursor
+    };
+    let mut shown = shown;
+    if focused {
+        shown.insert(position, '_');
+    }
+    let label = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{label}: ")
+    };
+    let available = usize::from(width).saturating_sub(label.width() + 2).max(1);
+    let mut start = 0;
+    if focused {
+        while shown[start..position].width() >= available {
+            start += shown[start..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
     Line::from(vec![
         Span::styled(
             if focused { "> " } else { "  " },
             Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
         ),
         Span::styled(
-            format!("{label}: "),
+            label,
             Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
         ),
-        Span::styled(
-            format!("{shown}{}", if focused { "_" } else { "" }),
-            Style::default().fg(TEXT.into()),
-        ),
+        Span::styled(shown[start..].to_string(), Style::default().fg(TEXT.into())),
     ])
 }
 
-pub(crate) fn input_value(value: &str, focused: bool, masked: bool) -> Line<'static> {
-    let shown = if masked {
-        "*".repeat(value.chars().count())
-    } else {
-        value.to_string()
-    };
-    Line::from(vec![
-        Span::styled(
-            if focused { "> " } else { "  " },
-            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
-        ),
-        Span::styled(
-            format!("{shown}{}", if focused { "_" } else { "" }),
-            Style::default().fg(TEXT.into()),
-        ),
-    ])
+pub(crate) fn render_form_error(frame: &mut Frame, inner: Rect, error: Option<&str>) {
+    if let Some(error) = error {
+        let height = inner.height.min(2);
+        frame.render_widget(
+            Paragraph::new(crate::diagnostics::redact_sensitive_text(error))
+                .style(Style::default().fg(Color::Rgb(221, 132, 112)))
+                .wrap(Wrap { trim: false }),
+            Rect {
+                y: inner.bottom().saturating_sub(height),
+                height,
+                ..inner
+            },
+        );
+    }
 }
 
 pub(crate) fn checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'static> {
@@ -4450,28 +4524,20 @@ pub(crate) fn checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'
 }
 
 fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::CredentialExportDialog) {
-    let area = centered_rect(76, 18, frame.area());
+    let area = centered_rect(76, 12, frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .title(" EXPORT ENCRYPTED CREDENTIALS ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(GREEN.into()))
-            .style(Style::default().bg(PANEL.into())),
+    let block = form_panel(
+        " EXPORT ENCRYPTED CREDENTIALS ",
+        "Tab / ↑↓ field  Enter export  Esc cancel",
         area,
     );
-    let inner = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(GREEN.into()))
-        .inner(area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let rows = Layout::vertical([
         Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Length(4),
-        Constraint::Length(4),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(2),
     ])
     .split(inner);
     frame.render_widget(
@@ -4480,57 +4546,31 @@ fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::Crede
         rows[0],
     );
     for (index, label) in ["Export password", "Confirm password"].iter().enumerate() {
-        let label_area = Rect {
-            x: rows[index + 2].x,
-            y: rows[index + 2].y,
-            width: rows[index + 2].width,
-            height: 1,
-        };
-        let input_area = Rect {
-            x: rows[index + 2].x,
-            y: rows[index + 2].y + 1,
-            width: rows[index + 2].width,
-            height: 3,
-        };
         let focused = dialog.selected_field == index;
+        let value = &dialog.fields[index];
         frame.render_widget(
-            Paragraph::new(*label).style(
-                Style::default()
-                    .fg(if focused { GREEN.into() } else { TEXT.into() })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            label_area,
-        );
-        frame.render_widget(
-            Paragraph::new(input_value(&dialog.fields[index], focused, true))
-                .block(Block::default().borders(Borders::ALL).border_style(
-                    Style::default().fg(if focused { GREEN.into() } else { BORDER.into() }),
-                ))
-                .style(Style::default().fg(if focused { GREEN.into() } else { TEXT.into() })),
-            input_area,
+            Paragraph::new(form_input_line(
+                label,
+                value,
+                focused,
+                true,
+                dialog.editor.position(index, value),
+                rows[index + 1].width,
+            )),
+            rows[index + 1],
         );
     }
-    if let Some(message) = dialog.error.as_deref() {
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(Color::Rgb(221, 132, 112))),
-            rows[5],
-        );
-    }
-    frame.render_widget(
-        Paragraph::new("Tab/↑↓ switch field   Enter export   Esc cancel")
-            .style(Style::default().fg(MUTED.into())),
-        rows[6],
-    );
+    render_form_error(frame, inner, dialog.error.as_deref());
 }
 
 fn render_credential_import_dialog(frame: &mut Frame, dialog: &crate::app::CredentialImportDialog) {
     let area = centered_rect(72, 10, frame.area());
     frame.render_widget(Clear, area);
     let input = Rect {
-        x: area.x + 2,
+        x: area.x + 1,
         y: area.y + 3,
-        width: area.width.saturating_sub(4),
-        height: 3,
+        width: area.width.saturating_sub(2),
+        height: 1,
     };
     frame.render_widget(
         Paragraph::new("Enter the password used to encrypt this credential archive.")
@@ -4549,11 +4589,14 @@ fn render_credential_import_dialog(frame: &mut Frame, dialog: &crate::app::Crede
         area,
     );
     frame.render_widget(
-        Paragraph::new(input_value(&dialog.password, true, true)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(GREEN.into())),
-        ),
+        Paragraph::new(form_input_line(
+            "Password",
+            &dialog.password,
+            true,
+            true,
+            dialog.editor.position(0, &dialog.password),
+            input.width,
+        )),
         input,
     );
     if let Some(error) = dialog.error.as_deref() {
@@ -4854,6 +4897,7 @@ mod tests {
             Ok(crate::metadata::Metadata::default()),
         );
         app.host_dialog = Some(crate::app::HostDialog {
+            editor: Default::default(),
             fields: [
                 "prod".into(),
                 String::new(),
@@ -4882,6 +4926,150 @@ mod tests {
     }
 
     #[test]
+    fn long_form_values_keep_unicode_and_masked_cursors_visible() {
+        let value = format!("{}中文{}", "start".repeat(20), "tail".repeat(20));
+        for masked in [false, true] {
+            for key in [
+                crossterm::event::KeyCode::Home,
+                crossterm::event::KeyCode::End,
+            ] {
+                let mut editor = crate::form::Editor::default();
+                let mut text = value.clone();
+                editor.edit(0, &mut text, key);
+                let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new(form_input_line(
+                                "Value",
+                                &text,
+                                true,
+                                masked,
+                                editor.position(0, &text),
+                                40,
+                            )),
+                            frame.area(),
+                        );
+                    })
+                    .unwrap();
+                let output = format!("{}", terminal.backend());
+                assert!(output.contains('_'), "{output}");
+                assert!(output.contains("> Value: "), "{output}");
+                if masked {
+                    assert!(output.contains('*'), "{output}");
+                    assert!(!output.contains("start"), "{output}");
+                    assert!(!output.contains("中文"), "{output}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_form_footers_keep_save_and_cancel_visible() {
+        for width in [42, 60, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        form_panel(
+                            " NEW ",
+                            "Tab / ↑↓ field  Space toggle  Enter save  Esc cancel",
+                            frame.area(),
+                        ),
+                        frame.area(),
+                    );
+                })
+                .unwrap();
+            let output = format!("{}", terminal.backend());
+            assert!(output.contains("Enter save"), "{output}");
+            assert!(output.contains("Esc cancel"), "{output}");
+        }
+    }
+
+    #[test]
+    fn tunnel_snippet_and_package_forms_keep_actions_on_the_bottom_border() {
+        let app = App::with_catalog(HostCatalog::default(), Ok(Default::default()));
+        for (width, height) in [(100, 30), (80, 24), (60, 20)] {
+            for editing in [false, true] {
+                for form in 0..3 {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| match form {
+                            0 => render_tunnel_dialog(
+                                frame,
+                                &crate::app::TunnelDialog {
+                                    editor: Default::default(),
+                                    fields: [
+                                        "Database".into(),
+                                        "web".into(),
+                                        "127.0.0.1".into(),
+                                        "3306".into(),
+                                        "localhost".into(),
+                                        "3306".into(),
+                                        "10".into(),
+                                        "30".into(),
+                                    ],
+                                    kind: crate::metadata::TunnelKind::Local,
+                                    editing_id: editing.then(uuid::Uuid::new_v4),
+                                    selected_field: 1,
+                                    deleting: false,
+                                },
+                            ),
+                            1 => render_snippet_dialog(
+                                frame,
+                                &crate::app::SnippetDialog {
+                                    editor: Default::default(),
+                                    fields: [
+                                        "Health".into(),
+                                        "uptime".into(),
+                                        "Check".into(),
+                                        "true".into(),
+                                    ],
+                                    package_id: uuid::Uuid::nil(),
+                                    editing_id: editing.then(uuid::Uuid::new_v4),
+                                    selected_field: 3,
+                                },
+                                &app,
+                            ),
+                            _ => render_package_dialog(
+                                frame,
+                                &crate::app::PackageDialog {
+                                    editor: Default::default(),
+                                    fields: ["Operations".into(), "Checks".into()],
+                                    editing_id: editing.then(uuid::Uuid::new_v4),
+                                    selected_field: 0,
+                                },
+                            ),
+                        })
+                        .unwrap();
+                    let area = centered_rect(
+                        if form == 2 { 72 } else { 82 },
+                        [22, 16, 11][form],
+                        Rect::new(0, 0, width, height),
+                    );
+                    let buffer = terminal.backend().buffer();
+                    let bottom = (area.x..area.right())
+                        .map(|x| buffer[(x, area.bottom() - 1)].symbol())
+                        .collect::<String>();
+                    assert!(bottom.contains("Enter save"), "{bottom}");
+                    assert!(bottom.contains("Esc cancel"), "{bottom}");
+                    let text = format!("{}", terminal.backend());
+                    assert_eq!(text.matches("Enter save").count(), 1, "{text}");
+                    if form == 0 {
+                        assert!(bottom.contains("Space select"), "{bottom}");
+                        assert!(text.contains("> SSH host / IP: web_"), "{text}");
+                        assert!(text.contains("KeepAlive interval (s): 30"), "{text}");
+                    } else if form == 1 {
+                        assert!(bottom.contains("Space toggle"), "{bottom}");
+                        assert!(text.contains("Dangerous command"), "{text}");
+                        assert!(text.contains("Package: Unknown"), "{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn host_forms_render_group_field_and_consistent_bottom_actions() {
         let mut metadata = crate::metadata::Metadata::default();
         metadata.tags.insert(
@@ -4890,6 +5078,7 @@ mod tests {
         );
         let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
         app.host_dialog = Some(crate::app::HostDialog {
+            editor: Default::default(),
             fields: [
                 "prod".into(),
                 "example.com".into(),
@@ -5031,7 +5220,7 @@ mod tests {
             assert!(text.contains("Password: **************"), "{text}");
             assert!(text.contains("SSH user: root (from Host/config)"));
             assert!(text.contains("Save password in system Keychain"));
-            assert!(text.contains("Space toggle"));
+            assert!(text.contains("Enter connect"));
             assert!(!text.contains("fixture-secret"));
         }
     }
@@ -5058,6 +5247,7 @@ mod tests {
             Ok(crate::metadata::Metadata::default()),
         );
         app.credential_export_dialog = Some(crate::app::CredentialExportDialog {
+            editor: Default::default(),
             fields: ["secret".into(), "confirmed".into()],
             selected_field: 0,
             error: None,
@@ -5076,6 +5266,7 @@ mod tests {
             Ok(crate::metadata::Metadata::default()),
         );
         app.credential_import_dialog = Some(crate::app::CredentialImportDialog {
+            editor: Default::default(),
             password: "archive-secret".into(),
             error: None,
         });
@@ -5384,6 +5575,7 @@ mod tests {
         app.sync_settings.remote = "git@example.test:team/config.git".into();
         app.sync_settings.branch = "main".into();
         app.sync_dialog = Some(crate::app::SyncSettingsDialog {
+            editor: Default::default(),
             remote: app.sync_settings.remote.clone(),
             branch: app.sync_settings.branch.clone(),
             selected: 4,

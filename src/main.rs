@@ -5,6 +5,7 @@ mod credential_app;
 mod credential_ui;
 mod credentials;
 mod diagnostics;
+mod form;
 mod hosts;
 mod i18n;
 mod import_export;

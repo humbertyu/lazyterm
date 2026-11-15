@@ -326,7 +326,8 @@ fn render_overlays(frame: &mut Frame, app: &App) {
             FormKind::Import => " IMPORT SSH KEY ",
             FormKind::RenameKey => " RENAME SSH KEY ",
         };
-        let block = panel(title);
+        let block =
+            crate::ui::form_panel(title, "Tab / ↑↓ field  Enter save  Esc cancel", form_area);
         let inner = block.inner(form_area);
         frame.render_widget(block, form_area);
         let note = match form.kind {
@@ -365,7 +366,6 @@ fn render_overlays(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(2),
-            Constraint::Length(1),
         ])
         .split(inner);
         frame.render_widget(
@@ -378,34 +378,27 @@ fn render_overlays(frame: &mut Frame, app: &App) {
                 })),
             rows[0],
         );
+        let field_height = if usize::from(rows[1].height) >= form.fields.len() * 2 {
+            2
+        } else {
+            1
+        };
         let field_rows =
-            Layout::vertical(vec![Constraint::Length(3); form.fields.len()]).split(rows[1]);
+            Layout::vertical(vec![Constraint::Length(field_height); form.fields.len()])
+                .split(rows[1]);
         for (index, label) in form.labels().iter().enumerate() {
             let focused = index == form.selected;
-            let value = if form.kind == FormKind::Password && index == 2 {
-                "*".repeat(form.fields[index].chars().count())
-            } else {
-                form.fields[index].clone()
-            };
-            let width = field_rows[index].width.saturating_sub(3) as usize;
-            let chars = value.chars().collect::<Vec<_>>();
-            let visible = chars
-                .iter()
-                .skip(chars.len().saturating_sub(width))
-                .collect::<String>();
+            let value = &form.fields[index];
             frame.render_widget(
-                Paragraph::new(crate::ui::input_value(&visible, focused, false))
-                    .block(
-                        Block::default()
-                            .title(*label)
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(if focused {
-                                ACCENT.into()
-                            } else {
-                                MUTED.into()
-                            })),
-                    )
-                    .style(Style::default().fg(TEXT.into())),
+                Paragraph::new(crate::ui::form_input_line(
+                    label,
+                    value,
+                    focused,
+                    form.kind == FormKind::Password && index == 2,
+                    form.editor.position(index, value),
+                    field_rows[index].width,
+                ))
+                .style(Style::default().fg(TEXT.into())),
                 field_rows[index],
             );
         }
@@ -418,11 +411,6 @@ fn render_overlays(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::Yellow)),
             rows[2],
-        );
-        frame.render_widget(
-            Paragraph::new("Tab / Up / Down field   Enter save   Esc cancel")
-                .style(Style::default().fg(MUTED.into())),
-            rows[3],
         );
     }
     if let Some(alias) = &state.confirm_upload {
@@ -527,6 +515,7 @@ mod tests {
         let mut app = App::with_catalog(HostCatalog::default(), Ok(Metadata::default()));
         app.open_credentials(None, false);
         app.credential_manager.form = Some(CredentialForm {
+            editor: Default::default(),
             kind: FormKind::Password,
             id: None,
             fields: vec!["Production".into(), "deploy".into(), "not-visible".into()],
