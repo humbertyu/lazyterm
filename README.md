@@ -4,7 +4,8 @@
 [GitHub Releases](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.1).
 [测试指南 / Beta guide](docs/BETA-TESTING.md) includes installation, known
 limits, feedback instructions, and a prompt you can give your Agent to install
-LazyTerm and its Skill. Release downloads become available after publication.
+LazyTerm and its Skill. With Homebrew: `brew tap humbertyu/brew`, then
+`brew install lazyterm` and run `lazyterm`.
 
 Agent CLI: [commands, JSON contract, and Skill setup](docs/CLI.md). Use
 `lazyterm hosts list --json`, `lazyterm projects status --json`, or
@@ -21,7 +22,8 @@ The project is at an early stage. The Hosts view reads aliases from `~/.ssh/conf
 
 See [installation, Homebrew setup, upgrades and the supported environment matrix](docs/INSTALL.md).
 The release preparation workflow combines Intel and Apple Silicon builds into one Universal Binary archive, SHA256SUMS and a Homebrew
-Formula. Published binary assets and a maintained tap are required before `brew install` is available.
+Formula. The [maintained tap](https://github.com/humbertyu/homebrew-brew)
+installs the published beta without a Rust toolchain.
 Run `lazyterm --version`, `lazyterm --help` or `lazyterm --diagnostics` without opening the TUI.
 The [security review](docs/SECURITY-REVIEW.md) documents diagnostic redaction and sensitive data boundaries.
 The [data migration policy](docs/DATA-MIGRATION.md) records schema versions,

@@ -2,8 +2,8 @@
 
 The release candidate is `0.9.0-beta.1`. Download its Universal Binary from
 [GitHub Releases](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.1)
-once published. See [beta testing and Agent/Skill setup](BETA-TESTING.md) for the
-quick start. A Homebrew tap is not required for this beta and is not yet published.
+or install from our [Homebrew tap](https://github.com/humbertyu/homebrew-brew).
+See [beta testing and Agent/Skill setup](BETA-TESTING.md) for the quick start.
 
 ## Supported Environment
 
@@ -51,22 +51,25 @@ The current packages have ad-hoc code signatures for execution integrity, not De
 
 ## Homebrew
 
-The packaging command generates `dist/lazyterm.rb` with one universal download URL and its real SHA-256 value. Publish it as `Formula/lazyterm.rb` in a maintained `homebrew-lazyterm` repository and publish the matching binary asset first. Once that tap exists:
+The maintained tap installs the published Universal Binary, without Rust:
 
 ```sh
-brew tap humbertyu/lazyterm
+brew tap humbertyu/brew
 brew install lazyterm
 brew test lazyterm
 ```
 
-The tap is release infrastructure to provision; the commands are not a claim that it already exists. The generated Formula can also be placed in another organization's tap. It installs a prebuilt binary, so users do not need Rust. Uploading a Formula as a release asset alone does not register a tap or Homebrew/core package. Homebrew/core submission is not part of this beta.
+The shared tap is hosted at `humbertyu/homebrew-brew` and can contain formulas
+for multiple applications. For each release, maintainers
+publish the binary first, then copy the generated `dist/lazyterm.rb` into the
+tap's `Formula/lazyterm.rb`. Homebrew/core submission is not part of this beta.
 
 If Homebrew refuses to load an untrusted third-party formula, review the tap
-and run `brew trust --formula humbertyu/lazyterm/lazyterm`, then retry installation.
+and run `brew trust --formula humbertyu/brew/lazyterm`, then retry installation.
 
 The tap command registers the package repository once. Subsequent installs and
 upgrades use the short formula name: `brew upgrade lazyterm`. If another tap
-provides a formula with the same name, use `humbertyu/lazyterm/lazyterm` to select
+provides a formula with the same name, use `humbertyu/brew/lazyterm` to select
 this one explicitly.
 
 ## Build From Source
@@ -98,7 +101,16 @@ schemas with a backup; CLI reads do not migrate. See [DATA-MIGRATION.md](DATA-MI
 for exact backup locations, retention, write/failure boundaries and recovery.
 The [Stable Core checklist](v0.9-acceptance.md) records outstanding acceptance.
 
-Upgrade a tap installation with `brew update` and `brew upgrade humbertyu/lazyterm/lazyterm`; otherwise verify and replace the standalone binary. Uninstall with `brew uninstall humbertyu/lazyterm/lazyterm` or remove `~/.local/bin/lazyterm`. Neither command should remove your SSH configuration, private keys, LazyTerm metadata, or Keychain entries. Delete saved credentials in the application before removing local data if that is your intent. Removing the binary alone does not stop independent Project services; stop them first.
+Upgrade a tap installation with `brew update` and `brew upgrade humbertyu/brew/lazyterm`; otherwise verify and replace the standalone binary. Uninstall with `brew uninstall humbertyu/brew/lazyterm` or remove `~/.local/bin/lazyterm`. Neither command should remove your SSH configuration, private keys, LazyTerm metadata, or Keychain entries. Delete saved credentials in the application before removing local data if that is your intent. Removing the binary alone does not stop independent Project services; stop them first.
+
+When switching from a manual install to Homebrew, use `type -a lazyterm` to
+identify any old executable that could shadow Homebrew. If installed with the
+manual binary instructions above, remove only that executable with
+`rm "$HOME/.local/bin/lazyterm"`. If installed through Cargo with
+`--root "$HOME/.local"`, use `cargo uninstall --root "$HOME/.local" lazyterm`
+instead. A default Cargo installation uses `cargo uninstall lazyterm`.
+Then install through Homebrew and open a new terminal, or run `rehash` in zsh.
+The existing application data is reused.
 
 ## Diagnose a Problem
 

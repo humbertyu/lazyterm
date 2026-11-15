@@ -5,7 +5,21 @@
 
 ## 下载和安装
 
-发布后从 [GitHub Release](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.1)
+已安装 Homebrew 的用户推荐：
+
+```sh
+brew tap humbertyu/brew
+brew install lazyterm
+lazyterm
+```
+
+如果 Homebrew 提示第三方 Formula 需要信任，先查看
+[tap 的 Formula](https://github.com/humbertyu/homebrew-brew/blob/main/Formula/lazyterm.rb)，
+然后运行 `brew trust --formula humbertyu/brew/lazyterm`，再安装。
+更新使用 `brew update` 和 `brew upgrade lazyterm`，卸载使用
+`brew uninstall lazyterm`；卸载保留用户配置与凭据。
+
+也可以从 [GitHub Release](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.1)
 下载以下文件：
 
 - `lazyterm-v0.9.0-beta.1-universal-apple-darwin.tar.gz`：程序和文档，内含 Skill。
@@ -46,12 +60,17 @@ install -m 755 lazyterm-v0.9.0-beta.1-universal-apple-darwin/lazyterm "$HOME/.lo
    lazyterm-v0.9.0-beta.1-universal-apple-darwin.tar.gz、
    lazyterm-v0.9.0-beta.1-skill.zip 和 SHA256SUMS。
    请直接下载预编译包，不需要安装 Rust 或编译源码。
+   如果本机已有 Homebrew，可优先使用 brew tap humbertyu/brew 和
+   brew install lazyterm 安装程序，确认版本符合要求；仍需单独下载并校验 Skill。
+   使用 Homebrew 时，后续通过 command -v lazyterm 确认程序路径，
+   不要再向 ~/.local/bin 安装第二份程序。
 2. 对照 SHA256SUMS 校验程序包和 Skill ZIP；校验失败则停止。
    解压前检查条目，不允许路径穿越、绝对路径或指向外部的链接。
 3. 如果已有安装，检查版本并报告；升级前确认旧 TUI 已退出，
    提醒我备份 ~/.ssh 与 LazyTerm 数据，不要擅自停止现有项目服务。
    把程序安装到 ~/.local/bin/lazyterm，用绝对路径运行 --version、
    --diagnostics，确认版本是 0.9.0-beta.1。
+   如果前面已用 Homebrew 安装，跳过复制程序，使用已确认的 Homebrew 程序路径。
 4. 通过你所在客户端实际支持的 Skill 加载方式安装 ZIP 内的 lazyterm 目录。
    若支持 Skill ZIP 导入就使用该入口；若有已确认的 Skill 目录就放入该目录。
    不要猜目录。已有同名 Skill 时先比较并保留备份。
@@ -59,6 +78,7 @@ install -m 755 lazyterm-v0.9.0-beta.1-universal-apple-darwin/lazyterm "$HOME/.lo
 5. 确认你能读取 lazyterm/SKILL.md；必要时让我刷新 Skill 或新开会话。
    使用 ~/.local/bin/lazyterm schema --json 验证 CLI。
    若 PATH 不可用，本次会话始终使用这个绝对路径。
+   Homebrew 安装则使用前面确认的程序路径执行相同验证。
 6. 最后汇报程序版本、安装路径、Skill 是否已被客户端加载，
    不要把“文件下载完成”当成“Skill 已启用”。
 
