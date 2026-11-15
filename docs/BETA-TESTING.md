@@ -8,14 +8,13 @@
 已安装 Homebrew 的用户推荐：
 
 ```sh
-brew tap humbertyu/brew
-brew install lazyterm
+brew install humbertyu/brew/lazyterm
 lazyterm
 ```
 
-如果 Homebrew 提示第三方 Formula 需要信任，先查看
-[tap 的 Formula](https://github.com/humbertyu/homebrew-brew/blob/main/Formula/lazyterm.rb)，
-然后运行 `brew trust --formula humbertyu/brew/lazyterm`，再安装。
+完整安装流程以及如何理解 Homebrew trust 提示，见
+[Agent 安装说明](AGENT-INSTALL.md)。完整公式名只选择 LazyTerm 这个公式，
+不需要信任整个 tap。
 更新使用 `brew update` 和 `brew upgrade lazyterm`，卸载使用
 `brew uninstall lazyterm`；卸载保留用户配置与凭据。
 
@@ -48,44 +47,10 @@ install -m 755 lazyterm-v0.9.0-beta.2-universal-apple-darwin/lazyterm "$HOME/.lo
 
 ## 让 Agent 帮你安装
 
-可以把下面整段交给 WorkBuddy 或其他支持 Skill 的 Agent。Agent 需具备联网下载、
-执行本机命令及写入安装目录的权限；沙箱权限不足时仍需在客户端授权。
-仅安装 CLI 不会让客户端自动加载 Skill。
-
-```text
-请在这台 Mac 上安装 LazyTerm 0.9.0-beta.2 和对应的 lazyterm Skill。
-发布地址：https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.2
-
-1. 检查 macOS 版本，要求 15+。从这个确切版本的 Release 下载
-   lazyterm-v0.9.0-beta.2-universal-apple-darwin.tar.gz、
-   lazyterm-v0.9.0-beta.2-skill.zip 和 SHA256SUMS。
-   请直接下载预编译包，不需要安装 Rust 或编译源码。
-   如果本机已有 Homebrew，可优先使用 brew tap humbertyu/brew 和
-   brew install lazyterm 安装程序，确认版本符合要求；仍需单独下载并校验 Skill。
-   使用 Homebrew 时，后续通过 command -v lazyterm 确认程序路径，
-   不要再向 ~/.local/bin 安装第二份程序。
-2. 对照 SHA256SUMS 校验程序包和 Skill ZIP；校验失败则停止。
-   解压前检查条目，不允许路径穿越、绝对路径或指向外部的链接。
-3. 如果已有安装，检查版本并报告；升级前确认旧 TUI 已退出，
-   提醒我备份 ~/.ssh 与 LazyTerm 数据，不要擅自停止现有项目服务。
-   把程序安装到 ~/.local/bin/lazyterm，用绝对路径运行 --version、
-   --diagnostics，确认版本是 0.9.0-beta.2。
-   如果前面已用 Homebrew 安装，跳过复制程序，使用已确认的 Homebrew 程序路径。
-4. 通过你所在客户端实际支持的 Skill 加载方式安装 ZIP 内的 lazyterm 目录。
-   若支持 Skill ZIP 导入就使用该入口；若有已确认的 Skill 目录就放入该目录。
-   不要猜目录。已有同名 Skill 时先比较并保留备份。
-   无法操作客户端时，告诉我具体需要在哪个入口导入该 ZIP。
-5. 确认你能读取 lazyterm/SKILL.md；必要时让我刷新 Skill 或新开会话。
-   使用 ~/.local/bin/lazyterm schema --json 验证 CLI。
-   若 PATH 不可用，本次会话始终使用这个绝对路径。
-   Homebrew 安装则使用前面确认的程序路径执行相同验证。
-6. 最后汇报程序版本、安装路径、Skill 是否已被客户端加载，
-   不要把“文件下载完成”当成“Skill 已启用”。
-
-本次只授权安装和只读验证；不要改写我的 Host/Project 配置，
-不要读取密码或私钥，不要启动、停止服务或建立远程连接。
-不要绕过操作系统或 Agent 客户端的权限限制。
-```
+将 [Agent 安装说明](AGENT-INSTALL.md) 分享给 WorkBuddy 或其他 Agent。
+其中包含可直接交给 Agent 的安装提示、Homebrew trust 说明，以及 Skill
+安装和校验步骤。Agent 需具备联网、执行命令和安装 Skill 的客户端权限；
+仅安装 CLI 不会自动启用 Skill。
 
 不支持 Skill 的客户端仍可以使用 CLI：先执行
 `~/.local/bin/lazyterm schema --json` 查看当前能力和输入格式。

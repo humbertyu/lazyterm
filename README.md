@@ -2,10 +2,11 @@
 
 **0.9 beta testing:** download the macOS Universal Binary from
 [GitHub Releases](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.2).
-[测试指南 / Beta guide](docs/BETA-TESTING.md) includes installation, known
-limits, feedback instructions, and a prompt you can give your Agent to install
-LazyTerm and its Skill. With Homebrew: `brew tap humbertyu/brew`, then
-`brew install lazyterm` and run `lazyterm`.
+[Install LazyTerm and its Skill with an Agent](docs/AGENT-INSTALL.md) is a
+shareable setup guide. With Homebrew, run
+`brew install humbertyu/brew/lazyterm`, then `lazyterm`.
+[Beta testing guide](docs/BETA-TESTING.md) covers supported workflows, limits,
+and feedback.
 
 Agent CLI: [commands, JSON contract, and Skill setup](docs/CLI.md). Use
 `lazyterm hosts list --json`, `lazyterm projects status --json`, or

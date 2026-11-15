@@ -54,8 +54,7 @@ The current packages have ad-hoc code signatures for execution integrity, not De
 The maintained tap installs the published Universal Binary, without Rust:
 
 ```sh
-brew tap humbertyu/brew
-brew install lazyterm
+brew install humbertyu/brew/lazyterm
 brew test lazyterm
 ```
 
@@ -64,13 +63,14 @@ for multiple applications. For each release, maintainers
 publish the binary first, then copy the generated `dist/lazyterm.rb` into the
 tap's `Formula/lazyterm.rb`. Homebrew/core submission is not part of this beta.
 
-If Homebrew refuses to load an untrusted third-party formula, review the tap
-and run `brew trust --formula humbertyu/brew/lazyterm`, then retry installation.
+The fully qualified formula name selects only LazyTerm and avoids a separate
+tap command. If the installed Homebrew version explicitly requires a trust
+command, review the [published formula](https://github.com/humbertyu/homebrew-brew/blob/main/Formula/lazyterm.rb)
+and trust only `humbertyu/brew/lazyterm`; do not trust the whole tap or disable
+trust checks. See the [Agent installation guide](AGENT-INSTALL.md) for details.
 
-The tap command registers the package repository once. Subsequent installs and
-upgrades use the short formula name: `brew upgrade lazyterm`. If another tap
-provides a formula with the same name, use `humbertyu/brew/lazyterm` to select
-this one explicitly.
+Upgrade with `brew upgrade lazyterm`. If another tap provides a formula with
+the same name, use `humbertyu/brew/lazyterm` to select this one explicitly.
 
 ## Build From Source
 
