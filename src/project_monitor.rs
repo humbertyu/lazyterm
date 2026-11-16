@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Command,
     sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
 };
@@ -204,7 +204,10 @@ pub(crate) fn inspect(
         }) {
             directories.insert(
                 process.pid,
-                runtime::process_working_directory(&RuntimeTarget::Local, process.pid)
+                runtime::local_working_directory(process.pid)
+                    .map_err(|error| {
+                        format!("Could not inspect project working directory: {error}")
+                    })?
                     .and_then(|path| PathBuf::from(path).canonicalize().ok()),
             );
         }
@@ -373,12 +376,12 @@ fn descendants(root: u32, processes: &HashMap<u32, ProcessIdentity>) -> Vec<Proc
 }
 
 fn process_snapshot() -> Result<HashMap<u32, ProcessIdentity>, String> {
-    let output = Command::new("ps")
-        .env("LC_ALL", "C")
-        .args(["-ww", "-axo", "pid=,ppid=,pgid=,uid=,lstart=,command="])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("Could not inspect project processes: {error}"))?;
+    let output = crate::local_inspection::output(Command::new("ps").env("LC_ALL", "C").args([
+        "-ww",
+        "-axo",
+        "pid=,ppid=,pgid=,uid=,lstart=,command=",
+    ]))
+    .map_err(|error| format!("Could not inspect project processes: {error}"))?;
     if !output.status.success() {
         return Err("Could not inspect project processes with ps.".into());
     }
@@ -436,7 +439,8 @@ pub(crate) fn stop_external(runs: &[ExternalRun]) -> Result<(), String> {
         let Some(root) = snapshot.get(&run.root.pid) else {
             return Err("External command ended; refresh before acting.".into());
         };
-        let cwd = runtime::process_working_directory(&RuntimeTarget::Local, root.pid)
+        let cwd = runtime::local_working_directory(root.pid)
+            .map_err(|error| format!("Could not revalidate project working directory: {error}"))?
             .and_then(|path| PathBuf::from(path).canonicalize().ok());
         if !root.same_process(&run.root) || cwd.as_ref() != Some(&run.directory) {
             return Err("External process identity changed; refresh before acting.".into());
@@ -491,7 +495,10 @@ pub(crate) fn stop_external(runs: &[ExternalRun]) -> Result<(), String> {
 pub(crate) mod tests {
     use super::*;
     use crate::projects::{ProjectCommand, tests::Fixture};
-    use std::{net::TcpStream, process::Child};
+    use std::{
+        net::TcpStream,
+        process::{Child, Stdio},
+    };
 
     pub struct ExternalFixture {
         pub fixture: Fixture,
@@ -704,6 +711,43 @@ pub(crate) mod tests {
         stop_external(std::slice::from_ref(run)).unwrap();
         fixture.child.wait().unwrap();
         assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    #[test]
+    fn failed_inspection_completes_preflight_with_an_error_and_allows_retry() {
+        let fixture = Fixture::new("inspection-timeout");
+        let definitions = vec![fixture.project.clone()];
+        let mut monitor = ProjectMonitor {
+            checking: true,
+            ..Default::default()
+        };
+        monitor
+            .sender
+            .send(Inspection {
+                generation: 1,
+                definitions: definitions.clone(),
+                owners: Vec::new(),
+                result: Err("Local process inspection timed out".into()),
+            })
+            .unwrap();
+        assert!(monitor.poll(&definitions, &[]));
+        assert!(!monitor.checking);
+        assert_eq!(monitor.completed, 1);
+        assert!(monitor.error.as_deref().unwrap().contains("timed out"));
+        monitor.checking = true;
+        monitor
+            .sender
+            .send(Inspection {
+                generation: 2,
+                definitions: definitions.clone(),
+                owners: Vec::new(),
+                result: Ok(BTreeMap::new()),
+            })
+            .unwrap();
+        assert!(monitor.poll(&definitions, &[]));
+        assert!(!monitor.checking);
+        assert_eq!(monitor.completed, 2);
+        assert!(monitor.error.is_none());
     }
 
     #[test]

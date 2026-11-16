@@ -410,7 +410,25 @@ Suggested policy:
 
 Do not automatically retry authentication failures, host-key changes, malformed configuration, or local port conflicts. User-initiated stop always cancels reconnect.
 
-## 6. Credentials and macOS
+## 6. Platform Support
+
+The current accepted runtime and release pipeline target macOS. Linux builds
+are experimental and Windows is unsupported until platform-specific process,
+IPC, credential, SSH/SFTP, filesystem, and Runtime behavior passes native
+acceptance. A dependency having a platform credential backend is not sufficient
+to declare the application supported.
+
+Cross-platform code should keep product behavior in shared modules and isolate
+OS-specific operations behind narrow adapters: process ownership and signaling,
+private IPC, secure file creation, credential storage, listener/process
+inspection, clipboard, and shell/browser launch. Implementations must preserve
+the existing security boundaries, especially authenticated process control,
+secret redaction, stale-write protection, and cleanup that cannot signal an
+unrelated reused PID. CI must run on each native OS; cross-compilation is an
+additional compile check, not a substitute for process, credential, or SSH/SFTP
+acceptance.
+
+## 7. Credentials and macOS
 
 The credential boundary should be explicit:
 

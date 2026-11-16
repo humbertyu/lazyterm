@@ -16,8 +16,8 @@ See [beta testing and Agent/Skill setup](BETA-TESTING.md) for the quick start.
 | Credentials | macOS Keychain, available and unlocked when saving/reading passwords |
 | Runtime | System `ps`, `lsof`, and `kill` |
 | Source builds | Rust 1.92+, Cargo, Xcode Command Line Tools; Python 3.9+ only for packaging |
-| Linux | Experimental source builds; no release package or full acceptance guarantee |
-| Windows | Not supported by this Unix process/socket implementation; a credential adapter alone does not imply application support |
+| Linux | Experimental source builds; no release package or full acceptance guarantee. Formal support is planned for v1.0 after native acceptance. |
+| Windows | Not supported by the current Unix process/socket implementation. Windows support is planned for v1.0 and requires native implementation and acceptance. |
 
 Agent CLI remote Runtime queries require noninteractive SSH authentication and
 existing Host-key trust, including any ProxyJump hops. Host-targeted CLI Project
@@ -27,7 +27,7 @@ Remote detached services and rediscovery are not supported. See [CLI.md](CLI.md)
 OpenSSH 9.9p2 is the tested baseline, not a verified minimum version; older
 OpenSSH versions have not passed the release acceptance matrix.
 
-Local release checks run on macOS 15.8.1 Apple Silicon, including execution of the Intel package under Rosetta. The release workflow additionally builds and tests natively on macOS 15 Intel and Apple Silicon runners; those hosted runs must succeed before publishing. CJK glyph size depends on the terminal font and fallback; use a monospace font covering the selected language. Full localization, first-use host-key dialogs in background operations, and encrypted-key passphrase storage are not release guarantees. Trust a new host through system OpenSSH before using background workflows.
+The current release workflow builds and tests natively on macOS 15 Intel and Apple Silicon runners; Linux and Windows are not currently release targets. v1.0 platform baselines and packages will be declared only after native CI and manual acceptance are complete. CJK glyph size depends on the terminal font and fallback; use a monospace font covering the selected language. Full localization, first-use host-key dialogs in background operations, and encrypted-key passphrase storage are not release guarantees. Trust a new host through system OpenSSH before using background workflows.
 
 ## Download a Binary
 

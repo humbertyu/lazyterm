@@ -4,7 +4,7 @@ LazyTerm is early-stage software. This roadmap describes intended release bounda
 
 ## Current
 
-The integrated v0.1-v0.6 workflows are the implementation baseline: native SSH, embedded SFTP, tunnels, snippets, Runtime, Projects, credential import/export, crash recovery, and the macOS Universal Binary release pipeline. v0.1 and v0.2 are historical implementation milestones, not pending feature lists. v0.8 Agent interoperability is implemented and covered by CLI/PTY/disposable SSH fixtures; manual Agent/platform acceptance remains open. Development now moves to v0.9 Stable Core on `v0.9-stable-core`. Initial v0.7 Git sync remains experimental and its remaining work stays paused. No public release is implied.
+The integrated v0.1-v0.6 workflows are the implementation baseline: native SSH, embedded SFTP, tunnels, snippets, Runtime, Projects, credential import/export, crash recovery, and the macOS Universal Binary release pipeline. v0.1 and v0.2 are historical implementation milestones, not pending feature lists. v0.8 Agent interoperability is implemented and covered by CLI/PTY/disposable SSH fixtures; manual Agent/platform acceptance remains open. Development now moves to v1.0 Cross-Platform on `v1.0-cross-platform`. Initial v0.7 Git sync remains experimental and its remaining work stays paused. No public release is implied.
 
 ## Delivery Strategy
 
@@ -305,6 +305,38 @@ Started 2026-11-14 after v0.8 commit `87d377c`. Keep the package version unchang
 until a release candidate is deliberately selected. v0.7 synchronization is not
 resumed by this milestone. Acceptance evidence and explicit exclusions live in
 `docs/v0.9-acceptance.md`.
+
+## v1.0.0 - Cross-Platform
+
+Goal: make LazyTerm's integrated Host, SSH, Files/SFTP, Tunnel, Runtime,
+Projects, Credentials, and Agent CLI workflows supportable on macOS, Linux, and
+Windows, with native builds, tests, and release artifacts for each declared
+platform.
+
+Platform work is staged: first establish a native Linux build/test baseline and
+fix Linux runtime behavior; then implement the Windows platform backends and
+validate them on native Windows runners. Cross-compilation alone is not
+acceptance. macOS remains supported throughout. Linux and Windows support must
+not be advertised until their platform acceptance gates pass.
+
+- [ ] Define and publish exact OS, CPU, terminal, OpenSSH, shell, and credential-service baselines for every supported platform.
+- [ ] Add native Linux CI for formatting, build, unit/CLI tests, disposable SSH/SFTP fixtures, and security/dependency checks; fix Linux-specific failures.
+- [ ] Add Linux process/runtime adapters for listener discovery, command metadata, lifecycle supervision, and confirmed process termination.
+- [ ] Validate Linux Secret Service behavior in a desktop session and report unavailable/locked credential services without plaintext fallback.
+- [ ] Add reproducible Linux release artifacts for the declared CPU targets, with install/upgrade/uninstall instructions and SHA256 checksums.
+- [ ] Isolate Unix-only process groups, file permissions, sockets, signals, and shell assumptions behind platform interfaces without weakening existing macOS safety guarantees.
+- [ ] Implement Windows-native process ownership and cleanup (including forced application exit), single-instance locking, and private local IPC; use Windows Job Objects and named pipes or a reviewed equivalent.
+- [ ] Provide Windows SSH authentication prompts and a supported embedded SFTP connection path while keeping secrets out of arguments, environment variables, and logs.
+- [ ] Implement Windows Runtime listener/process/path inspection and safe process termination using native APIs.
+- [ ] Define Project command shell semantics on Windows; preserve explicit Task/Service lifecycle behavior and prevent unrelated process termination.
+- [ ] Add native Windows CI for build, unit/CLI tests, SSH/SFTP fixtures, credential backend behavior where a test credential service is available, and recovery/process-isolation tests.
+- [ ] Produce signed or clearly documented Windows packages and Linux archives/packages, with checksums, upgrade/uninstall guidance, and no user configuration bundled.
+- [ ] Run and record manual acceptance on clean Linux and Windows accounts for install, upgrade, SSH, ProxyJump, credentials, SFTP, tunnels, Runtime, Projects, import/export, and forced-exit recovery.
+
+Release gate: all advertised platforms build and pass native automated and
+manual acceptance. A platform with deferred or incomplete integrated workflows
+must remain explicitly unsupported rather than being implied by a successful
+compile.
 
 ## Later, only if justified
 

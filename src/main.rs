@@ -10,6 +10,7 @@ mod hosts;
 mod i18n;
 mod import_export;
 mod instance;
+mod local_inspection;
 mod metadata;
 mod native_connection;
 mod process_guard;

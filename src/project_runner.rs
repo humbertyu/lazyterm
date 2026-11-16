@@ -626,8 +626,17 @@ fn run_inner(spec: &Path) -> io::Result<()> {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error),
             };
-            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-            stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+            // A client may die between connect and accept. Its socket errors
+            // must not end the runner and tear down the managed service.
+            if stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .is_err()
+                || stream
+                    .set_write_timeout(Some(Duration::from_millis(500)))
+                    .is_err()
+            {
+                continue;
+            }
             let mut line = String::new();
             if BufReader::new((&mut stream).take(4096))
                 .read_line(&mut line)
@@ -658,6 +667,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disconnected_control_clients_do_not_terminate_the_persistent_service() {
+        use crate::projects::tests::{Fixture, PersistentCleanup, until};
+        use std::net::{Shutdown, TcpStream};
+
+        let fixture = Fixture::new("disconnected-runner-clients");
+        let mut command = fixture.listener_command(false);
+        command.lifecycle = ProjectLifecycle::Persistent;
+        let key = (fixture.project.id, command.id);
+        let _cleanup = PersistentCleanup::new(&fixture, key);
+        let mut service = fixture.service();
+        service.start(&fixture.project, &command).unwrap();
+        until(&mut service, |_| fixture.ready().is_some());
+        let (_, port) = fixture.ready().unwrap();
+        let root = fixture.root.join("logs");
+        let saved = read_json::<Snapshot>(&record_path(&root, key)).unwrap();
+        for _ in 0..32 {
+            let stream = UnixStream::connect(&saved.socket).unwrap();
+            stream.shutdown(Shutdown::Both).unwrap();
+        }
+        // A valid authenticated request must still be served after the dead clients.
+        let status = Handle::request(&saved, "status", None).unwrap();
+        assert!(status.active());
+        assert_eq!(status.owner, saved.owner);
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+        service.stop(key).unwrap();
+        until(&mut service, |service| !service.active(key));
+    }
+
+    #[test]
     fn sigkill_tui_preserves_persistent_runner_then_sigkill_runner_cleans_children_and_recovers() {
         use crate::{
             process_guard::tests::{start_owner, wait_until},
@@ -679,7 +717,14 @@ mod tests {
         let root = fixture.root.join("logs");
         let mut service = fixture.service();
         service.restore(std::slice::from_ref(&fixture.project));
-        assert!(service.active(key));
+        assert!(
+            service.active(key),
+            "Persistent run was not restored: record={:?}, recovery={:?}",
+            read_json::<serde_json::Value>(&record_path(&root, key)),
+            recover(&root, key).as_ref().map(|handle| handle
+                .as_ref()
+                .map(|handle| (&handle.snapshot.status, handle.active()))),
+        );
         assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
         assert!(
             service.start(&fixture.project, &command).is_err(),

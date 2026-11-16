@@ -310,11 +310,21 @@ pub(crate) fn inspect_listeners_with_config(
     config_file: Option<&std::path::Path>,
 ) -> Result<Vec<RuntimeEntry>, String> {
     let output = match target {
-        RuntimeTarget::Local => Command::new("sh")
-            .args(["-c", INSPECT_SCRIPT])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("Could not start local port inspection: {error}"))?,
+        RuntimeTarget::Local => crate::local_inspection::output(Command::new("lsof").args([
+            "-nP",
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-F",
+            "pcun",
+        ]))
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::local_inspection::output(Command::new("ss").arg("-ltnpH"))
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| format!("Could not start local port inspection: {error}"))?,
         RuntimeTarget::Host(alias) => {
             let mut command = inspection_ssh(config_file, alias)
                 .map_err(|error| format!("Could not prepare SSH inspection: {error}"))?;
@@ -399,9 +409,11 @@ fn process_observations(
     config: Option<&std::path::Path>,
 ) -> HashMap<u32, ProcessObservation> {
     let output = match target {
-        RuntimeTarget::Local => Command::new("ps")
-            .args(["-ww", "-axo", "pid=,ppid=,pgid=,tty=,command="])
-            .output(),
+        RuntimeTarget::Local => crate::local_inspection::output(Command::new("ps").args([
+            "-ww",
+            "-axo",
+            "pid=,ppid=,pgid=,tty=,command=",
+        ])),
         RuntimeTarget::Host(alias) => inspection_ssh(config, alias).and_then(|mut command| {
             command
                 .arg(alias)
@@ -553,18 +565,16 @@ fn process_details(
     config: Option<&std::path::Path>,
 ) -> Option<(String, String, Option<String>)> {
     let command_output = match target {
-        RuntimeTarget::Local => Command::new("ps")
-            .args([
-                "-ww",
-                "-p",
-                &pid.to_string(),
-                "-o",
-                "uid=",
-                "-o",
-                "command=",
-            ])
-            .output()
-            .ok()?,
+        RuntimeTarget::Local => crate::local_inspection::output(Command::new("ps").args([
+            "-ww",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "uid=",
+            "-o",
+            "command=",
+        ]))
+        .ok()?,
         RuntimeTarget::Host(alias) => inspection_ssh(config, alias)
             .ok()?
             .arg(alias)
@@ -600,8 +610,37 @@ fn process_details(
     ))
 }
 
-pub(crate) fn process_working_directory(target: &RuntimeTarget, pid: u32) -> Option<String> {
-    process_working_directory_with_config(target, pid, None)
+pub(crate) fn local_working_directory(pid: u32) -> std::io::Result<Option<String>> {
+    let output = match crate::local_inspection::output(Command::new("lsof").args([
+        "-nP",
+        "-a",
+        "-p",
+        &pid.to_string(),
+        "-d",
+        "cwd",
+        "-Fn",
+    ])) {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                Ok(path) => Ok(Some(path.to_string_lossy().into_owned())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(output
+        .status
+        .success()
+        .then(|| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix('n'))
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+        })
+        .flatten())
 }
 
 fn process_working_directory_with_config(
@@ -610,15 +649,7 @@ fn process_working_directory_with_config(
     config: Option<&std::path::Path>,
 ) -> Option<String> {
     let output = match target {
-        RuntimeTarget::Local => Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "if command -v lsof >/dev/null 2>&1; then lsof -a -p {pid} -d cwd -Fn; elif [ -e /proc/{pid}/cwd ]; then readlink /proc/{pid}/cwd; fi"
-                ),
-            ])
-            .output()
-            .ok()?,
+        RuntimeTarget::Local => return local_working_directory(pid).ok().flatten(),
         RuntimeTarget::Host(alias) => inspection_ssh(config, alias).ok()?
             .arg(alias)
             .arg(format!(
