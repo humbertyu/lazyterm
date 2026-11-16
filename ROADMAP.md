@@ -324,8 +324,11 @@ SSH/SFTP tests pass. An isolated GNOME Secret Service fixture covers save,
 update, cross-process read, deletion, missing D-Bus and locked storage.
 Linux-specific credential errors now explain session/keyring requirements
 without changing macOS Keychain behavior. Linux CI build dependencies are
-corrected after its first missing-Wayland-library failure; the updated Ubuntu
-x86_64 CI and GNOME/KDE graphical-session acceptance remain pending.
+corrected after its first missing-Wayland-library failure; Ubuntu 24.04 x86_64
+and macOS CI passed at `03b53b4`. GNOME Keyring and KWallet graphical
+unlock/cancel/retry/delete probes passed in isolated Xvfb sessions. Full
+GNOME Shell/Plasma TUI and login-session manual acceptance remains pending;
+see [the validation record](docs/v1.0-acceptance.md).
 
 - [ ] Define and publish exact OS, CPU, terminal, OpenSSH, shell, and credential-service baselines for every supported platform.
 - [ ] Add native Linux CI for formatting, build, unit/CLI tests, disposable SSH/SFTP fixtures, and security/dependency checks; fix Linux-specific failures.

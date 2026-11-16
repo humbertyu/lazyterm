@@ -119,7 +119,10 @@ operations retain their documented noninteractive authentication restrictions.
 On a headless machine, use SSH keys or temporary interactive passwords unless
 you deliberately configure a session bus and credential service. LazyTerm does
 not create an unprotected keyring or start a credential daemon for the user.
-GNOME/KDE graphical unlock prompts still require desktop acceptance; see the
+GNOME Keyring and KWallet graphical unlock/cancel/retry have passed isolated
+X11 probes. A new KDE account must initialize a password-protected default
+wallet using Wallet Manager before saving. Full GNOME/Plasma login-session
+and Wayland acceptance remains pending; see the
 [v1.0 validation record](v1.0-acceptance.md).
 
 Developers can test the backend without touching their real credential

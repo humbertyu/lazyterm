@@ -700,6 +700,34 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated Linux desktop credential prompt fixture only"]
+    fn linux_secret_service_desktop_probe() {
+        require_linux_fixture("desktop");
+        let reference = format!("{CREDENTIAL_PREFIX}{}", "d".repeat(64));
+        let store = SystemStore;
+        match std::env::var("LAZYTERM_DESKTOP_PROBE").as_deref() {
+            Ok("seed") => store
+                .set(&reference, "disposable-desktop-password")
+                .unwrap(),
+            Ok("read") => assert_eq!(
+                &**store.get(&reference).unwrap(),
+                "disposable-desktop-password"
+            ),
+            Ok("cancel") => {
+                let message = store.get(&reference).expect_err("Unlock was cancelled");
+                assert!(message.contains("Linux Secret Service"), "{message}");
+                assert!(!message.contains("disposable-desktop-password"));
+            }
+            Ok("delete") => {
+                store.delete(&reference).unwrap();
+                assert!(store.get_optional(&reference).unwrap().is_none());
+            }
+            _ => panic!("Set LAZYTERM_DESKTOP_PROBE to seed/read/cancel/delete."),
+        }
+    }
+
     #[test]
     fn replacements_are_isolated_and_references_contain_no_password() {
         let store = Store::default();
