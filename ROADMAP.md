@@ -319,6 +319,14 @@ validate them on native Windows runners. Cross-compilation alone is not
 acceptance. macOS remains supported throughout. Linux and Windows support must
 not be advertised until their platform acceptance gates pass.
 
+Linux progress (2026-11-16): native Debian 12 ARM64 unit/App, CLI and real
+SSH/SFTP tests pass. An isolated GNOME Secret Service fixture covers save,
+update, cross-process read, deletion, missing D-Bus and locked storage.
+Linux-specific credential errors now explain session/keyring requirements
+without changing macOS Keychain behavior. Linux CI build dependencies are
+corrected after its first missing-Wayland-library failure; the updated Ubuntu
+x86_64 CI and GNOME/KDE graphical-session acceptance remain pending.
+
 - [ ] Define and publish exact OS, CPU, terminal, OpenSSH, shell, and credential-service baselines for every supported platform.
 - [ ] Add native Linux CI for formatting, build, unit/CLI tests, disposable SSH/SFTP fixtures, and security/dependency checks; fix Linux-specific failures.
 - [ ] Add Linux process/runtime adapters for listener discovery, command metadata, lifecycle supervision, and confirmed process termination.

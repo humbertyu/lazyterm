@@ -146,7 +146,10 @@ mod tests {
     fn nonzero_exit_and_excessive_output_are_not_successful_empty_snapshots() {
         let result = output(&mut helper("failure")).unwrap();
         assert!(!result.status.success());
-        let error = output(&mut helper("overflow")).unwrap_err();
+        // Large output can take longer on small CI pipes; test the cap independently
+        // of the production deadline, which has its own blocked-query test.
+        let error =
+            output_with_timeout(&mut helper("overflow"), Duration::from_secs(30)).unwrap_err();
         assert!(error.to_string().contains("exceeded"));
     }
 

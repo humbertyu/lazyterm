@@ -92,6 +92,50 @@ For local uncommitted testing, use `python3 scripts/release.py universal --allow
 
 The repository's `projects/lazyterm.json` records the local Projects workspace commands for builds, checks and packaging. Set the workspace base path to your checkout when registering it in LazyTerm. Run one packaging task at a time because they share `target/` and `dist/`. The local package command permits uncommitted changes; the release command requires a clean checkout. Packaging is an ordinary Task and stops if its owning LazyTerm exits.
 
+## Experimental Linux Source Builds
+
+Linux remains a development target, not a published release package. On
+Debian/Ubuntu, install Rust 1.92+ and the build/runtime dependencies:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential pkg-config libssl-dev libwayland-dev \
+  libxkbcommon-dev openssh-client procps lsof iproute2
+cargo build --locked
+./target/debug/lazyterm --diagnostics
+```
+
+Linux passwords use Secret Service through the session D-Bus. A desktop
+session must provide an enabled Secret Service implementation, such as GNOME
+Keyring or a compatible KWallet setup, and its password collection must be
+unlocked. Installing a package alone does not ensure a working desktop session.
+LazyTerm reports unavailable/denied storage operations without exposing the
+backend's raw error details. Host passwords never fall back to configuration
+files. An unavailable store does not mean that a saved password was deleted;
+restore access to the original keyring or enter a temporary password without
+saving. Temporary password entry is supported by the interactive TUI; CLI
+operations retain their documented noninteractive authentication restrictions.
+
+On a headless machine, use SSH keys or temporary interactive passwords unless
+you deliberately configure a session bus and credential service. LazyTerm does
+not create an unprotected keyring or start a credential daemon for the user.
+GNOME/KDE graphical unlock prompts still require desktop acceptance; see the
+[v1.0 validation record](v1.0-acceptance.md).
+
+Developers can test the backend without touching their real credential
+collection:
+
+```sh
+sudo apt-get install openssh-server dbus-x11 gnome-keyring libglib2.0-bin
+bash scripts/test-linux-credentials.sh
+```
+
+The fixture creates a temporary home, its own D-Bus session and a disposable
+password-protected GNOME keyring. It tests unavailable storage, password
+creation/update, a fresh process reading the same reference, deletion, and
+locked storage without a graphical prompter. It deletes the temporary home
+afterwards. This script refuses to run on macOS.
+
 ## Upgrade, Backup, and Uninstall
 
 Quit LazyTerm before replacing its binary. Stop or intentionally retain persistent Project services; existing independent runners continue using the executable they started with, so stop/restart them after upgrading. Do not run an older version against upgraded metadata. Back up both `~/.ssh` and `~/Library/Application Support/lazyterm/` before an upgrade. Settings configuration export excludes managed passwords and private keys; export encrypted credentials separately and retain private keys through your own secure backup.

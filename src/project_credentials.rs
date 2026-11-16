@@ -53,7 +53,26 @@ fn entry(reference: &str) -> Result<keyring::Entry, String> {
     } else {
         SERVICE
     };
-    keyring::Entry::new(service, reference).map_err(|_| "Could not access system keychain.".into())
+    keyring::Entry::new(service, reference)
+        .map_err(|error| keychain_error(error, "Could not access system keychain."))
+}
+
+fn keychain_error(error: keyring::Error, _fallback: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        match error {
+            keyring::Error::NoStorageAccess(_) => "Linux Secret Service is locked or access was denied. Unlock your desktop keyring and retry; passwords are not saved in configuration files.".into(),
+            keyring::Error::PlatformFailure(_) => "Linux Secret Service could not be reached or the request failed. Check your desktop session's D-Bus and GNOME Keyring/KWallet; on a headless system, use a temporary password without saving.".into(),
+            keyring::Error::Ambiguous(_) => "Multiple Linux Secret Service entries match this password. Resolve duplicate entries in your system password manager and retry.".into(),
+            keyring::Error::NoEntry => "Saved password was not found in Linux Secret Service. Enter it again to save a replacement.".into(),
+            _ => "Linux Secret Service could not complete the password operation. Check your system password manager and retry.".into(),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        _fallback.to_owned()
+    }
 }
 
 fn valid_reference(reference: &str) -> bool {
@@ -83,30 +102,44 @@ pub fn delete_password(reference: &str) -> Result<(), String> {
 
 impl PasswordStore for SystemStore {
     fn set(&self, reference: &str, password: &str) -> Result<(), String> {
-        entry(reference)?
-            .set_password(password)
-            .map_err(|_| "Could not save password in system keychain; unlock it and retry.".into())
+        entry(reference)?.set_password(password).map_err(|error| {
+            keychain_error(
+                error,
+                "Could not save password in system keychain; unlock it and retry.",
+            )
+        })
     }
 
     fn get(&self, reference: &str) -> Result<Zeroizing<String>, String> {
         entry(reference)?
             .get_password()
             .map(Zeroizing::new)
-            .map_err(|_| "Could not read saved password; unlock the keychain or replace it.".into())
+            .map_err(|error| {
+                keychain_error(
+                    error,
+                    "Could not read saved password; unlock the keychain or replace it.",
+                )
+            })
     }
 
     fn get_optional(&self, reference: &str) -> Result<Option<Zeroizing<String>>, String> {
         match entry(reference)?.get_password() {
             Ok(password) => Ok(Some(Zeroizing::new(password))),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err("Could not read system keychain; unlock it and retry.".into()),
+            Err(error) => Err(keychain_error(
+                error,
+                "Could not read system keychain; unlock it and retry.",
+            )),
         }
     }
 
     fn delete(&self, reference: &str) -> Result<(), String> {
         match entry(reference)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err("Could not remove unused password from system keychain.".into()),
+            Err(error) => Err(keychain_error(
+                error,
+                "Could not remove unused password from system keychain.",
+            )),
         }
     }
 }
@@ -508,6 +541,163 @@ pub(crate) mod tests {
         assert_eq!(&**value.unwrap(), "lazyterm-disposable-test-password");
         removed.unwrap();
         assert!(store.get(&reference).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keyring_errors_are_actionable_without_backend_details() {
+        let private_detail = "private backend detail with a secret";
+        for (error, expected) in [
+            (
+                keyring::Error::NoStorageAccess(Box::new(std::io::Error::other(private_detail))),
+                "locked or access was denied",
+            ),
+            (
+                keyring::Error::PlatformFailure(Box::new(std::io::Error::other(private_detail))),
+                "D-Bus",
+            ),
+            (keyring::Error::Ambiguous(vec![]), "Multiple"),
+            (
+                keyring::Error::BadEncoding(vec![0xff]),
+                "could not complete",
+            ),
+            (keyring::Error::NoEntry, "not found"),
+        ] {
+            let message = keychain_error(error, "macOS fallback");
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains(private_detail));
+            assert!(!message.contains("macOS fallback"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_linux_fixture(mode: &str) {
+        assert_eq!(
+            std::env::var("LAZYTERM_SECRET_SERVICE_FIXTURE").as_deref(),
+            Ok(mode),
+            "Run scripts/test-linux-credentials.sh in an isolated Linux environment."
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated Linux Secret Service fixture only"]
+    fn linux_secret_service_round_trip() {
+        require_linux_fixture("available");
+        let store = SystemStore;
+        for prefix in [PREFIX, CREDENTIAL_PREFIX] {
+            let reference = save_with_prefix(&store, "disposable-original", prefix).unwrap();
+            struct Cleanup(String);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = SystemStore.delete(&self.0);
+                }
+            }
+            let _cleanup = Cleanup(reference.clone());
+            assert_eq!(&**store.get(&reference).unwrap(), "disposable-original");
+            store.set(&reference, "disposable-updated").unwrap();
+            assert_eq!(
+                &**store.get_optional(&reference).unwrap().unwrap(),
+                "disposable-updated"
+            );
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "project_credentials::tests::linux_secret_service_read_back",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("LAZYTERM_TEST_PASSWORD_REFERENCE", &reference)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "Separate process could not read the password"
+            );
+            store.delete(&reference).unwrap();
+            assert!(store.get_optional(&reference).unwrap().is_none());
+            store.delete(&reference).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated Linux Secret Service subprocess helper"]
+    fn linux_secret_service_read_back() {
+        require_linux_fixture("available");
+        let reference = std::env::var("LAZYTERM_TEST_PASSWORD_REFERENCE").unwrap();
+        assert_eq!(
+            &**SystemStore.get(&reference).unwrap(),
+            "disposable-updated"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated Linux Secret Service fixture without a graphical prompter"]
+    fn linux_secret_service_locked() {
+        require_linux_fixture("available");
+        let store = SystemStore;
+        let reference = save_new(&store, "disposable-locked").unwrap();
+        let call = |method: &str, argument: &str| {
+            let output = std::process::Command::new("gdbus")
+                .args([
+                    "call",
+                    "--session",
+                    "--dest",
+                    "org.freedesktop.secrets",
+                    "--object-path",
+                    "/org/freedesktop/secrets",
+                    "--method",
+                    method,
+                    argument,
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Secret Service fixture control failed"
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let alias = call("org.freedesktop.Secret.Service.ReadAlias", "default");
+        let collection = alias.split('\'').nth(1).unwrap();
+        assert!(collection.starts_with("/org/freedesktop/secrets/collection/"));
+        call(
+            "org.freedesktop.Secret.Service.Lock",
+            &format!("['{collection}']"),
+        );
+        // This collection belongs only to the fixture and is removed with its home.
+        for result in [
+            store.get(&reference).map(|_| ()),
+            store.get_optional(&reference).map(|_| ()),
+            store.set(&reference, "disposable-not-saved"),
+            store.delete(&reference),
+        ] {
+            let message = result.expect_err("A locked keyring must not silently succeed");
+            assert!(message.contains("Linux Secret Service"), "{message}");
+            assert!(!message.contains("disposable-"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated Linux environment without a session bus only"]
+    fn linux_secret_service_unavailable() {
+        require_linux_fixture("unavailable");
+        let reference = format!("{CREDENTIAL_PREFIX}{}", "a".repeat(64));
+        let store = SystemStore;
+        for result in [
+            store.set(&reference, "disposable-not-saved"),
+            store.get(&reference).map(|_| ()),
+            store.get_optional(&reference).map(|_| ()),
+            store.delete(&reference),
+        ] {
+            let message = result.expect_err("An unavailable service must not silently succeed");
+            assert!(message.contains("Linux Secret Service"), "{message}");
+            assert!(message.contains("D-Bus"), "{message}");
+            assert!(!message.contains("disposable-not-saved"));
+        }
     }
 
     #[test]

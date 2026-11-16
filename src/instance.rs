@@ -70,7 +70,7 @@ impl InstanceGuard {
 fn terminal_name() -> Option<String> {
     #[cfg(unix)]
     {
-        let mut buffer = [0_i8; 1024];
+        let mut buffer = [0 as libc::c_char; 1024];
         if unsafe { libc::ttyname_r(libc::STDIN_FILENO, buffer.as_mut_ptr(), buffer.len()) } == 0 {
             return Some(
                 unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }

@@ -124,6 +124,8 @@ pub fn support_report() -> String {
         io::stdin().is_terminal(),
         if cfg!(target_os = "macos") {
             "macOS Keychain"
+        } else if cfg!(target_os = "linux") {
+            "Linux Secret Service (requires a session D-Bus and an unlocked keyring)"
         } else {
             "experimental platform backend"
         }
