@@ -1536,12 +1536,70 @@ pub(crate) mod tests {
             .unwrap();
         assert!(connection.control_path().exists());
         let mut session = connection.command();
-        session
-            .args(["exit", "0"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        assert!(session.status().unwrap().success());
+        assert!(
+            session.get_args().any(|argument| argument == "-t"),
+            "interactive SSH sessions must request remote PTY allocation"
+        );
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut size,
+                )
+            },
+            0
+        );
+        let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
+        let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1
+        );
+        let mut session = session
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap();
+        master.write_all(b"exit\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        while !output
+            .windows(b"shell-input-confirmed".len())
+            .any(|window| window == b"shell-input-confirmed")
+        {
+            let mut buffer = [0; 4096];
+            match master.read(&mut buffer) {
+                Ok(size) => output.extend_from_slice(&buffer[..size]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("Interactive SSH PTY read failed: {error}"),
+            }
+            assert!(
+                session.try_wait().unwrap().is_none(),
+                "SSH shell exited before confirming input: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SSH shell did not receive input: {}",
+                String::from_utf8_lossy(&output)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.wait().unwrap().success());
         drop(connection);
         drop(fixture);
     }

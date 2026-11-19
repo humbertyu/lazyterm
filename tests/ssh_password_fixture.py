@@ -106,6 +106,27 @@ class Server(paramiko.ServerInterface):
         threading.Thread(target=execute, daemon=True).start()
         return True
 
+    def check_channel_shell_request(self, channel):
+        def shell():
+            received = bytearray()
+            channel.sendall(b"fixture-shell> ")
+            try:
+                while True:
+                    data = channel.recv(4096)
+                    if not data:
+                        return
+                    received.extend(data)
+                    channel.sendall(data)
+                    if b"exit\n" in received or b"exit\r" in received:
+                        channel.sendall(b"\r\nshell-input-confirmed\r\n")
+                        channel.send_exit_status(0)
+                        return
+            finally:
+                channel.close()
+
+        threading.Thread(target=shell, daemon=True).start()
+        return True
+
     def check_channel_direct_tcpip_request(self, channel_id, origin, destination):
         if destination[0] not in ("localhost", "127.0.0.1") or destination[1] != PORT:
             return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED

@@ -3,6 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
     os::fd::AsRawFd,
     os::unix::process::CommandExt,
+    path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -82,6 +83,101 @@ impl ManagedChild {
     }
 }
 
+pub struct DetachedSsh(Child);
+
+impl DetachedSsh {
+    pub fn spawn(ssh: &Command, directory: &Path) -> io::Result<Self> {
+        let mut guard = Command::new(std::env::current_exe()?);
+        #[cfg(not(test))]
+        guard.arg("--ssh-guard").arg(directory).args(ssh.get_args());
+        #[cfg(test)]
+        {
+            guard.args([
+                "--ignored",
+                "--exact",
+                "process_guard::tests::ssh_guard_process",
+                "--nocapture",
+            ]);
+            guard.env("LAZYTERM_TEST_SSH_DIRECTORY", directory);
+            for (index, arg) in ssh.get_args().enumerate() {
+                guard.env(format!("LAZYTERM_TEST_SSH_ARG_{index}"), arg);
+            }
+        }
+        for (key, value) in ssh.get_envs() {
+            if let Some(value) = value {
+                guard.env(key, value);
+            } else {
+                guard.env_remove(key);
+            }
+        }
+        guard.stdin(Stdio::piped()).stderr(Stdio::piped());
+        guard.stdout(Stdio::null());
+        // Keep the master and its jump processes outside the TUI's terminal session.
+        unsafe {
+            guard.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        guard.spawn().map(Self)
+    }
+
+    pub fn child(&mut self) -> &mut Child {
+        &mut self.0
+    }
+
+    pub fn stop(&mut self) {
+        self.0.stdin.take();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for DetachedSsh {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+pub(crate) fn run_ssh(
+    directory: &Path,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> io::Result<()> {
+    let group = checked_group()?;
+    let result = (|| {
+        // SSH must close normally on TERM. Only the supervisor ignores it.
+        let mut ssh = Command::new("ssh")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()?;
+        ignore_cleanup_signals();
+        let mut lifeline = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            if ssh.try_wait()?.is_some() {
+                return Ok(());
+            }
+            match unsafe { libc::poll(&mut lifeline, 1, 50) } {
+                0 => continue,
+                -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+                -1 => return Err(io::Error::last_os_error()),
+                _ => return Ok(()),
+            }
+        }
+    })();
+    cleanup_group(group, || {
+        let _ = std::fs::remove_file(directory.join("ssh"));
+        let _ = std::fs::remove_dir(directory);
+    });
+    result
+}
+
 fn wait_ready(guard: &mut Child) -> io::Result<()> {
     let mut output = guard.stdout.take().expect("piped guard stdout");
     let fd = output.as_raw_fd();
@@ -157,17 +253,8 @@ pub(crate) fn group_has_members(group: u32, exclude: Option<u32>) -> bool {
 }
 
 pub(crate) fn run() -> io::Result<()> {
-    // Ignore TERM only in this helper; managed commands retain their usual handlers.
-    unsafe {
-        libc::signal(libc::SIGTERM, libc::SIG_IGN);
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-    }
-    let group = std::process::id();
-    if unsafe { libc::getpgrp() } != group as i32 || group <= 1 {
-        return Err(io::Error::other(
-            "Process guard requires its own process group",
-        ));
-    }
+    let group = checked_group()?;
+    ignore_cleanup_signals();
     io::stdout().write_all(b"guard-ready\n")?;
     io::stdout().flush()?;
     let mut buffer = [0; 64];
@@ -179,24 +266,50 @@ pub(crate) fn run() -> io::Result<()> {
             Err(_) => break,
         }
     }
+    cleanup_group(group, || {});
+    Ok(())
+}
+
+fn checked_group() -> io::Result<u32> {
+    let group = std::process::id();
+    if unsafe { libc::getpgrp() } != group as i32 || group <= 1 {
+        return Err(io::Error::other(
+            "Process guard requires its own process group",
+        ));
+    }
+    Ok(group)
+}
+
+fn ignore_cleanup_signals() {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+}
+
+fn cleanup_group(group: u32, finish: impl FnOnce()) {
     unsafe { libc::kill(-(group as i32), libc::SIGTERM) };
     let deadline = Instant::now() + Duration::from_secs(2);
     while group_has_members(group, Some(group)) {
         if Instant::now() >= deadline {
             // The guard is still the group leader, so escalation cannot hit a reused group.
+            finish();
             unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
-            break;
+            return;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Ok(())
+    finish();
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::projects::{ProjectDefinition, ProjectLifecycle, tests::Fixture};
-    use std::{fs, net::TcpStream, path::Path};
+    use std::{
+        fs,
+        net::{TcpListener, TcpStream},
+    };
 
     pub(crate) struct OwnerProcess(pub Child);
 
@@ -282,6 +395,79 @@ pub(crate) mod tests {
             .err()
             .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn killed_ssh_owner_cleans_up_before_authentication() {
+        let fixture = Fixture::new("sigkill-ssh");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut owner = OwnerProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "process_guard::tests::ssh_owner_process",
+                ])
+                .env("LAZYTERM_TEST_SSH_OWNER", &fixture.root)
+                .env(
+                    "LAZYTERM_TEST_SSH_PORT",
+                    listener.local_addr().unwrap().port().to_string(),
+                )
+                .spawn()
+                .unwrap(),
+        );
+        let mut pending_socket = None;
+        wait_until(|| {
+            if pending_socket.is_none() {
+                pending_socket = listener.accept().ok();
+            }
+            pending_socket.is_some() && fixture.root.join("owner-ready").exists()
+        });
+        let group: u32 = fs::read_to_string(fixture.root.join("owner-ready"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::getsid(group as i32) }, group as i32);
+        assert!(group_has_members(group, Some(group)));
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+        wait_until(|| !group_has_members(group, None));
+        assert!(!fixture.root.join("control").exists());
+    }
+
+    #[test]
+    #[ignore = "isolated SSH owner for SIGKILL recovery test"]
+    fn ssh_owner_process() {
+        let Some(root) = std::env::var_os("LAZYTERM_TEST_SSH_OWNER") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let directory = root.join("control");
+        fs::create_dir(&directory).unwrap();
+        let mut command = Command::new("ssh");
+        command
+            .args(["-F", "/dev/null", "-M", "-N", "-T", "-S"])
+            .arg(directory.join("ssh"))
+            .arg("-p")
+            .arg(std::env::var_os("LAZYTERM_TEST_SSH_PORT").unwrap())
+            .arg("127.0.0.1");
+        let mut child = DetachedSsh::spawn(&command, &directory).unwrap();
+        fs::write(root.join("owner-ready"), child.child().id().to_string()).unwrap();
+        while child.child().try_wait().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    #[ignore = "detached SSH supervisor subprocess helper"]
+    fn ssh_guard_process() {
+        let Some(directory) = std::env::var_os("LAZYTERM_TEST_SSH_DIRECTORY") else {
+            return;
+        };
+        let args =
+            (0..).map_while(|index| std::env::var_os(format!("LAZYTERM_TEST_SSH_ARG_{index}")));
+        super::run_ssh(Path::new(&directory), args).unwrap();
     }
 
     #[test]

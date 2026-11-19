@@ -48,6 +48,15 @@ use ratatui::DefaultTerminal;
 use crate::app::{App, ConnectionDialog, InputAction};
 
 fn main() -> Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    let mode = arguments.next();
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--ssh-guard")) {
+        let directory = arguments
+            .next()
+            .ok_or_else(|| io::Error::other("Missing SSH socket directory"))?;
+        crate::process_guard::run_ssh(std::path::Path::new(&directory), arguments)?;
+        return Ok(());
+    }
     if let Some(code) = crate::cli::run_if_requested() {
         std::process::exit(code);
     }
@@ -63,8 +72,6 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let mut arguments = std::env::args_os().skip(1);
-    let mode = arguments.next();
     match mode.as_deref().and_then(std::ffi::OsStr::to_str) {
         Some("--version" | "-V") => {
             println!("lazyterm {}", env!("CARGO_PKG_VERSION"));

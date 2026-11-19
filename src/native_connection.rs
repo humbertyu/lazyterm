@@ -3,7 +3,7 @@ use std::{
     io::{self, Read},
     os::unix::fs::DirBuilderExt,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -31,7 +31,7 @@ pub struct Connection {
     pub kind: Kind,
     username: Option<String>,
     directory: PathBuf,
-    child: crate::process_guard::ManagedChild,
+    child: crate::process_guard::DetachedSsh,
     #[cfg(test)]
     config: Option<PathBuf>,
 }
@@ -44,8 +44,7 @@ impl Drop for Pending {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.stop();
         let _ = fs::remove_file(self.directory.join("ssh"));
         let _ = fs::remove_dir(&self.directory);
     }
@@ -142,12 +141,8 @@ fn connect(
         }
     };
     let authentication = trace.as_ref().map(crate::authentication::Trace::status);
-    command
-        .arg(&alias)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let spawned = crate::process_guard::ManagedChild::spawn(&mut command);
+    command.arg(&alias);
+    let spawned = crate::process_guard::DetachedSsh::spawn(&command, &directory);
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
@@ -155,7 +150,7 @@ fn connect(
             return Err(error);
         }
     };
-    let stderr = child.stderr.take().expect("piped SSH stderr");
+    let stderr = child.child().stderr.take().expect("piped SSH stderr");
     let errors = Arc::new(Mutex::new(String::new()));
     let output = errors.clone();
     let reader = std::thread::spawn(move || {
@@ -188,12 +183,11 @@ fn connect(
             || authentication.as_ref().is_some_and(|auth| auth.cancelled())
             || Instant::now() >= deadline
         {
-            let _ = connection.child.kill();
-            let _ = connection.child.wait();
+            connection.child.stop();
             let _ = reader.join();
             return Err(io::Error::other("SSH connection cancelled or timed out."));
         }
-        if connection.child.try_wait()?.is_some() {
+        if connection.child.child().try_wait()?.is_some() {
             let _ = reader.join();
             return Err(io::Error::other({
                 let detail = errors.lock().unwrap();
