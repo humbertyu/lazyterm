@@ -171,7 +171,7 @@ pub(crate) fn run_ssh(
             }
         }
     })();
-    cleanup_group(group, || {
+    cleanup_group_with_grace(group, Duration::from_millis(250), || {
         let _ = std::fs::remove_file(directory.join("ssh"));
         let _ = std::fs::remove_dir(directory);
     });
@@ -288,8 +288,12 @@ fn ignore_cleanup_signals() {
 }
 
 fn cleanup_group(group: u32, finish: impl FnOnce()) {
+    cleanup_group_with_grace(group, Duration::from_secs(2), finish);
+}
+
+fn cleanup_group_with_grace(group: u32, grace: Duration, finish: impl FnOnce()) {
     unsafe { libc::kill(-(group as i32), libc::SIGTERM) };
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + grace;
     while group_has_members(group, Some(group)) {
         if Instant::now() >= deadline {
             // The guard is still the group leader, so escalation cannot hit a reused group.
@@ -399,6 +403,7 @@ pub(crate) mod tests {
 
     #[test]
     fn killed_ssh_owner_cleans_up_before_authentication() {
+        let started = Instant::now();
         let fixture = Fixture::new("sigkill-ssh");
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -434,6 +439,11 @@ pub(crate) mod tests {
         owner.0.wait().unwrap();
         wait_until(|| !group_has_members(group, None));
         assert!(!fixture.root.join("control").exists());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "SSH cleanup took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
