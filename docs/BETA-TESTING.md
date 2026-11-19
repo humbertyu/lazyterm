@@ -1,6 +1,6 @@
 # 0.9 Beta 测试指南 / Beta Testing
 
-当前测试版本：`0.9.0-beta.2`。支持 macOS 15+，Intel 和 Apple Silicon
+当前测试版本：`0.9.0-beta.3`。支持 macOS 15+，Intel 和 Apple Silicon
 共用一个 Universal 安装包，不需要 Rust。Linux 仅实验性源码构建，暂不支持 Windows。
 
 ## 下载和安装
@@ -18,21 +18,21 @@ lazyterm
 更新使用 `brew update` 和 `brew upgrade lazyterm`，卸载使用
 `brew uninstall lazyterm`；卸载保留用户配置与凭据。
 
-也可以从 [GitHub Release](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.2)
+也可以从 [GitHub Release](https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.3)
 下载以下文件：
 
-- `lazyterm-v0.9.0-beta.2-universal-apple-darwin.tar.gz`：程序和文档，内含 Skill。
+- `lazyterm-v0.9.0-beta.3-universal-apple-darwin.tar.gz`：程序和文档，内含 Skill。
 - `SHA256SUMS`：校验和。
-- `lazyterm-v0.9.0-beta.2-skill.zip`：单独的便携 Skill，可选。
+- `lazyterm-v0.9.0-beta.3-skill.zip`：单独的便携 Skill，可选。
 
 先运行下面的命令，把输出和 `SHA256SUMS` 中对应文件的值比较，一致后再解压安装。
 Skill ZIP 也有独立校验和。校验和用于检查下载完整性，不替代确认发布来源。
 
 ```sh
-shasum -a 256 lazyterm-v0.9.0-beta.2-universal-apple-darwin.tar.gz
-tar -xzf lazyterm-v0.9.0-beta.2-universal-apple-darwin.tar.gz
+shasum -a 256 lazyterm-v0.9.0-beta.3-universal-apple-darwin.tar.gz
+tar -xzf lazyterm-v0.9.0-beta.3-universal-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 755 lazyterm-v0.9.0-beta.2-universal-apple-darwin/lazyterm "$HOME/.local/bin/lazyterm"
+install -m 755 lazyterm-v0.9.0-beta.3-universal-apple-darwin/lazyterm "$HOME/.local/bin/lazyterm"
 "$HOME/.local/bin/lazyterm" --version
 "$HOME/.local/bin/lazyterm" --diagnostics
 ```

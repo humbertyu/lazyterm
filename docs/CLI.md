@@ -193,7 +193,7 @@ tools; the CLI does not execute Snippets. CLI configuration queries never run
 ## Skill
 
 For the published beta, see [beta installation and Agent setup](BETA-TESTING.md).
-The release provides a portable `lazyterm-v0.9.0-beta.2-skill.zip` and includes
+The release provides a portable `lazyterm-v0.9.0-beta.3-skill.zip` and includes
 the same `skills/lazyterm/SKILL.md` in the binary archive. Use that portable
 package for other users; development packages pinned to a maintainer's local
 executable path will not work on their machines.
