@@ -1,13 +1,45 @@
 [package]
 name = "lazyterm"
-version = "0.1.0"
+version = "0.9.0-beta.3"
 edition = "2024"
+rust-version = "1.92"
 description = "A lightweight, keyboard-driven workspace for remote hosts"
 license = "MIT"
 
 [dependencies]
+age = "0.11"
+async-recursion = "1"
 color-eyre = "0.6"
 crossterm = "0.29"
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+regex = "1"
+rfd = "0.15"
 glob = "0.3"
+getrandom = "0.3"
+libc = "0.2"
 shell-words = "1.1"
+ssh-key = { version = "0.6", default-features = false, features = ["std"] }
+vte = "0.14"
+bytes = "1"
+futures-util = "0.3"
+openssh = "0.11.6"
+openssh-sftp-client = { version = "0.15.12", features = ["openssh"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+unicode-width = "0.2"
+webbrowser = { version = "1.2.2", features = ["hardened"] }
+keyring = "3.6.3"
+arboard = { version = "3", default-features = false }
+zeroize = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }

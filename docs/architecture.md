@@ -55,7 +55,7 @@ Input event
 
 This is more important than the specific Ratatui widget layout. It keeps the UI testable and prevents network or filesystem work from blocking the event loop.
 
-### 2.2 Separate host configuration from runtime sessions
+### 2.2 Separate host configuration, credentials, and runtime sessions
 
 SSHub distinguishes saved host data from active connections. LazyTerm should do the same:
 
@@ -87,7 +87,8 @@ For reliable CRUD, identify which host entries LazyTerm owns and update only tho
 SSHub centralizes persistent settings and credentials instead of letting each screen write its own files. LazyTerm should have one storage boundary:
 
 ```text
-Host catalog / metadata / snippets / tunnel definitions
+Host catalog / metadata / snippets / tunnel / project definitions
+Host credential store (platform secret service)
                           |
                      Repository
                           |
@@ -96,18 +97,85 @@ Host catalog / metadata / snippets / tunnel definitions
 
 Secrets go through a separate `CredentialStore`; they must not be serialized into ordinary application records.
 
-### 2.5 Runtime process supervision
+Metadata retains the exact file snapshot obtained on read. `save_to` holds an OS file lock across snapshot comparison, backup and atomic replacement. A stale snapshot, external deletion or corrupt replacement blocks saving; the user reloads through Hosts before retrying. Top-level unknown fields survive round trips. Before replacement, the last contents are copied to a private timestamped file in `hosts.json.backups/` (30 retained); the existing single backup remains for compatibility. A private append-only `hosts.json.writes.jsonl` records attempts, successful saves, failures and conflicts with PID, timestamp, caller and collection counts only. Unit tests cannot invoke the production save entry point and App tests require an explicit temporary metadata path. Older binaries do not participate in the lock or snapshot protocol and must be closed.
 
-Tunnel processes, snippet commands, and native SSH sessions need a shared process policy:
+The interactive startup path acquires a nonblocking OS lock on `tui.instance.lock` in the same data directory before initializing the terminal or loading App state. Its guard lives through terminal restoration and clipboard cleanup. The file stores only owner PID and terminal; lock ownership, rather than PID liveness or file presence, determines exclusion. It stays in place on exit to avoid unlink/inode races. Askpass and `--project-runner` dispatch happen before this gate, allowing authentication and persistent tasks while a TUI is running. Cross-process tests verify duplicate rejection and release after process death.
 
-- capture exit status and stderr;
-- classify expected exit versus failure;
-- avoid logging secrets;
-- terminate the correct process group;
-- preserve persistent tunnels when the TUI exits;
-- rediscover running persistent tunnels on the next launch.
+### 2.5 Host credential storage
 
-### 2.6 Capability-focused tests
+OpenSSH configuration remains the source of truth for standard Host fields such as `HostName`, `User`, `Port`, identity files, and routing options. LazyTerm metadata stores only UI data and opaque credential references. Host passwords never enter `.ssh/config`, JSON metadata, command arguments, environment variables, logs, or configuration exports.
+
+The credential store provides platform adapters for macOS Keychain, Linux Secret Service, and Windows Credential Manager. A Host credential is keyed by a stable LazyTerm host identity plus the resolved alias, so renaming or reconciling an alias cannot silently attach a password to an unrelated Host. Username may be read from OpenSSH config and optionally saved with the credential record when the user chooses; password retrieval always requires an explicit connection operation.
+
+SSH, SFTP, Tunnel, and remote Project connections use the same credential lookup path. Password authentication is supplied through the connection backend's supported prompt or authentication API; the application must never fall back to `sshpass` or place the secret in a process-visible argument. If the platform store is unavailable, the UI reports the failure and allows an interactive one-time password entry without persisting it.
+
+### 2.6 Runtime process supervision
+
+`process_guard.rs` supplies a shared managed-child boundary for Project commands, Tunnels, and native SSH connection masters on macOS/Linux. Before starting a command, the owner launches an independent group leader and waits for a bounded readiness handshake. The command joins that group; only the owner retains the guard's input pipe. CLOEXEC prevents commands, askpass, and independent runners from inheriting another owner's lifeline. The guard ignores TERM/HUP itself and blocks on pipe EOF, so SIGKILL of the owner still initiates group TERM followed by group KILL after two seconds. Keeping the guard alive as the group leader anchors group identity throughout cleanup; ordinary signaling also requires the live, unreaped guard child. Project polling excludes the idle guard when deciding whether the command group has finished. The guard dispatch precedes the TUI instance gate and never loads personal configuration.
+
+App-scoped commands and Tunnels are cleaned after TUI death. Persistent Project runners instead own their command guard, so a TUI crash preserves the runner; reopening authenticates and reattaches through its existing control socket. If the runner dies, its guard cleans the group independently. Recovery rereads its record under the per-command lock and marks unexpected exit only once the group is empty, then removes the private abandoned socket directory. The same reconciliation runs on failed status requests, without requiring an application restart. No recovery operation signals a PID from disk. An unknown live group remains reserved rather than being killed or duplicated. Persistent Tunnels and remote daemon rediscovery remain deferred.
+
+Isolated App-owner tests acquire an instance lock and launch real listener descendants, then use SIGKILL to verify lock release, TERM-resistant child cleanup, unrelated-process isolation, and restart. A persistent-runner test kills its TUI owner, verifies reattachment and duplicate prevention, then kills the runner and verifies cleanup and status recovery. The optional loopback SSH fixture kills real forwarding processes and their App owner, checks failure state, released bind ports, and same-definition restart. Commands deliberately leaving the group and pre-guard processes are outside this ownership boundary.
+
+### 2.7 Runtime inspection
+
+The Runtime view inspects listening TCP sockets on the local machine or on a selected OpenSSH Host. It does not replace Tunnel definitions: Tunnels own forwarding processes that LazyTerm starts, while Runtime observes any listener and can request termination after confirmation.
+
+Inspection runs in a worker thread so the TUI event loop remains responsive. The local and remote adapters use a fixed command policy: prefer `lsof` field output, then fall back to `ss` on systems that provide it. Remote inspection sends the selected alias to OpenSSH and never copies resolved hostname, user, identity, or proxy settings into Runtime state.
+
+Runtime entries are transient observations. PID values are not stable identities and must be revalidated by a fresh inspection before future process actions. When permissions allow, the adapter enriches an entry with the full command line and current working directory using `ps` and `lsof` or `/proc`. External process termination sends `TERM`; a separate confirmed `KILL` action is available for entries that do not stop cleanly. Managed Project commands use the separate group lifecycle described below. Missing tools, permission limits, authentication failures, and unavailable process metadata are displayed as inspection errors or unavailable fields.
+
+Runtime origin is independent of process ownership and system classification. A single `ps` snapshot per inspection supplies PID, PPID, PGID, terminal, and command. A bounded, cycle-checked ancestry walk recognizes shells, attached terminals, known Agent executables, and macOS app bundles. Agent ancestry takes precedence over its launcher; a CLI child inside a desktop terminal remains CLI. Missing or reparented ancestors leave origin unknown. Origin is a hint displayed with evidence, not authorization for automatic termination.
+
+Runtime defaults to the `Mine` category, comparing process UID against `id -u` on the inspected machine and excluding recognized system services. `Apps`, `System`, and `All` expose broader views. These observations cannot establish Agent provenance. Filtering is shared by rendering, navigation, details, and termination confirmation so a visible selection always refers to the same process.
+
+Runtime separates machine selection (`Local` and a catalog-backed `Hosts` picker) from process categories. Each target has a session-only cached list, filter, selected row, and scroll offset. Switching restores that view and starts a fresh inspection; termination remains disabled while loading or after an inspection failure. Results carry a monotonically increasing request ID as well as the target, preventing a delayed result from an earlier visit to the same machine from replacing current data. Refresh preserves the selected listener by PID, endpoint, and protocol when it remains present. Termination confirmation displays the machine and prevents target changes; missing catalog aliases cannot start new inspections. Rendering and mouse hit testing share the same target/category/list geometry.
+
+Local listeners in a currently owned Project process group receive a green `PROJECT` origin, project/command IDs and names, and the current run ID. The UI validates this identity again when receiving worker results and before routing a confirmed stop to the Project supervisor. Remote PID/PGID values never match local ownership. The Runtime `o` action opens the linked command output; entering Runtime refreshes the observation so new project listeners are discoverable.
+
+### 2.8 Project workspaces
+
+`projects.rs` owns Project/command definitions and the local process supervisor; `project_app.rs` owns workspace navigation and forms. A Project has a stable ID, name, base directory, and named commands with stable per-project IDs, shell text, and optional working-directory overrides. Definitions are added to version-1 metadata with an empty default for old files. They share the existing atomic write/backup boundary and survive Host reconciliation. Failed saves roll back definition changes and retain form input.
+
+Projects optionally persist ordered group names; each command references at most one group by name. Browsing derives groups from both explicit groups and command references, preserving empty groups and tolerating older or hand-edited definitions. Group rename updates all references atomically; group removal clears references without deleting commands. The browser is a default-expanded tree with group headers, indented commands, and ungrouped commands, plus an optional flat view. A session-only set keyed by Project ID and group name remembers collapsed groups across navigation and flat-view toggles. Rename migrates fold state after a successful save; removal discards it. Selection stores command identity separately from visible row position so output, mutations, and Runtime navigation resolve the intended command. Saving a command or following its Runtime link expands its group before selecting it. Services and Tasks are distinct, defaulting to Task for older definitions. Batch controls select only Services within the selected header/command's group or whole project.
+
+Project definitions also contain an additive `links` array of stable ID, name, and URL records; older definitions default to no links. Tree views place links under a distinct default-expanded `Web links` header above command groups. This header uses a typed workspace item and separate per-Project session fold state, avoiding collisions with user-defined command groups; flat views omit headers. Link and command rows share name styling, child indentation, and muted secondary information. Creating/editing a link expands the header and resolves selection through workspace-item identity. Their forms and confirmed deletion share the metadata save/rollback path, and editing a Project preserves its links. Neither link nor link-header selection resolves to a command or a service batch scope. The `url` parser validates HTTP/HTTPS addresses on save and again before opening imported metadata; `webbrowser` handles platform browser launching on a background worker, with completion/errors polled by the App. URLs are literal browser destinations and are independent of the Project's execution target.
+
+Links have optional username and password fields plus a storage choice. Keychain storage uses an opaque password reference and the `keyring` crate stores the secret under the dedicated `lazyterm.project-links` service, using a random reference per replacement. Config-file storage writes the password to `hosts.json` as plaintext and is intended only for low-sensitivity services; the form labels this choice explicitly and warns before saving. No password is embedded in a URL or passed on a command line. Forms mask new input, preserve existing passwords when blank, and zero their password buffer on drop. A worker prepares a new Keychain credential, then the UI saves metadata and commits the reference; a canceled or failed save discards only the prepared credential. Successfully saved edits/deletions asynchronously remove references no longer used by any Project link. Cleanup errors are surfaced; process crashes can leave orphaned keychain entries, and automatic orphan reconciliation is deferred. Credential operations never block the UI event loop. A persistent clipboard worker owns copied text, expires passwords after 30 seconds, and clears only matching clipboard contents; normal application exit requests the same cleanup. Unit tests use an in-memory credential store; the ignored `native_keychain_round_trip` is an opt-in native-store smoke test.
+
+Settings can export referenced manager/Host passwords and Project Web Link passwords, including config-file passwords, to a user-selected `.age` file. The export asks for a separate passphrase, builds the payload in memory, encrypts it before writing, and excludes saved password fields and private key files from ordinary JSON configuration export.
+
+### Credential manager implementation
+
+Credentials is a top-level workspace tab alongside Hosts, Files, Tunnels, Snippets, Runtime and Projects. Settings controls its visibility and retains configuration/credential export; it is not the credential manager's entry point. The tab shares the normal numbered/function-key, cycle, previous-tab and Settings navigation. Hosts can still open a modal credential selector for assignment or upload; only its forms/pickers/confirmations own modal input on the main tab. Rendering keeps the top navigation visible while sharing manager content and dialogs between both entry points.
+
+`credentials.rs` owns serializable credential metadata, OpenSSH key generation/import/discovery, target-scoped askpass, and public-key installation. `credential_app.rs` owns modal navigation, transactional password replacement, Host associations and worker completion; `credential_ui.rs` renders the manager, forms, Host picker and confirmations. Metadata adds default-empty `credentials` and `host_passwords` fields without replacing OpenSSH as the Host source of truth. The existing secret-store adapter routes manager references to `lazyterm.credentials` and legacy Web Link references to `lazyterm.project-links`; random references use the platform CSPRNG through `getrandom`. The Credentials tab and Host credential selector rescan `~/.ssh` on entry and support manual refresh. Discovery uses matching `.pub` and private-file paths, reads only public-key data, and does not enumerate third-party system credential entries. Project Web Link Keychain references are displayed as linked credentials, but remain edited and removed through Projects.
+
+Passwords use prepare/save/commit semantics and unused-reference cleanup checks both manager records and Project links. Host reconciliation removes associations for confirmed missing aliases but preserves reusable credential records, and in-app rename migrates password associations. SSH keys store a canonical private-file path plus public material and fingerprint. Import uses `ssh-key` to read OpenSSH private-key public metadata and compares it with the fingerprint of the `.pub` sidecar. Generation reserves a new mode-0700 directory and invokes system `ssh-keygen` to produce an unencrypted Ed25519 pair (private file mode 0600 on Unix); this limitation is visible before saving. Private key files are never serialized or automatically removed. Key assignment changes only the chosen single-alias block's `IdentityFile` in its original root/Include file with the existing backup and atomic-write boundary; ambiguous/shared blocks are refused. Successful Host preflight connections run OpenSSH verbose diagnostics and persist aliases for which OpenSSH reports public-key authentication; local identity candidates alone do not count as successful key authentication. These observations and upload history are distinct metadata, and both are removed when a confirmed missing Host is reconciled.
+
+Hosts `p` opens the associated password editor without reading the stored secret into the form. Password replacement retains the credential ID and Host associations. Hosts `x` opens a direct password deletion confirmation without opening the credential manager. It shares the same deletion transaction as Credentials: confirm affected Hosts and remove their associations with the record in a single metadata save; save failure restores both collections and leaves the Keychain secret untouched. Unused-secret cleanup runs only after saving and preserves references used by other credentials or Project Web Links. The deletion confirmation owns keyboard and mouse input so it cannot change tabs, select a different Host, or initiate a connection.
+
+Host Add/Edit use one form and confirmation style. Fields are displayed as Alias, HostName, Groups, User, Port, and IdentityFile; only SSH connection fields are written to the OpenSSH Host stanza, while selected groups are stored in LazyTerm metadata. Add creates a marked Host block in the root config. Edit updates a concrete single-alias Host block in its original root or `Include` file, including blocks not created by LazyTerm; it changes the four represented connection options and preserves unrelated lines and comments. Shared-alias blocks and duplicate definitions are refused to avoid changing other connections. The Groups field opens a multi-select picker over persisted groups and existing Host assignments; a typed non-existing name can be created and added. Creation inside a group preselects that group, and edits load current assignments. In the Hosts overview, lowercase `g/e/d` act on a selected group for group create/rename/delete; `a` continues to add a Host and preselects the selected or open group. When a Host is selected, `e/d` edit or delete it. Rename updates all Host assignments; delete removes the group and assignments but never deletes Hosts. Empty groups remain persisted in `host_groups`, which is normalized with legacy tag assignments on load and save.
+
+Host forms additionally expose ProxyJump after IdentityFile. Space opens an existing-Host selector excluding the edited alias and its proposed replacement; manual input supports custom destinations and comma-separated hops. The config adapter validates input and creates, updates, or removes the explicit ProxyJump directive using the same backup and source-file write boundary. Unlike ordinary SSH options, ProxyJump is serialized without surrounding quotes because OpenSSH retains those quotes as part of its raw jump argument. Unrepresented directives, including ProxyCommand, remain untouched. Clearing ProxyJump does not override routing inherited from other matching blocks.
+
+Public-key upload requires an explicit confirmation and runs a bounded OpenSSH worker using the Host alias, strict host-key checking and existing routing options. The controlled remote script preserves existing authorized keys, compares type/blob before appending, sets private permissions and refuses symlink targets. A disposable SSH fixture installs the new key twice and authenticates using it without touching the user's actual authorized_keys. Native SSH/SFTP, embedded SFTP, Tunnels, Snippets, remote Projects, and upload use one per-connection broker exposed through a private Unix socket and `SSH_ASKPASS`; only the opaque session token and resolved prompt target enter the child environment. The broker answers exact target and ProxyJump password prompts, queues UI challenges, retries rejected saved passwords without replaying the remote command, and commits a replacement credential only after OpenSSH confirms password authentication. It refuses host-key, keyboard-interactive, and private-key passphrase prompts. An opt-in Paramiko fixture covers real password authentication across these integrated workflows; first-use host-key approval, encrypted-key passphrase storage, and the cross-platform native-store acceptance matrix remain pending.
+
+The additive target model stores a Project default (`Local` or `Host(alias)`) and optional per-command overrides. Target choices come from the existing catalog without copying SSH settings. Remote definitions are preserved when Hosts disappear. Remote execution is deliberately unavailable in this phase: the application refuses remote actions before batching, the supervisor rejects them before launching a process, and external recognition cannot associate them with local processes. Remote paths are stored without local canonicalization; their actual existence must be validated when remote execution is implemented.
+
+Execution uses the standard process API with `sh -c`, a validated directory, inherited environment, null stdin, and a guarded Unix process group. Commands do not start from navigation, tab changes, or application startup. Start, stop, restart, and start/stop-all are explicit actions. Stop sends group TERM and escalates to KILL after two seconds; restart waits for group cleanup and both output readers. If the shell exits while children retain its pipes, the remaining group is also cleaned up. Zombie-only groups do not block completion. App-scoped Drop kills remaining owned groups and reaps direct children; owner SIGKILL is handled by the ownership pipe guard described above. Daemonized processes that leave the group remain unsupported.
+
+The additive command lifecycle defaults to `App` (`Stop on exit`). `Persistent` (`Keep running`) launches the same executable in a private `--project-runner` mode before terminal initialization. The runner detaches with `setsid`, null stdio, and supervises one ordinary app-scoped command using the existing output readers and TERM/KILL handling. It holds an exclusive per-command `flock`, exposes a Unix socket in a short, private `/tmp` directory, and authenticates control requests with a random run token. Atomic mode-0600 records under `project-logs` store the run identity, real command/directory, log paths, status, and final bounded output tail; intermediate output is streamed through the socket. Status snapshots are queried on workers without blocking the event loop. Startup recovery scans local Project commands regardless of lifecycle: it reattaches runner-managed tasks and marks confirmed-dead runs as unexpectedly exited, while live or uncertain process groups remain reserved to avoid duplicates. Reattached runs retain their configured `App` or `Persistent` lifecycle, preserve runner-owned process groups for Runtime links, and send stop/restart through authenticated control requests instead of signaling persisted PIDs. A replaced run updates cached identity, protecting stale Runtime confirmations. Dropping a TUI handle leaves the runner and its output readers alive. Completed runner state remains readable after the socket is removed. Deleting a stopped command or Project removes its completed run index only after metadata saves successfully, retaining raw logs; the runner lock protects live records. Automatic relaunch, log rotation, full run history, and reboot autostart remain deferred.
+
+Dedicated readers write complete raw stdout/stderr to private per-run files and send bounded chunks over a bounded channel. The event loop drains a bounded number of chunks per frame and keeps a UTF-8-safe 256 KiB display tail. A streaming `vte` parser removes terminal controls for plain output; this is a log view rather than an interactive terminal. The view follows the tail until scrolled, preserves scroll across tab changes, and shows status and executed directory. Full log paths appear in details. Logs live under the metadata directory's `project-logs/`, with directory mode `0700` and file mode `0600`, and are retained when rerunning or deleting a definition. Rotation and persistent run indexing remain deferred.
+
+`project_monitor.rs` observes external commands separately from the owning supervisor. A single-flight worker scans every three seconds, matching effective UID, canonical working directory, and normalized command tokens. npm launch argument rewriting is supported; descendant processes supply listening ports. Managed process groups and the application's ancestors are excluded. Ambiguous definitions are not associated. Returned snapshots carry definitions and managed owner identities; changed definitions or run generations invalidate stale results. Missing inspection data is reported, and actions waiting for inspection fail closed.
+
+Start/start-all and restart wait for a fresh scan before execution. Current external-running status takes priority over a previous managed exit result, which remains separately labeled. External observation never grants lifecycle ownership or output capture. Runtime links external listeners by observed PID and command only on the local target; expired links cannot fall through to a stale generic termination action.
+
+External stop/restart presents an explicit confirmation. Before signaling, the worker revalidates the root's PID, UID, start time, command, and directory, then snapshots descendants. It sends TERM only to individually revalidated processes, protecting unrelated processes that share the terminal process group. External stops do not escalate to KILL; timeout cancels restart. Successful completion triggers a fresh inspection before the requested action, so a replacement external process requires confirmation again. Monitor Drop leaves external processes running.
+
+### 2.9 Capability-focused tests
 
 Connection features should be tested through narrow interfaces and fake implementations:
 
@@ -118,6 +186,14 @@ Connection features should be tested through narrow interfaces and fake implemen
 - fake clock for reconnect backoff.
 
 Do not make unit tests depend on a real SSH server, a real Keychain, or the user's `~/.ssh/config`.
+
+Project process tests launch the test binary as a disposable local server in a temporary directory, bind an OS-assigned loopback port, and remove the fixture on completion. They verify cwd, stdout/stderr, Unicode and ANSI decoding, log retention beyond the display cap, exit codes, concurrent tasks, duplicate rejection, TERM escalation, restart, Drop cleanup, metadata compatibility/backup/failure, and Projects -> Runtime -> output -> confirmed stop. Pure ownership tests cover child PGIDs and remote PID collisions. Nonempty workspace and output rendering is checked from 32x12 through 120x40.
+
+The opt-in SSH fixture also validates remote Runtime inspection against a temporary `sshd` listener, using an isolated client config and host key file. The fixture is disposable and never uses the user's SSH configuration.
+
+Persistent fixtures launch an independent runner subprocess and exercise TUI Drop/reopen, output generated while no TUI exists, exit-status restoration, duplicate prevention across handles, exclusive runner locking, token rejection, restart/TERM escalation, replacement discovery from another window, and Runtime ownership/output/stop after reopening. Test cleanup explicitly stops background fixtures; lifecycle form changes and legacy defaults are checked without launching user commands.
+
+External fixtures run outside the supervisor and deliberately share the test process group. Tests cover conservative command matching, descendants and ports, ambiguous definitions, stale definition/owner snapshots, identity revalidation, non-owning monitor Drop, and individual-process stopping. The App flow retains a previous failed managed run while an external server runs, rejects a duplicate launch, follows its Runtime output link, cancels a stop, then confirms a restart into a new managed generation.
 
 ## 3. LazyTerm target architecture
 
@@ -258,7 +334,11 @@ This preserves the user's complete OpenSSH configuration. Only add explicit `-o`
 
 ### 5.3 SftpService
 
-SFTP is the first area that may need a library-backed adapter rather than the system `sftp` command. The service should provide:
+The first v0.2 slice uses `openssh` plus `openssh-sftp-client`. `openssh` launches the system OpenSSH connection with the selected alias, while `openssh-sftp-client` speaks SFTP v3 over the subsystem and provides directory and file operations. This reuses `~/.ssh/config`, Includes, ProxyJump, agent/key routing, and known-host checking without implementing the protocol ourselves. The current UI implements directory listing, basic metadata, entering directories, and returning to the parent.
+
+The system `sftp` client remains available as a native handoff for interactive password prompts, first-time host-key confirmation, and other cases where the library's non-interactive session cannot proceed. It is a compatibility path, not the embedded browser. See the [OpenSSH sftp manual](https://man.openbsd.org/sftp).
+
+The service should provide:
 
 - list directory;
 - stat;
@@ -269,7 +349,15 @@ SFTP is the first area that may need a library-backed adapter rather than the sy
 - remove;
 - cancellation and progress.
 
-It must consume the same effective host profile and credential provider as SSH. This avoids a host working in Terminal but failing in Files because the two screens use different authentication rules.
+The intended contract is one shared host reference and credential policy. The current listing slice resolves the same alias and OpenSSH config but requires key/agent authentication and a previously trusted host key (`StrictHostKeyChecking=yes`); it does not yet share interactive password prompts with the native SSH/SFTP handoff.
+
+### 5.3.1 Shared host context
+
+The workspace retains an optional host alias independently of the Hosts cursor, group, or search. An explicit connection from Hosts or a selection in the Files picker updates that context; merely switching tabs never infers a host from the current cursor or connects.
+
+Each operation resolves the alias against the current catalog. A successful refresh that removes the alias clears the context, while discovery failure retains it and blocks new operations. In-app rename migrates the context. An external rename is deletion plus addition and requires explicit selection of the new alias. Future persisted tunnel/snippet references use this same policy; missing references are disabled, not retargeted.
+
+No module copies hostname, user, port, identity, or proxy fields into a separate host store. OpenSSH receives the alias to resolve inherited settings at execution time.
 
 ### 5.4 TunnelService
 
@@ -322,7 +410,25 @@ Suggested policy:
 
 Do not automatically retry authentication failures, host-key changes, malformed configuration, or local port conflicts. User-initiated stop always cancels reconnect.
 
-## 6. Credentials and macOS
+## 6. Platform Support
+
+The current accepted runtime and release pipeline target macOS. Linux builds
+are experimental and Windows is unsupported until platform-specific process,
+IPC, credential, SSH/SFTP, filesystem, and Runtime behavior passes native
+acceptance. A dependency having a platform credential backend is not sufficient
+to declare the application supported.
+
+Cross-platform code should keep product behavior in shared modules and isolate
+OS-specific operations behind narrow adapters: process ownership and signaling,
+private IPC, secure file creation, credential storage, listener/process
+inspection, clipboard, and shell/browser launch. Implementations must preserve
+the existing security boundaries, especially authenticated process control,
+secret redaction, stale-write protection, and cleanup that cannot signal an
+unrelated reused PID. CI must run on each native OS; cross-compilation is an
+additional compile check, not a substitute for process, credential, or SSH/SFTP
+acceptance.
+
+## 7. Credentials and macOS
 
 The credential boundary should be explicit:
 
@@ -405,7 +511,7 @@ Input / timer
 
 Use bounded channels for service events. Long-running work belongs in worker tasks or threads. The UI should display `Starting`, `Transferring`, `Reconnecting`, and `Failed` rather than block on a synchronous network call.
 
-For the current Rust stack, start with standard threads and channels where ownership is simple. Introduce Tokio only when SFTP concurrency, tunnel supervision, or cancellation actually requires an async runtime.
+The current SFTP adapter uses a short-lived Tokio runtime inside a worker thread and returns listing and transfer events through channels. The Ratatui event loop remains non-blocking, and the Files view keeps a bounded transfer history with a progress bar, percentage, and terminal status. The metadata store also remembers the local path, the last remote path by host alias, and the shared hidden-file setting. A supervised worker model and cancellation protocol remain future work.
 
 ## 9. Persistence layout
 
@@ -443,12 +549,14 @@ The storage layer needs schema versioning from its first migration. It should su
 - surface exit status and common errors;
 - add host search and favorite/group metadata.
 
-### Phase 3: SFTP and credentials
+### Phase 3: integrated Files
 
-- choose a maintained SFTP library;
-- implement Keychain adapter;
-- share effective connection profiles;
-- implement directory listing and one transfer path before building the full browser.
+- retain shared host context across modules and validate references;
+- add native SFTP terminal handoff as a small usable bridge;
+- implement the initial dual-pane directory browser: local files stay visible, while the remote pane reuses the Hosts catalog and offers a Groups/Hosts picker;
+- add transfers, progress, cancellation, and mutations around the same service.
+
+Keychain and automatic saved-password entry are a separate deferred track, not a dependency for starting Files with native prompts or agent/key authentication.
 
 ### Phase 4: tunnels
 
@@ -465,15 +573,25 @@ The storage layer needs schema versioning from its first migration. It should su
 - timeout/Keepalive controls;
 - ProxyJump display and hop-specific errors.
 
+### Phase 5a: Runtime and Project workspaces
+
+- inspect local and remote listeners through the Hosts catalog;
+- add confirmed process termination with platform-specific diagnostics;
+- define local Projects with base paths and named commands;
+- supervise project process groups and capture complete output;
+- keep Project execution separate from Snippet command records.
+
 ### Phase 6: reassess embedded sessions
 
 Only add embedded PTY sessions after measuring a real need for multiple live terminals, tab switching, or command injection into an active session. Until then, native OpenSSH gives better compatibility for less code.
 
 ## 11. Architectural decisions
 
+Development follows integrated vertical slices, not strict release acceptance order. The carry-over backlog in `ROADMAP.md` retains incomplete and unverified work. Safety invariants remain mandatory; starting the next milestone does not claim the previous release is accepted.
+
 1. OpenSSH is the default interactive SSH and Tunnel backend.
-2. SFTP is a separate library-backed capability with shared host and credential models.
-3. The TUI is a state projection, not a process manager or credential store.
+2. SFTP reuses the OpenSSH alias; the embedded adapter currently requires a trusted host key and key/agent auth, with credential-policy unification still open.
+3. The TUI projects application state; dedicated supervisors own Tunnel and Project processes, and credentials use a separate store.
 4. Persistent tunnels are supervised independently of the interactive SSH handoff.
 5. Password support starts with safe prompts and Keychain storage; automatic native SSH password injection is a separately validated feature.
 6. Reconnect, Keepalive, and timeout are separate policies.

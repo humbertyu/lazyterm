@@ -1,72 +1,125 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+};
+use unicode_width::UnicodeWidthChar;
+
+use crate::{
+    app::{
+        App, ConnectionDialog, FileDialog, FilePane, FilesState, HostPasswordPurpose,
+        HostPickerItem, LOCAL_BREADCRUMB_SEPARATOR, LocalEntryKind, NavSection, TransferStatus,
+        TunnelStatus, group_columns, host_browser_width,
+    },
+    sftp::SftpEntryKind,
 };
 
-use crate::app::{App, ConnectionDialog, NavSection};
+const BG: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Background);
+const PANEL: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Panel);
+const BORDER: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Border);
+const GREEN: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Accent);
+const TEXT: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Text);
+const MUTED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Muted);
+const DISABLED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Disabled);
+const SELECTED: crate::theme::ThemeColor = crate::theme::color(crate::theme::Role::Selection);
+const SELECTED_ROW: crate::theme::ThemeColor =
+    crate::theme::color(crate::theme::Role::SelectionStrong);
 
-const BG: Color = Color::Rgb(13, 16, 17);
-const PANEL: Color = Color::Rgb(18, 23, 23);
-const BORDER: Color = Color::Rgb(49, 65, 61);
-const GREEN: Color = Color::Rgb(133, 196, 159);
-const TEXT: Color = Color::Rgb(215, 228, 218);
-const MUTED: Color = Color::Rgb(107, 126, 116);
-const DISABLED: Color = Color::Rgb(76, 91, 82);
+fn runtime_origin_color(origin: crate::runtime::RuntimeOrigin) -> Color {
+    use crate::runtime::RuntimeOrigin;
+    match origin {
+        RuntimeOrigin::Project => GREEN.into(),
+        RuntimeOrigin::ExternalProject => Color::Rgb(103, 211, 211),
+        RuntimeOrigin::Tunnel => Color::Rgb(190, 145, 255),
+        RuntimeOrigin::Agent => Color::Rgb(239, 192, 101),
+        RuntimeOrigin::CommandLine => Color::Rgb(103, 211, 211),
+        RuntimeOrigin::Desktop => Color::Rgb(160, 171, 190),
+        RuntimeOrigin::Unknown => MUTED.into(),
+    }
+}
 
 pub fn render(frame: &mut Frame, app: &App) {
+    crate::theme::set_active(app.metadata.theme);
     frame.render_widget(
-        Block::default().style(Style::default().bg(BG)),
+        Block::default().style(Style::default().bg(BG.into())),
         frame.area(),
     );
-    let page = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+    let page = page_layout().split(frame.area());
 
     render_header(frame, page[0], app);
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(17), Constraint::Min(1)])
-        .split(page[1]);
-    render_navigation(frame, columns[0], app);
+    render_navigation(frame, page[1], app);
     match app.section {
-        NavSection::Hosts => render_hosts(frame, columns[1], app),
-        NavSection::Files => {
-            let description = app.selected_host().map_or_else(
-                || "Select a host in Hosts to choose the remote file context.".to_string(),
-                |host| format!("SFTP browser for {} will appear here.", host.alias),
-            );
-            render_placeholder(frame, columns[1], "Files", "SFTP workspace", &description);
-        }
-        NavSection::Tunnels => {
-            let description = app.selected_host().map_or_else(
-                || "Create local, remote, or SOCKS port forwards.".to_string(),
-                |host| format!("Tunnel manager for {} will appear here.", host.alias),
-            );
-            render_placeholder(
-                frame,
-                columns[1],
-                "Tunnels",
-                "Port forwarding",
-                &description,
-            );
-        }
-        NavSection::Snippets => render_placeholder(
-            frame,
-            columns[1],
-            "Snippets",
-            "Command library",
-            "Save commands and run them against one or more hosts.",
-        ),
+        NavSection::Hosts => render_hosts(frame, page[2], app),
+        NavSection::Files => render_files(frame, page[2], app),
+        NavSection::Tunnels => render_tunnels(frame, page[2], app),
+        NavSection::Snippets => render_snippets(frame, page[2], app),
+        NavSection::Runtime => render_runtime(frame, app),
+        NavSection::Projects => render_projects(frame, page[2], app),
+        NavSection::Credentials => crate::credential_ui::render_page(frame, page[2], app),
+        NavSection::Settings => render_settings(frame, page[2], app),
     }
-    render_footer(frame, page[2], app);
+    render_toast(frame, app);
+    render_footer(frame, page[3], app);
+    render_dialogs(frame, app);
+}
+
+fn page_layout() -> Layout {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(8),
+            Constraint::Length(2),
+        ])
+}
+
+fn render_toast(frame: &mut Frame, app: &App) {
+    let Some(toast) = app
+        .toast
+        .as_ref()
+        .filter(|toast| toast.expires_at > std::time::Instant::now())
+    else {
+        return;
+    };
+    let screen = frame.area();
+    let max_width = screen.width.saturating_sub(2).min(58);
+    if max_width < 12 {
+        return;
+    }
+    let text_width = toast
+        .message
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0) as u16)
+        .sum::<u16>();
+    let width = text_width.saturating_add(6).min(max_width).max(12);
+    let height = 4.min(screen.height.saturating_sub(4));
+    if height < 3 {
+        return;
+    }
+    let area = Rect {
+        x: screen.x + screen.width - width - 1,
+        y: screen.y + 3,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  • ", Style::default().fg(MUTED.into())),
+            Span::styled(toast.message.as_str(), Style::default().fg(TEXT.into())),
+            Span::raw("  "),
+        ]))
+        .style(Style::default().bg(PANEL.into()))
+        .block(Block::default().style(Style::default().bg(PANEL.into())))
+        .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_dialogs(frame: &mut Frame, app: &App) {
     if app.searching {
         render_search(frame, app);
     }
@@ -75,7 +128,1995 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if let Some(dialog) = &app.host_dialog {
         render_host_dialog(frame, dialog);
+        if dialog.tag_picker_open {
+            render_host_tag_picker(frame, app, dialog);
+        }
+        if dialog.proxy_jump_picker_open {
+            render_proxy_jump_picker(frame, app, dialog);
+        }
     }
+    if let Some(dialog) = &app.host_group_dialog {
+        render_host_group_dialog(frame, dialog);
+    }
+    if let Some(dialog) = &app.tunnel_dialog {
+        render_tunnel_dialog(frame, dialog);
+    }
+    if app.tunnel_host_picker_open {
+        render_tunnel_host_picker(frame, app);
+    }
+    if app.snippet_host_picker_open {
+        render_snippet_host_picker(frame, app);
+    }
+    if let Some(dialog) = &app.snippet_dialog {
+        render_snippet_dialog(frame, dialog, app);
+    }
+    if let Some(dialog) = &app.package_dialog {
+        render_package_dialog(frame, dialog);
+    }
+    if let Some(dialog) = &app.credential_export_dialog {
+        render_credential_export_dialog(frame, dialog);
+    }
+    if let Some(dialog) = &app.credential_import_dialog {
+        render_credential_import_dialog(frame, dialog);
+    }
+    if app.settings_picker.is_some() {
+        render_settings_picker(frame, app);
+    }
+    if let Some(dialog) = &app.sync_dialog {
+        render_sync_settings_dialog(frame, dialog);
+    }
+    if let Some(prepared) = &app.sync_conflicts {
+        render_sync_conflicts(frame, prepared);
+    }
+    if let Some(kind) = app.import_confirmation {
+        render_import_confirmation(frame, app, kind);
+    }
+    if let Some(pending) = &app.snippet_confirmation {
+        render_snippet_confirmation(frame, pending);
+    }
+    if let Some(target) = &app.snippet_delete_confirmation {
+        render_snippet_delete_confirmation(frame, target);
+    }
+    if app.runtime_host_picker_open {
+        render_runtime_host_picker(frame, app);
+    }
+    if let Some(entry) = &app.runtime_kill_confirmation {
+        render_runtime_kill_confirmation(frame, entry, &app.runtime_target, false);
+    }
+    if let Some(entry) = &app.runtime_force_kill_confirmation {
+        render_runtime_kill_confirmation(frame, entry, &app.runtime_target, true);
+    }
+    if let Some((alias, tags)) = &app.tags_dialog {
+        let area = centered_rect(68, 7, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                input_line("Tags", tags, true, false),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Comma-separated tags   Enter save   Esc cancel",
+                    Style::default().fg(MUTED.into()),
+                )),
+            ])
+            .style(Style::default().fg(TEXT.into()))
+            .block(panel(&format!(" TAGS / {alias} ")))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+    }
+    if let Some(dialog) = &app.file_dialog {
+        render_file_dialog(frame, dialog);
+    }
+    render_workspace_dialog(frame, app);
+    crate::credential_ui::render(frame, app);
+    if let Some(dialog) = &app.host_password_dialog {
+        render_host_password_dialog(frame, dialog);
+    }
+    if let Some(dialog) = &app.host_action_dialog {
+        render_host_action_dialog(frame, dialog);
+    }
+}
+
+fn render_host_action_dialog(frame: &mut Frame, dialog: &crate::app::HostActionDialog) {
+    let area = centered_rect(72, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let title = format!(" {} ", dialog.title);
+    let text = Paragraph::new(vec![Line::from(dialog.message.as_str())])
+        .style(Style::default().fg(TEXT.into()))
+        .block(action_panel(&title, "Enter/Esc close", BORDER.into()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(text, area);
+}
+
+fn project_status(app: &App, key: crate::projects::TaskKey) -> (String, Color) {
+    use crate::projects::TaskStatus;
+    if !app.project_service.active(key) {
+        let external = app.external_project_runs(key);
+        if let Some(run) = external.first() {
+            return (
+                format!(
+                    "{}{}",
+                    run.label(),
+                    if external.len() > 1 {
+                        format!(" / {} instances", external.len())
+                    } else {
+                        String::new()
+                    }
+                ),
+                GREEN.into(),
+            );
+        }
+        if app.workspace.monitor.matches(&app.metadata.projects)
+            && app.workspace.monitor.error.is_some()
+        {
+            return ("unknown / inspection failed".into(), Color::Yellow);
+        }
+        if !app.workspace.monitor.matches(&app.metadata.projects) {
+            return ("checking...".into(), MUTED.into());
+        }
+        return (
+            if app.project_service.tasks.contains_key(&key) {
+                "stopped"
+            } else {
+                "not started"
+            }
+            .into(),
+            MUTED.into(),
+        );
+    }
+    app.project_service.tasks.get(&key).map_or_else(
+        || ("not started".into(), MUTED.into()),
+        |task| {
+            let color = match task.status {
+                TaskStatus::Running => GREEN.into(),
+                TaskStatus::Stopping => Color::Yellow,
+                TaskStatus::Exited(0) | TaskStatus::Stopped => MUTED.into(),
+                TaskStatus::Exited(_) | TaskStatus::Failed(_) => Color::Red,
+            };
+            (
+                format!(
+                    "{}{}",
+                    task.status.label(),
+                    if task.lifecycle == crate::projects::ProjectLifecycle::Persistent {
+                        " / background"
+                    } else {
+                        ""
+                    }
+                ),
+                color,
+            )
+        },
+    )
+}
+
+fn project_last_result(app: &App, key: crate::projects::TaskKey) -> Option<String> {
+    app.project_service
+        .tasks
+        .get(&key)
+        .filter(|task| !task.active())
+        .map(|task| task.status.label())
+}
+
+fn render_projects(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(project) = app.selected_project() else {
+        frame.render_widget(
+            Paragraph::new(crate::i18n::text(app.metadata.language, "No projects."))
+                .style(Style::default().fg(MUTED.into()))
+                .block(panel_l(app, "PROJECTS")),
+            area,
+        );
+        return;
+    };
+    if app.workspace.output_open {
+        let Some(command) = app.selected_project_command() else {
+            return;
+        };
+        let key = (project.id, command.id);
+        let (status, color) = project_status(app, key);
+        let header_height = if area.height < 12 { 2 } else { 4 };
+        let sections =
+            Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).split(area);
+        let directory = crate::projects::working_directory(project, command).map_or_else(
+            |_| project.base_path.display().to_string(),
+            |path| path.display().to_string(),
+        );
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!(" {} / {}   ", project.name, command.name),
+                    Style::default()
+                        .fg(TEXT.into())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(status, Style::default().fg(color))),
+                Line::from(Span::styled(
+                    format!(" {directory}"),
+                    Style::default().fg(MUTED.into()),
+                )),
+                Line::from(Span::styled(
+                    project_last_result(app, key)
+                        .map_or_else(String::new, |result| format!(" Last managed run: {result}")),
+                    Style::default().fg(MUTED.into()),
+                )),
+            ]),
+            sections[0],
+        );
+        let task = app.project_service.tasks.get(&key);
+        let external = !app.external_project_runs(key).is_empty();
+        let block = panel(if external {
+            " OUTPUT / LAST MANAGED RUN "
+        } else if app.workspace.output_scroll.is_some() {
+            " OUTPUT / SCROLLED "
+        } else {
+            " OUTPUT / LIVE "
+        });
+        let inner = block.inner(sections[1]);
+        frame.render_widget(block, sections[1]);
+        let text = task.map_or(
+            if external {
+                "No captured output for the external process."
+            } else {
+                "No output."
+            },
+            |task| task.output.as_str(),
+        );
+        let paragraph = Paragraph::new(text)
+            .style(Style::default().fg(TEXT.into()))
+            .wrap(Wrap { trim: false });
+        let end = paragraph
+            .line_count(inner.width)
+            .saturating_sub(usize::from(inner.height));
+        let scroll = app.workspace.output_scroll.unwrap_or(end).min(end);
+        frame.render_widget(
+            paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
+        return;
+    }
+
+    let wide = area.width >= 75;
+    let columns = Layout::horizontal([
+        Constraint::Percentage(if wide { 40 } else { 100 }),
+        Constraint::Percentage(if wide { 60 } else { 0 }),
+    ])
+    .split(area);
+    let title = if app.workspace.project_open {
+        format!(
+            " {} / {} ",
+            project.name,
+            if app.workspace.flat {
+                "All items"
+            } else {
+                "Workspace"
+            }
+        )
+    } else {
+        " PROJECTS ".into()
+    };
+    let mut state = ListState::default();
+    let rows: Vec<ListItem> = if app.workspace.project_open {
+        state.select(Some(app.workspace.selected_item));
+        app.project_items()
+            .iter()
+            .map(|item| {
+                let command = match item {
+                    crate::project_app::WorkspaceItem::Links => {
+                        return ListItem::new(Line::from(Span::styled(
+                            format!(
+                                "{} Web links  {}",
+                                if app.project_links_collapsed() {
+                                    "▸"
+                                } else {
+                                    "▾"
+                                },
+                                project.links.len()
+                            ),
+                            Style::default()
+                                .fg(GREEN.into())
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    crate::project_app::WorkspaceItem::Link(index) => {
+                        let link = &project.links[*index];
+                        let indent = if app.workspace.flat { "" } else { "  " };
+                        return ListItem::new(vec![
+                            Line::from(Span::styled(
+                                format!("{indent}{}", link.name),
+                                Style::default().fg(TEXT.into()),
+                            )),
+                            Line::from(vec![
+                                Span::styled(format!("{indent}  "), Style::default()),
+                                Span::styled(link.url.as_str(), Style::default().fg(MUTED.into())),
+                            ]),
+                        ]);
+                    }
+                    crate::project_app::WorkspaceItem::Group(group) => {
+                        let commands = project
+                            .commands
+                            .iter()
+                            .filter(|command| command.group.as_ref() == Some(group))
+                            .collect::<Vec<_>>();
+                        let running = commands
+                            .iter()
+                            .filter(|command| app.project_is_running((project.id, command.id)))
+                            .count();
+                        return ListItem::new(Line::from(Span::styled(
+                            format!(
+                                "{} {group}  {} / {running} active",
+                                if app.project_group_collapsed(group) {
+                                    "▸"
+                                } else {
+                                    "▾"
+                                },
+                                commands.len()
+                            ),
+                            Style::default()
+                                .fg(GREEN.into())
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    crate::project_app::WorkspaceItem::Command(index) => &project.commands[*index],
+                };
+                let indent = if !app.workspace.flat && command.group.is_some() {
+                    "  "
+                } else {
+                    ""
+                };
+                let (status, color) = project_status(app, (project.id, command.id));
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        format!("{indent}{}", command.name),
+                        Style::default().fg(TEXT.into()),
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "{indent}  {} / {}",
+                            command.kind.label(),
+                            crate::projects::execution_target(project, command).label()
+                        ),
+                        Style::default().fg(MUTED.into()),
+                    )),
+                    Line::from(Span::styled(
+                        format!("{indent}  {status}"),
+                        Style::default().fg(color),
+                    )),
+                ];
+                if let Some(result) = project_last_result(app, (project.id, command.id)) {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}  last run: {result}"),
+                        Style::default().fg(MUTED.into()),
+                    )));
+                }
+                if !wide {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}  {}", command.command),
+                        Style::default().fg(MUTED.into()),
+                    )));
+                }
+                ListItem::new(lines)
+            })
+            .collect()
+    } else {
+        state.select(Some(app.workspace.selected_project));
+        app.metadata
+            .projects
+            .iter()
+            .map(|project| {
+                let running = project
+                    .commands
+                    .iter()
+                    .filter(|command| app.project_is_running((project.id, command.id)))
+                    .count();
+                ListItem::new(vec![
+                    Line::from(Span::styled(
+                        project.name.as_str(),
+                        Style::default().fg(TEXT.into()),
+                    )),
+                    Line::from(Span::styled(
+                        format!("  {}", project.base_path.display()),
+                        Style::default().fg(MUTED.into()),
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "  {} commands / {} links / {running} active",
+                            project.commands.len(),
+                            project.links.len()
+                        ),
+                        Style::default().fg(MUTED.into()),
+                    )),
+                ])
+            })
+            .collect()
+    };
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No commands or links.")
+                .style(Style::default().fg(MUTED.into()))
+                .block(panel(&title)),
+            columns[0],
+        );
+    } else {
+        frame.render_stateful_widget(
+            List::new(rows)
+                .block(panel(&title))
+                .highlight_symbol("> ")
+                .highlight_style(
+                    Style::default()
+                        .bg(SELECTED.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            columns[0],
+            &mut state,
+        );
+    }
+    if !wide {
+        return;
+    }
+    let mut lines = vec![
+        detail_line("Project", &project.name),
+        detail_line("Base directory", &project.base_path.display().to_string()),
+        detail_line("Default target", &project.target.label()),
+    ];
+    if app.project_links_header_selected() {
+        lines.push(detail_line("Group", "Web links"));
+        lines.push(detail_line("Links", &project.links.len().to_string()));
+        for link in &project.links {
+            lines.push(detail_line(&link.name, &link.url));
+        }
+    } else if let Some(link) = app.selected_project_link() {
+        lines.extend([
+            detail_line("Link", &link.name),
+            detail_line("URL", &link.url),
+            detail_line(
+                "Username",
+                if link.username.is_empty() {
+                    "(none)"
+                } else {
+                    &link.username
+                },
+            ),
+            detail_line(
+                "Password",
+                if link.password_ref.is_some() {
+                    "******** (keychain)"
+                } else if link.password.is_some() {
+                    "******** (config file)"
+                } else {
+                    "(none)"
+                },
+            ),
+        ]);
+    } else if app.workspace.project_open
+        && let Some(command) = app.selected_project_command()
+    {
+        let key = (project.id, command.id);
+        lines.extend([
+            detail_line("Command name", &command.name),
+            detail_line("Group", command.group.as_deref().unwrap_or("Ungrouped")),
+            detail_line("Type", command.kind.label()),
+            detail_line("On exit", command.lifecycle.label()),
+            detail_line(
+                "Target",
+                &crate::projects::execution_target(project, command).label(),
+            ),
+            detail_line("Command", &command.command),
+            detail_line(
+                "Working directory",
+                &command.working_directory.as_ref().map_or_else(
+                    || "(project base)".into(),
+                    |path| path.display().to_string(),
+                ),
+            ),
+            detail_line("Status", &project_status(app, key).0),
+        ]);
+        if let Some(result) = project_last_result(app, key) {
+            lines.push(detail_line("Last managed run", &result));
+        }
+        for run in app.external_project_runs(key) {
+            lines.extend([
+                detail_line("Ownership", "External"),
+                detail_line("External PID", &run.root.pid.to_string()),
+                detail_line("External command", &run.root.command),
+                detail_line("External directory", &run.directory.display().to_string()),
+                detail_line(
+                    "Ports",
+                    &run.ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ]);
+        }
+        if let Some(error) = &app.workspace.monitor.error {
+            lines.push(detail_line("Inspection", error));
+        }
+        if let Some(task) = app.project_service.tasks.get(&key) {
+            lines.extend([
+                detail_line("Process group", &task.owner.process_group.to_string()),
+                detail_line("Executed command", &task.command),
+                detail_line("Executed directory", &task.directory.display().to_string()),
+                detail_line("Stdout log", &task.stdout_log.display().to_string()),
+                detail_line("Stderr log", &task.stderr_log.display().to_string()),
+            ]);
+        }
+    } else if app.workspace.project_open
+        && let Some(crate::project_app::WorkspaceItem::Group(group)) =
+            app.project_items().get(app.workspace.selected_item)
+    {
+        let commands = project
+            .commands
+            .iter()
+            .filter(|command| command.group.as_ref() == Some(group))
+            .collect::<Vec<_>>();
+        lines.push(detail_line("Group", group));
+        lines.push(detail_line("Commands", &commands.len().to_string()));
+        lines.push(detail_line(
+            "Services",
+            &commands
+                .iter()
+                .filter(|command| command.kind == crate::projects::CommandKind::Service)
+                .count()
+                .to_string(),
+        ));
+    } else {
+        lines.push(detail_line("Commands", &project.commands.len().to_string()));
+        lines.push(detail_line("Web links", &project.links.len().to_string()));
+        for link in &project.links {
+            lines.push(detail_line(&link.name, &link.url));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_l(app, "DETAILS"))
+            .wrap(Wrap { trim: false }),
+        columns[1],
+    );
+}
+
+pub(crate) fn project_output_end(app: &App) -> usize {
+    let page = page_layout().split(Rect::new(0, 0, app.viewport_width, app.viewport_height));
+    let header_height = if page[2].height < 12 { 2 } else { 4 };
+    let sections =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).split(page[2]);
+    let inner = panel_l(app, "OUTPUT").inner(sections[1]);
+    app.selected_project_key()
+        .and_then(|key| app.project_service.tasks.get(&key))
+        .map_or(0, |task| {
+            Paragraph::new(task.output.as_str())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+                .saturating_sub(usize::from(inner.height))
+        })
+}
+
+fn render_workspace_dialog(frame: &mut Frame, app: &App) {
+    if let Some(confirmation) = &app.workspace.confirmation {
+        let area = centered_rect(86, 18, frame.area());
+        frame.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::from(
+                if confirmation.action == crate::project_app::ProjectAction::Restart {
+                    "Stop external commands and restart under LazyTerm?"
+                } else {
+                    "Stop external commands and their child processes?"
+                },
+            ),
+            Line::from(""),
+        ];
+        for run in &confirmation.runs {
+            lines.push(Line::from(format!(
+                "{} / {} / PID {}",
+                run.project_name, run.command_name, run.root.pid
+            )));
+            lines.push(Line::from(run.root.command.clone()));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(action_panel(
+                    " EXTERNAL PROCESS ",
+                    "y/Enter yes  n/Esc no",
+                    BORDER.into(),
+                ))
+                .style(Style::default().fg(TEXT.into()))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    } else if let Some(form) = &app.workspace.form {
+        let area = centered_rect(86, (form.fields.len() * 2 + 5) as u16, frame.area());
+        frame.render_widget(Clear, area);
+        let title = format!(
+            " {} {} ",
+            if form.editing_id.is_some() || form.original_group.is_some() {
+                "EDIT"
+            } else {
+                "NEW"
+            },
+            if form.group_form {
+                "GROUP"
+            } else if form.link_form {
+                "WEB LINK"
+            } else if form.project_id.is_some() {
+                "COMMAND"
+            } else {
+                "PROJECT"
+            }
+        );
+        let choice_selected = form.is_choice(form.selected);
+        let block = form_panel(
+            &title,
+            if form.link_form && form.selected == 5 {
+                "Tab / ↑↓ field  Space toggle  Enter save  Esc cancel"
+            } else if choice_selected {
+                "Tab / ↑↓ field  ←→/Space choice  Enter save  Esc cancel"
+            } else {
+                "Tab / ↑↓ field  Enter save  Esc cancel"
+            },
+            area,
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let field_height = if usize::from(inner.height) >= form.fields.len() * 2 + 2 {
+            2
+        } else {
+            1
+        };
+        let visible_count = (usize::from(inner.height.saturating_sub(2)) / field_height)
+            .max(1)
+            .min(form.fields.len());
+        let start = form.selected.saturating_sub(visible_count - 1);
+        let mut fields = vec![Constraint::Length(field_height as u16); visible_count];
+        fields.push(Constraint::Min(1));
+        let rows = Layout::vertical(fields).split(inner);
+        for (row_index, (index, value)) in form
+            .fields
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_count)
+            .enumerate()
+        {
+            let active = index == form.selected;
+            let inner = rows[row_index];
+            let choice = form.is_choice(index);
+            let value = if form.link_form && index == 3 {
+                let display = if value.is_empty()
+                    && form.editing_id.is_some()
+                    && app
+                        .selected_project_link()
+                        .is_some_and(|link| link.password_ref.is_some() || link.password.is_some())
+                {
+                    "(saved; blank keeps it)"
+                } else {
+                    value.as_str()
+                };
+                display.to_string()
+            } else if choice {
+                format!("‹ {value} ›")
+            } else {
+                value.clone()
+            };
+            let line = if form.link_form && index == 5 {
+                checkbox_line(form.labels()[index], value == "Yes", active)
+            } else {
+                let masked = form.link_form && index == 3 && !form.fields[index].is_empty();
+                form_input_line(
+                    form.labels()[index],
+                    &value,
+                    active,
+                    masked,
+                    if choice || value != form.fields[index] {
+                        value.len()
+                    } else {
+                        form.editor.position(index, &value)
+                    },
+                    inner.width,
+                )
+            };
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().fg(TEXT.into())),
+                inner,
+            );
+        }
+        render_form_error(frame, inner, form.error.as_deref());
+    } else if let Some(target) = &app.workspace.delete {
+        let message = match target {
+            crate::project_app::WorkspaceDelete::Project { name, .. } => {
+                format!("Delete project {name} and its command definitions?")
+            }
+            crate::project_app::WorkspaceDelete::Command { name, .. } => {
+                format!("Delete command {name}?")
+            }
+            crate::project_app::WorkspaceDelete::Group { name, .. } => {
+                format!("Remove group {name}? Its commands will become ungrouped.")
+            }
+            crate::project_app::WorkspaceDelete::Link { name, .. } => {
+                format!("Delete web link {name}?")
+            }
+        };
+        let area = centered_rect(72, 7, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(message)
+                .block(action_panel(
+                    " DELETE ",
+                    "y/Enter yes  n/Esc no",
+                    BORDER.into(),
+                ))
+                .style(Style::default().fg(TEXT.into()))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+}
+
+fn render_tunnels(frame: &mut Frame, area: Rect, app: &App) {
+    let columns =
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
+    let list_block = Block::default()
+        .title(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "PORT FORWARDING")
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()));
+    let list_inner = list_block.inner(columns[0]);
+    frame.render_widget(list_block, columns[0]);
+
+    let mut rows = vec![ListItem::new(Line::from(Span::styled(
+        "  + New forwarding    a add",
+        Style::default()
+            .fg(GREEN.into())
+            .add_modifier(Modifier::BOLD),
+    )))];
+    rows.extend(app.metadata.tunnels.iter().map(|tunnel| {
+        let selected = app
+            .selected_tunnel_definition()
+            .is_some_and(|selected| selected.id == tunnel.id);
+        let status = app
+            .tunnel_statuses
+            .get(&tunnel.id)
+            .cloned()
+            .unwrap_or(TunnelStatus::Stopped);
+        let (status_label, status_color) = tunnel_status_display(&status);
+        let route = match tunnel.kind {
+            crate::metadata::TunnelKind::Dynamic => {
+                format!("{}:{}  SOCKS", tunnel.bind_address, tunnel.local_port)
+            }
+            _ => format!(
+                "{}:{}  ->  {}:{}",
+                tunnel.bind_address,
+                tunnel.local_port,
+                tunnel.remote_host.as_deref().unwrap_or("-"),
+                tunnel.remote_port.unwrap_or_default()
+            ),
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { " > " } else { "   " },
+                Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
+            ),
+            Span::styled(
+                format!("{} ", tunnel_kind_label(tunnel.kind)),
+                Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
+            ),
+            Span::styled(
+                format!("{status_label:<9}"),
+                Style::default().fg(status_color),
+            ),
+            Span::styled(
+                format!("{:<18}", tunnel.label),
+                Style::default()
+                    .fg(if selected { TEXT.into() } else { MUTED.into() })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(route, Style::default().fg(MUTED.into())),
+        ]))
+    }));
+    frame.render_widget(List::new(rows), list_inner);
+
+    let detail_block = Block::default()
+        .title(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "EDIT PORT FORWARDING")
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()));
+    let detail_inner = detail_block.inner(columns[1]);
+    frame.render_widget(detail_block, columns[1]);
+    let Some(tunnel) = app.selected_tunnel_definition() else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    crate::i18n::text(app.metadata.language, "No forwarding selected."),
+                    Style::default().fg(TEXT.into()),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press a to create a local forward.",
+                    Style::default().fg(MUTED.into()),
+                )),
+            ])
+            .wrap(Wrap { trim: true }),
+            detail_inner,
+        );
+        return;
+    };
+    let status = app
+        .tunnel_statuses
+        .get(&tunnel.id)
+        .cloned()
+        .unwrap_or(crate::app::TunnelStatus::Stopped);
+    let (status_label, status_color) = tunnel_status_display(&status);
+    let status_line = match &status {
+        TunnelStatus::Failed(message) => format!("Status                {status_label}: {message}"),
+        _ => format!("Status                {status_label}"),
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("●  {}", tunnel.label),
+            Style::default()
+                .fg(TEXT.into())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "SSH host             {}{}",
+            tunnel.host_alias,
+            if tunnel.custom_host { " (custom)" } else { "" }
+        )),
+        if let Some(proxy_jump) = app
+            .hosts
+            .hosts
+            .iter()
+            .find(|host| host.alias == tunnel.host_alias)
+            .and_then(|host| host.proxy_jump.as_deref())
+        {
+            Line::from(format!("ProxyJump            {proxy_jump}"))
+        } else {
+            Line::from("ProxyJump            none")
+        },
+        Line::from(format!(
+            "{}                 {}:{}",
+            if tunnel.kind == crate::metadata::TunnelKind::Remote {
+                "Remote bind"
+            } else {
+                "Local bind"
+            },
+            tunnel.bind_address,
+            tunnel.local_port
+        )),
+        if tunnel.kind == crate::metadata::TunnelKind::Dynamic {
+            Line::from("SOCKS destination    dynamic")
+        } else {
+            Line::from(format!(
+                "{}           {}:{}",
+                if tunnel.kind == crate::metadata::TunnelKind::Remote {
+                    "Local destination"
+                } else {
+                    "Destination"
+                },
+                tunnel.remote_host.as_deref().unwrap_or("-"),
+                tunnel.remote_port.unwrap_or_default()
+            ))
+        },
+        Line::from(format!(
+            "Mode                 {}",
+            tunnel_kind_label(tunnel.kind)
+        )),
+        Line::from(format!(
+            "Reconnect            {}",
+            if tunnel.auto_reconnect {
+                "enabled"
+            } else {
+                "manual"
+            }
+        )),
+        Line::from(format!(
+            "Timeout / KeepAlive  {}s / {}s",
+            tunnel.connect_timeout_secs, tunnel.keepalive_interval_secs
+        )),
+        Line::from(format!("Lifecycle             {:?}", tunnel.lifecycle)),
+        Line::from(Span::styled(status_line, Style::default().fg(status_color))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "s/Space start/stop   r restart   A auto-reconnect   e edit   d delete",
+            Style::default().fg(MUTED.into()),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }),
+        detail_inner,
+    );
+}
+
+pub(crate) struct RuntimeLayout {
+    pub local: Rect,
+    pub hosts: Rect,
+    pub target: Rect,
+    pub filters: Rect,
+    pub listeners: Rect,
+    pub details: Rect,
+}
+
+pub(crate) fn runtime_layout(viewport: Rect) -> RuntimeLayout {
+    let area = page_layout().split(viewport)[2];
+    let sections = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .split(area);
+    let targets = Layout::horizontal([
+        Constraint::Length(9),
+        Constraint::Length(11),
+        Constraint::Min(0),
+    ])
+    .split(sections[0]);
+    let columns = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(sections[2]);
+    RuntimeLayout {
+        local: targets[0],
+        hosts: targets[1],
+        target: targets[2],
+        filters: sections[1],
+        listeners: columns[0],
+        details: columns[1],
+    }
+}
+
+pub(crate) fn runtime_filter_areas(area: Rect, app: &App) -> Vec<Rect> {
+    let mut x = area.x;
+    let mut y = area.y;
+    crate::runtime::RuntimeFilter::ALL
+        .iter()
+        .map(|filter| {
+            let count = app
+                .runtime_entries
+                .iter()
+                .filter(|entry| filter.matches(entry))
+                .count();
+            let width = (filter.title().len() + count.to_string().len() + 3) as u16;
+            if x > area.x && x.saturating_add(width) > area.right() && y + 1 < area.bottom() {
+                x = area.x;
+                y += 1;
+            }
+            let rect = Rect::new(x, y, width.min(area.right().saturating_sub(x)), 1);
+            x = x.saturating_add(width + 1).min(area.right());
+            rect
+        })
+        .collect()
+}
+
+fn render_runtime(frame: &mut Frame, app: &App) {
+    let layout = runtime_layout(frame.area());
+    let active = Style::default()
+        .fg(GREEN.into())
+        .bg(SELECTED.into())
+        .add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(MUTED.into());
+    let local = app.runtime_target == crate::runtime::RuntimeTarget::Local;
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "Local")
+        ))
+        .style(if local { active } else { inactive }),
+        layout.local,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "Hosts ▾")
+        ))
+        .style(if local { inactive } else { active }),
+        layout.hosts,
+    );
+    frame.render_widget(
+        Paragraph::new(app.runtime_target.label()).style(Style::default().fg(TEXT.into())),
+        layout.target,
+    );
+    for (filter, area) in crate::runtime::RuntimeFilter::ALL
+        .iter()
+        .zip(runtime_filter_areas(layout.filters, app))
+    {
+        let count = app
+            .runtime_entries
+            .iter()
+            .filter(|entry| filter.matches(entry))
+            .count();
+        frame.render_widget(
+            Paragraph::new(format!(" {} {count} ", filter.title())).style(
+                if *filter == app.runtime_filter {
+                    active
+                } else {
+                    inactive
+                },
+            ),
+            area,
+        );
+    }
+    let entries = app.visible_runtime_entries();
+    let target = app.runtime_target.label();
+    let runtime_title = crate::i18n::text(app.metadata.language, "RUNTIME");
+    let title = if app.runtime_loading {
+        format!(" {runtime_title} / {target}  loading... ")
+    } else {
+        format!(" {runtime_title} / {target} ")
+    };
+    let block = panel(&title);
+    let inner = block.inner(layout.listeners);
+    frame.render_widget(block, layout.listeners);
+
+    if let Some(error) = &app.runtime_error {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    crate::i18n::text(app.metadata.language, "Port inspection failed"),
+                    Style::default()
+                        .fg(GREEN.into())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(error.as_str()),
+                Line::from("Press r to retry, l for Local, or s to choose a Host."),
+            ])
+            .style(Style::default().fg(TEXT.into()))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+    } else if entries.is_empty() && !app.runtime_loading {
+        frame.render_widget(
+            Paragraph::new(crate::i18n::text(
+                app.metadata.language,
+                "No listeners in this category.",
+            ))
+            .style(Style::default().fg(MUTED.into()))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+    } else {
+        let rows = entries.iter().enumerate().map(|(index, entry)| {
+            let selected = index == app.selected_runtime;
+            let pid = entry
+                .pid
+                .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+            let row_background = if selected {
+                SELECTED.into()
+            } else {
+                PANEL.into()
+            };
+            let row_style = Style::default().bg(row_background);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        if selected { ">> " } else { "   " },
+                        row_style.fg(if selected { GREEN.into() } else { MUTED.into() }),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{:<5} {:<5} {}  {}",
+                            entry.port,
+                            entry.protocol,
+                            entry.address,
+                            entry.kind.label()
+                        ),
+                        row_style
+                            .fg(if selected { GREEN.into() } else { TEXT.into() })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        format!("  {}", entry.origin.label()),
+                        row_style
+                            .fg(runtime_origin_color(entry.origin))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        "         {:<18} pid {:<8} {}",
+                        entry.process,
+                        pid,
+                        entry.project.as_ref().map_or_else(
+                            || entry.external_project.as_ref().map_or_else(
+                                || entry.user.clone(),
+                                |run| format!(
+                                    "{} / {} (external)",
+                                    run.project_name, run.command_name
+                                )
+                            ),
+                            |owner| format!("{} / {}", owner.project_name, owner.command_name)
+                        )
+                    ),
+                    row_style.fg(runtime_origin_color(entry.origin)),
+                )),
+            ])
+            .style(row_style)
+        });
+        let mut state =
+            ListState::default().with_offset(app.runtime_scroll_offset(frame.area().height));
+        if !entries.is_empty() {
+            state.select(Some(app.selected_runtime));
+        }
+        frame.render_stateful_widget(
+            List::new(rows).block(panel_l(app, "LISTENERS")),
+            inner,
+            &mut state,
+        );
+    }
+
+    let detail = app.selected_runtime_entry();
+    let detail_lines = detail.map_or_else(
+        || {
+            vec![Line::from(Span::styled(
+                "Select a listener to inspect it.",
+                Style::default().fg(MUTED.into()),
+            ))]
+        },
+        |entry| {
+            let mut lines = vec![
+                detail_line("Machine", &app.runtime_target.label()),
+                detail_line("Protocol", &entry.protocol),
+                detail_line("Address", &entry.address),
+                detail_line("Port", &entry.port.to_string()),
+                detail_line(
+                    "PID",
+                    &entry
+                        .pid
+                        .map_or_else(|| "Unavailable".to_string(), |pid| pid.to_string()),
+                ),
+                detail_line("Process", &entry.process),
+                detail_line(
+                    "User",
+                    if entry.user.is_empty() {
+                        "Unavailable"
+                    } else {
+                        &entry.user
+                    },
+                ),
+                detail_line("Class", entry.kind.label()),
+                Line::from(vec![
+                    Span::styled("Origin              ", Style::default().fg(MUTED.into())),
+                    Span::styled(
+                        entry.origin.label(),
+                        Style::default().fg(runtime_origin_color(entry.origin)),
+                    ),
+                ]),
+                detail_line(
+                    "Working dir",
+                    entry.working_directory.as_deref().unwrap_or("Unavailable"),
+                ),
+                detail_line("Command", &entry.command),
+                detail_line("Evidence", &entry.origin_reason),
+            ];
+            if let Some(owner) = &entry.project {
+                lines.push(detail_line("Project", &owner.project_name));
+                lines.push(detail_line("Project command", &owner.command_name));
+            }
+            if let Some(run) = &entry.external_project {
+                lines.push(detail_line("Project", &run.project_name));
+                lines.push(detail_line("Project command", &run.command_name));
+                lines.push(detail_line("Ownership", "External"));
+            }
+            lines
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(detail_lines)
+            .block(panel_l(app, "PROCESS"))
+            .wrap(Wrap { trim: false }),
+        layout.details,
+    );
+}
+
+fn render_runtime_host_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(76, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let title = app.runtime_host_picker_group.as_ref().map_or_else(
+        || " SELECT RUNTIME HOST ".to_string(),
+        |group| format!(" SELECT HOST / {} ", group.title()),
+    );
+    let items = app.runtime_host_picker_items_for_ui();
+    let rows = items.iter().map(|item| match item {
+        crate::app::HostPickerItem::Group(group) => {
+            ListItem::new(format!("> {}", group.title())).style(Style::default().fg(GREEN.into()))
+        }
+        crate::app::HostPickerItem::Host(alias) => {
+            ListItem::new(format!("  {alias}")).style(Style::default().fg(TEXT.into()))
+        }
+    });
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(app.runtime_host_picker_selection.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(rows)
+            .block(panel(&title))
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(TEXT.into())
+                    .bg(SELECTED_ROW.into())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        area,
+        &mut state,
+    );
+}
+
+fn render_runtime_kill_confirmation(
+    frame: &mut Frame,
+    entry: &crate::runtime::RuntimeEntry,
+    target: &crate::runtime::RuntimeTarget,
+    force: bool,
+) {
+    let area = centered_rect(76, 12, frame.area());
+    frame.render_widget(Clear, area);
+    let pid = entry
+        .pid
+        .map_or_else(|| "?".to_string(), |pid| pid.to_string());
+    let block = action_panel(
+        if force {
+            " FORCE KILL PROCESS "
+        } else {
+            " TERMINATE PROCESS "
+        },
+        "y/Enter yes  n/Esc no",
+        Color::Rgb(221, 132, 112),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                match target {
+                    crate::runtime::RuntimeTarget::Local => "Machine: Local".to_string(),
+                    crate::runtime::RuntimeTarget::Host(alias) => {
+                        format!("Machine: Host / {alias}")
+                    }
+                },
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(if force {
+                format!(
+                    "Send KILL to {} (PID {pid}) listening on {}:{}?",
+                    entry.process, entry.address, entry.port
+                )
+            } else {
+                entry.project.as_ref().map_or_else(
+                    || {
+                        if let Some(run) = &entry.external_project {
+                            return format!(
+                                "Stop external {} / {} (PID {}) and its child processes?",
+                                run.project_name, run.command_name, run.root.pid
+                            );
+                        }
+                        format!(
+                            "Send TERM to {} (PID {pid}) listening on {}:{}?",
+                            entry.process, entry.address, entry.port
+                        )
+                    },
+                    |owner| {
+                        format!(
+                            "Stop {} / {} and all its child processes?",
+                            owner.project_name, owner.command_name
+                        )
+                    },
+                )
+            }),
+        ])
+        .style(Style::default().fg(TEXT.into()))
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn tunnel_status_display(status: &TunnelStatus) -> (&'static str, Color) {
+    match status {
+        TunnelStatus::Stopped => ("Stopped", MUTED.into()),
+        TunnelStatus::Starting => ("Starting", Color::Yellow),
+        TunnelStatus::Running => ("Running", GREEN.into()),
+        TunnelStatus::Failed(_) => ("Failed", Color::Red),
+    }
+}
+
+fn tunnel_kind_label(kind: crate::metadata::TunnelKind) -> &'static str {
+    match kind {
+        crate::metadata::TunnelKind::Local => "L",
+        crate::metadata::TunnelKind::Remote => "R",
+        crate::metadata::TunnelKind::Dynamic => "D",
+    }
+}
+
+fn render_files(frame: &mut Frame, area: Rect, app: &App) {
+    let task_height = app.transfer_panel_height(area.height);
+    let sections = if task_height == 0 {
+        Layout::vertical([Constraint::Min(1)]).split(area)
+    } else {
+        Layout::vertical([Constraint::Min(6), Constraint::Length(task_height)]).split(area)
+    };
+    let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[0]);
+    render_local_files(frame, panes[0], app);
+    if app.host_picker_open {
+        render_host_picker(frame, panes[1], app);
+    } else {
+        render_remote_files(frame, panes[1], app);
+    }
+    if task_height > 0 {
+        render_transfer_tasks(frame, sections[1], app);
+    }
+}
+
+fn render_transfer_tasks(frame: &mut Frame, area: Rect, app: &App) {
+    let tasks = app.transfer_tasks.iter().rev().take(4).collect::<Vec<_>>();
+    let task_area = Block::default()
+        .title(format!(
+            " {} ",
+            crate::i18n::text(app.metadata.language, "TRANSFERS")
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()));
+    let inner = task_area.inner(area);
+    frame.render_widget(task_area, area);
+    for (index, task) in tasks.into_iter().enumerate() {
+        let direction = match task.direction {
+            crate::sftp::TransferDirection::Upload => "↑",
+            crate::sftp::TransferDirection::Download => "↓",
+        };
+        let ratio = if task.total > 0 {
+            (task.transferred as f64 / task.total as f64).clamp(0.0, 1.0)
+        } else if task.status == TransferStatus::Completed {
+            1.0
+        } else {
+            0.0
+        };
+        let label = match &task.status {
+            TransferStatus::Queued => format!("{direction} {}  queued", task.name),
+            TransferStatus::Running if task.total > 0 => {
+                format!("{direction} {}  {:.0}%", task.name, ratio * 100.0)
+            }
+            TransferStatus::Running => {
+                format!(
+                    "{direction} {}  {}",
+                    task.name,
+                    format_bytes(task.transferred)
+                )
+            }
+            TransferStatus::Completed => format!("{direction} {}  100% done", task.name),
+            TransferStatus::Cancelled => format!("{direction} {}  cancelled", task.name),
+            TransferStatus::Failed(message) => {
+                format!("{direction} {}  failed: {message}", task.name)
+            }
+        };
+        let selected = app
+            .selected_transfer_task_id()
+            .is_some_and(|task_id| task_id == task.id);
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(GREEN.into()))
+            .label(if selected {
+                format!("> {label}")
+            } else {
+                label
+            })
+            .ratio(if task.status == TransferStatus::Queued {
+                0.0
+            } else {
+                ratio
+            });
+        if let Some(row) = inner.rows().nth(index) {
+            frame.render_widget(gauge, row);
+        }
+    }
+}
+
+fn render_local_files(frame: &mut Frame, area: Rect, app: &App) {
+    let active = app.active_file_pane == FilePane::Local;
+    let title = if active {
+        format!(
+            " LOCAL  [FOCUS]  hidden:{} ",
+            if app.show_hidden_files { "on" } else { "off" }
+        )
+    } else {
+        format!(
+            " LOCAL  hidden:{} ",
+            if app.show_hidden_files { "on" } else { "off" }
+        )
+    };
+    let block = file_panel(&title, active);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let filter_visible = app.file_filter_visible(FilePane::Local);
+    let filter = app.file_filter(FilePane::Local);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(filter_visible)),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+    let breadcrumbs = app.local_breadcrumb_parts(rows[0].width);
+    let mut path_line = Vec::new();
+    for (index, breadcrumb) in breadcrumbs.iter().enumerate() {
+        if index > 0 {
+            path_line.push(Span::styled(
+                LOCAL_BREADCRUMB_SEPARATOR,
+                Style::default().fg(MUTED.into()),
+            ));
+        }
+        path_line.push(Span::styled(
+            breadcrumb.label.as_str(),
+            Style::default()
+                .fg(if active {
+                    if index + 1 == breadcrumbs.len() {
+                        TEXT.into()
+                    } else {
+                        GREEN.into()
+                    }
+                } else {
+                    MUTED.into()
+                })
+                .add_modifier(if index + 1 == breadcrumbs.len() {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(path_line))
+            .style(Style::default().fg(TEXT.into()))
+            .scroll((0, 0)),
+        rows[0],
+    );
+
+    if filter_visible {
+        frame.render_widget(
+            Paragraph::new(input_line(
+                "Filter",
+                filter,
+                app.file_filtering && active,
+                false,
+            ))
+            .style(Style::default().fg(if active {
+                if filter.is_empty() {
+                    MUTED.into()
+                } else {
+                    GREEN.into()
+                }
+            } else {
+                DISABLED.into()
+            })),
+            rows[1],
+        );
+    }
+
+    if let Some(error) = &app.local_files.error {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Could not read this directory.",
+                    Style::default().fg(if active { TEXT.into() } else { MUTED.into() }),
+                )),
+                Line::from(Span::styled(
+                    error.as_str(),
+                    Style::default().fg(MUTED.into()),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press r to retry.",
+                    Style::default().fg(GREEN.into()),
+                )),
+            ])
+            .wrap(Wrap { trim: true }),
+            rows[2],
+        );
+        return;
+    }
+
+    let visible_entries = app.visible_local_entries();
+    let items = visible_entries.iter().map(|entry| {
+        let (name, kind) = match entry.kind {
+            LocalEntryKind::Parent => ("..".to_string(), "parent"),
+            LocalEntryKind::Directory => (format!("{}/", entry.name), "folder"),
+            LocalEntryKind::File => (entry.name.clone(), "file"),
+            LocalEntryKind::Other => (entry.name.clone(), "other"),
+        };
+        let size = entry
+            .size
+            .map_or_else(String::new, |size| format!("  {}", format_bytes(size)));
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("  {name}"),
+                Style::default().fg(if active && entry.kind == LocalEntryKind::Directory {
+                    GREEN.into()
+                } else if active {
+                    TEXT.into()
+                } else {
+                    MUTED.into()
+                }),
+            ),
+            Span::styled(
+                format!("  {kind}{size}"),
+                Style::default().fg(if active {
+                    MUTED.into()
+                } else {
+                    DISABLED.into()
+                }),
+            ),
+        ]))
+    });
+    let mut state = ListState::default();
+    if !visible_entries.is_empty() {
+        state.select(Some(
+            app.local_files.selected.min(visible_entries.len() - 1),
+        ));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("> ")
+            .highlight_style(file_selection_style(active)),
+        rows[2],
+        &mut state,
+    );
+    if visible_entries.is_empty() && !filter.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching local files or directories.")
+                .style(Style::default().fg(MUTED.into())),
+            rows[2],
+        );
+    }
+}
+
+fn render_remote_files(frame: &mut Frame, area: Rect, app: &App) {
+    let active = app.active_file_pane == FilePane::Remote;
+    let Some(host) = app.context_host() else {
+        let block = file_panel(" REMOTE  SELECT HOST ", active);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let content = Layout::vertical([
+            Constraint::Percentage(30),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+        frame.render_widget(
+            Paragraph::new("[ SFTP ]")
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(if active { GREEN.into() } else { MUTED.into() })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            content[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Connect to host")
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(TEXT.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            content[1],
+        );
+        frame.render_widget(
+            Paragraph::new("Choose a saved SSH host to manage its files.")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED.into()))
+                .wrap(Wrap { trim: true }),
+            content[2],
+        );
+        let select_label = if area.width < 36 {
+            "[Enter] Select host"
+        } else {
+            "[Enter / s]  Select host"
+        };
+        frame.render_widget(
+            Paragraph::new(select_label)
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(if active { GREEN.into() } else { MUTED.into() })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            content[3],
+        );
+        return;
+    };
+
+    match &app.files {
+        FilesState::Idle => {
+            let title = format!(" REMOTE  {}  ~ ", host.alias);
+            let block = file_panel(&title, active);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Remote host selected.",
+                        Style::default()
+                            .fg(if active { TEXT.into() } else { MUTED.into() })
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "Press Enter to load its home directory.",
+                        Style::default().fg(if active {
+                            MUTED.into()
+                        } else {
+                            DISABLED.into()
+                        }),
+                    )),
+                ])
+                .alignment(Alignment::Center),
+                inner,
+            );
+        }
+        FilesState::Loading { host_alias, path } => {
+            render_remote_status(
+                frame,
+                area,
+                active,
+                &format!(
+                    " REMOTE  {}  {} ",
+                    host_alias,
+                    if path.is_empty() { "~" } else { path }
+                ),
+                "Connecting to remote directory...",
+                "Please wait",
+            );
+        }
+        FilesState::Failed {
+            host_alias,
+            path,
+            message,
+        } => {
+            render_remote_status(
+                frame,
+                area,
+                active,
+                &format!(
+                    " REMOTE  {}  {} ",
+                    host_alias,
+                    if path.is_empty() { "~" } else { path }
+                ),
+                message,
+                "Enter retry  s choose another host",
+            );
+        }
+        FilesState::Loaded(listing) => {
+            let title = format!(
+                " REMOTE  {}  {}  hidden:{} ",
+                listing.host_alias,
+                if listing.path.is_empty() {
+                    "~"
+                } else {
+                    listing.path.as_str()
+                },
+                if app.show_hidden_files { "on" } else { "off" }
+            );
+            let block = file_panel(&title, active);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let entries = app.visible_remote_entries();
+            let filter_visible = app.file_filter_visible(FilePane::Remote);
+            let filter = app.file_filter(FilePane::Remote);
+            let rows = Layout::vertical([
+                Constraint::Length(u16::from(filter_visible)),
+                Constraint::Min(1),
+            ])
+            .split(inner);
+            if filter_visible {
+                frame.render_widget(
+                    Paragraph::new(input_line(
+                        "Filter",
+                        filter,
+                        app.file_filtering && active,
+                        false,
+                    ))
+                    .style(Style::default().fg(if active {
+                        if filter.is_empty() {
+                            MUTED.into()
+                        } else {
+                            GREEN.into()
+                        }
+                    } else {
+                        DISABLED.into()
+                    })),
+                    rows[0],
+                );
+            }
+            if entries.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(if filter.is_empty() {
+                        "This directory is empty."
+                    } else {
+                        "No matching remote files or directories."
+                    })
+                    .style(Style::default().fg(MUTED.into())),
+                    rows[1],
+                );
+                return;
+            }
+            let items = entries.iter().map(|entry| {
+                let marker = if entry.kind == SftpEntryKind::Directory {
+                    "/"
+                } else {
+                    ""
+                };
+                let size = entry
+                    .size
+                    .map_or_else(String::new, |size| format!("  {}", format_bytes(size)));
+                let metadata = format_remote_metadata(entry);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("  {}{}", entry.name, marker),
+                        Style::default().fg(if active && entry.kind == SftpEntryKind::Directory {
+                            GREEN.into()
+                        } else if active {
+                            TEXT.into()
+                        } else {
+                            MUTED.into()
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{size}{metadata}"),
+                        Style::default().fg(if active {
+                            MUTED.into()
+                        } else {
+                            DISABLED.into()
+                        }),
+                    ),
+                ]))
+            });
+            let mut state = ListState::default();
+            state.select(Some(app.selected_file.min(entries.len() - 1)));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_symbol("> ")
+                    .highlight_style(file_selection_style(active)),
+                rows[1],
+                &mut state,
+            );
+        }
+    }
+}
+
+fn format_remote_metadata(entry: &crate::sftp::SftpEntry) -> String {
+    let mut parts = Vec::new();
+    if let Some(mode) = entry.permissions {
+        parts.push(format!("{mode:04o}"));
+    }
+    if let (Some(uid), Some(gid)) = (entry.uid, entry.gid) {
+        parts.push(format!("{uid}:{gid}"));
+    }
+    if let Some(modified) = entry.modified {
+        parts.push(format!("mtime:{}", format_unix_timestamp(modified)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join(" "))
+    }
+}
+
+fn format_unix_timestamp(timestamp: u64) -> String {
+    const SECONDS_PER_MINUTE: u64 = 60;
+    const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+    const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
+    let days = timestamp / SECONDS_PER_DAY;
+    let seconds = timestamp % SECONDS_PER_DAY;
+    let hour = seconds / SECONDS_PER_HOUR;
+    let minute = (seconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
+    let (year, month, day) = civil_date_from_days(days as i64);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+// Howard Hinnant's proleptic Gregorian calendar conversion, with Unix epoch
+// days as input.
+fn civil_date_from_days(days_since_epoch: i64) -> (i64, u8, u8) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year, month as u8, day as u8)
+}
+
+fn render_remote_status(
+    frame: &mut Frame,
+    area: Rect,
+    active: bool,
+    title: &str,
+    message: &str,
+    hint: &str,
+) {
+    let block = file_panel(title, active);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                message,
+                Style::default().fg(if active { TEXT.into() } else { MUTED.into() }),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                hint,
+                Style::default().fg(if active { GREEN.into() } else { MUTED.into() }),
+            )),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_host_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let title = app
+        .host_picker_group
+        .as_ref()
+        .map_or(" SELECT HOST  /  GROUPS + HOSTS ".to_string(), |group| {
+            format!(" SELECT HOST  /  {} ", group.title())
+        });
+    let block = file_panel(&title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let items = app.host_picker_items();
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No SSH hosts found in ~/.ssh/config.")
+                .style(Style::default().fg(MUTED.into())),
+            inner,
+        );
+        return;
+    }
+    let group_count = items
+        .iter()
+        .take_while(|item| matches!(item, HostPickerItem::Group(_)))
+        .count();
+    let mut list_items = Vec::with_capacity(items.len() + 2);
+    if group_count > 0 {
+        list_items.push(ListItem::new(Line::from(Span::styled(
+            " Groups",
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
+        ))));
+        list_items.extend(items[..group_count].iter().map(|item| {
+            let HostPickerItem::Group(group) = item else {
+                unreachable!("group section contains only groups")
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled("  [G] ", Style::default().fg(GREEN.into())),
+                Span::styled(
+                    group.title(),
+                    Style::default()
+                        .fg(TEXT.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} hosts", app.host_group_count(group)),
+                    Style::default().fg(MUTED.into()),
+                ),
+            ]))
+        }));
+    }
+    list_items.push(ListItem::new(Line::from(Span::styled(
+        if let Some(group) = &app.host_picker_group {
+            format!(" Hosts / {}", group.title())
+        } else {
+            " Hosts".to_string()
+        },
+        Style::default()
+            .fg(GREEN.into())
+            .add_modifier(Modifier::BOLD),
+    ))));
+    let host_items = &items[group_count..];
+    list_items.extend(host_items.iter().map(|item| {
+        let HostPickerItem::Host(alias) = item else {
+            unreachable!("host section contains only hosts")
+        };
+        let target = app
+            .hosts
+            .hosts
+            .iter()
+            .find(|host| host.alias == *alias)
+            .map_or(alias.as_str(), |host| host.destination());
+        ListItem::new(Line::from(vec![
+            Span::styled("  [H] ", Style::default().fg(MUTED.into())),
+            Span::styled(alias, Style::default().fg(TEXT.into())),
+            Span::styled(format!("  {target}"), Style::default().fg(MUTED.into())),
+        ]))
+    }));
+    let selected_row = if group_count > 0 && app.host_picker_group.is_none() {
+        if app.host_picker_selection < group_count {
+            app.host_picker_selection + 1
+        } else {
+            app.host_picker_selection + 2
+        }
+    } else {
+        app.host_picker_selection + 1
+    };
+    let mut state = ListState::default();
+    state.select(Some(selected_row.min(list_items.len().saturating_sub(1))));
+    frame.render_stateful_widget(
+        List::new(list_items)
+            .highlight_symbol("> ")
+            .highlight_style(file_selection_style(true)),
+        inner,
+        &mut state,
+    );
+}
+
+fn file_panel(title: &str, active: bool) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .title_style(Style::default().fg(if active { GREEN.into() } else { MUTED.into() }))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active { GREEN.into() } else { BORDER.into() }))
+        .style(Style::default().bg(PANEL.into()))
+}
+
+fn file_selection_style(active: bool) -> Style {
+    Style::default()
+        .fg(if active { TEXT.into() } else { MUTED.into() })
+        .bg(if active {
+            SELECTED_ROW.into()
+        } else {
+            PANEL.into()
+        })
+        .add_modifier(if active {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        })
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next_unit in UNITS {
+        value /= 1024.0;
+        unit = next_unit;
+        if value < 1024.0 || next_unit == "TB" {
+            break;
+        }
+    }
+    let formatted = if value >= 100.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    };
+    let formatted = formatted.strip_suffix(".0").unwrap_or(&formatted);
+    format!("{formatted} {unit}")
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -83,92 +2124,576 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let content = Line::from(vec![
         Span::styled(
             " LAZYTERM ",
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  remote workspace", Style::default().fg(MUTED)),
+        Span::styled(
+            format!(
+                "  {}",
+                crate::i18n::text(app.metadata.language, "remote workspace")
+            ),
+            Style::default().fg(MUTED.into()),
+        ),
         Span::styled(
             format!("    SSH CONFIG  {hosts}"),
-            Style::default().fg(TEXT),
+            Style::default().fg(TEXT.into()),
         ),
-        Span::styled("    ~/.ssh/config", Style::default().fg(MUTED)),
+        Span::styled("    ~/.ssh/config", Style::default().fg(MUTED.into())),
+        Span::styled(
+            format!(
+                "    {}",
+                crate::i18n::text(app.metadata.language, "[,] Settings")
+            ),
+            Style::default().fg(GREEN.into()),
+        ),
     ]);
+    frame.render_widget(Paragraph::new(content), area);
+}
+
+fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
+    let visible = app.visible_sections();
+    let titles = visible.iter().enumerate().map(|(index, section)| {
+        let localized = crate::i18n::text(app.metadata.language, section.title());
+        let title = if area.width < 70 {
+            format!("{} {}", index + 1, localized.chars().next().unwrap_or(' '))
+        } else if area.width < 100 {
+            localized.to_string()
+        } else {
+            format!("{} {}", index + 1, localized)
+        };
+        Line::from(title)
+    });
+    let selected = visible
+        .iter()
+        .position(|section| *section == app.section)
+        .unwrap_or(visible.len());
     frame.render_widget(
-        Paragraph::new(content).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(BORDER)),
-        ),
+        Tabs::new(titles)
+            .select(selected)
+            .padding("", "")
+            .divider(if area.width < 70 { " " } else { " | " })
+            .style(Style::default().fg(MUTED.into()))
+            .highlight_style(
+                Style::default()
+                    .fg(GREEN.into())
+                    .bg(SELECTED_ROW.into())
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(BORDER.into())),
+            ),
         area,
     );
 }
 
-fn render_navigation(frame: &mut Frame, area: Rect, app: &App) {
-    let items = [
-        (NavSection::Hosts, "1", false),
-        (NavSection::Files, "2", true),
-        (NavSection::Tunnels, "3", true),
-        (NavSection::Snippets, "4", true),
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let language = app.metadata.language;
+    let settings = [
+        (
+            crate::i18n::text(language, "Theme"),
+            crate::i18n::text(language, app.metadata.theme.label()).to_string(),
+        ),
+        (
+            crate::i18n::text(language, "Language"),
+            app.metadata.language.label().to_string(),
+        ),
+        (
+            crate::i18n::text(language, "Show Hosts tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Hosts") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Show Files tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Files") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Show Tunnels tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Tunnels") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Show Snippets tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Snippets") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Show Runtime tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Runtime") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Show Projects tab"),
+            crate::i18n::text(
+                language,
+                if !app.metadata.hidden_tabs.iter().any(|tab| tab == "Projects") {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Show Credentials tab"),
+            crate::i18n::text(
+                language,
+                if !app
+                    .metadata
+                    .hidden_tabs
+                    .iter()
+                    .any(|tab| tab == "Credentials")
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .into(),
+        ),
+        (
+            crate::i18n::text(language, "Export configuration"),
+            crate::i18n::text(language, "Press Enter").into(),
+        ),
+        (
+            crate::i18n::text(language, "Export credentials"),
+            crate::i18n::text(language, "Encrypted .age file").into(),
+        ),
+        ("Import configuration", "Validated JSON".to_string()),
+        ("Import credentials", "Encrypted .age file".to_string()),
+        ("Configuration sync", "Git remote settings".to_string()),
+    ];
+    let groups = [
+        ("Appearance", 0..2),
+        ("Workspace tabs", 2..9),
+        ("Configuration", 9..14),
+    ];
+    let mut selected_row = 0;
+    let mut row_index = 0;
+    let mut items = Vec::with_capacity(settings.len() + groups.len());
+    for (title, range) in groups {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  {}", crate::i18n::text(language, title)),
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
+        ))));
+        row_index += 1;
+        for index in range {
+            let (label, value) = &settings[index];
+            let selected = index == app.selected_setting;
+            if selected {
+                selected_row = row_index;
+            }
+            let style = if selected {
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT.into())
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(if selected { "▸ " } else { "  " }, style),
+                Span::styled(format!("{label:<24}"), style),
+                Span::styled(
+                    if index < 2 {
+                        format!("{value} ▾")
+                    } else {
+                        value.clone()
+                    },
+                    Style::default().fg(if selected { GREEN.into() } else { MUTED.into() }),
+                ),
+            ])));
+            row_index += 1;
+        }
+    }
+    let mut state = ListState::default().with_selected(Some(selected_row));
+    frame.render_stateful_widget(
+        List::new(items).block(panel_l(app, "Settings")),
+        area,
+        &mut state,
+    );
+}
+
+fn render_sync_settings_dialog(frame: &mut Frame, dialog: &crate::app::SyncSettingsDialog) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(76);
+    let height = 14.min(screen.height.saturating_sub(2));
+    if width < 24 || height < 7 {
+        return;
+    }
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let block = form_panel(
+        " Git configuration sync ",
+        "Tab / ↑↓ field  Enter save/action  Esc cancel",
+        area,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(2),
+    ])
+    .split(inner);
+    for (index, (label, value)) in [
+        ("Remote", dialog.remote.as_str()),
+        ("Branch", dialog.branch.as_str()),
     ]
     .into_iter()
-    .map(|(section, key, planned)| {
-        let selected = app.section == section;
-        let marker = if selected { ">" } else { " " };
-        let label = if planned {
-            format!("{marker} {key}  {}  ·", section.title())
-        } else {
-            format!("{marker} {key}  {}", section.title())
-        };
-        let style = if selected {
-            Style::default()
-                .fg(TEXT)
-                .bg(Color::Rgb(34, 54, 47))
-                .add_modifier(Modifier::BOLD)
-        } else if planned {
-            Style::default().fg(DISABLED)
-        } else {
-            Style::default().fg(MUTED)
-        };
-        ListItem::new(label).style(style)
-    });
-
+    .enumerate()
+    {
+        let selected = dialog.selected == index;
+        frame.render_widget(
+            Paragraph::new(form_input_line(
+                label,
+                value,
+                selected,
+                false,
+                dialog.editor.position(index, value),
+                rows[index].width,
+            )),
+            rows[index],
+        );
+    }
+    let controls = [
+        (2, "Save"),
+        (
+            3,
+            if dialog.testing {
+                "Testing connection..."
+            } else {
+                "Test connection"
+            },
+        ),
+        (
+            4,
+            if dialog.testing {
+                "Sync unavailable while active"
+            } else {
+                "Sync now"
+            },
+        ),
+    ];
+    for (offset, (index, label)) in controls.into_iter().enumerate() {
+        let selected = dialog.selected == index;
+        frame.render_widget(
+            Paragraph::new(if selected {
+                format!("> {label}")
+            } else {
+                format!("  {label}")
+            })
+            .style(Style::default().fg(if selected {
+                GREEN.into()
+            } else {
+                MUTED.into()
+            })),
+            rows[offset + 2],
+        );
+    }
     frame.render_widget(
-        List::new(items).block(
+        Paragraph::new("Use a private remote. Git auth uses your agent/helper; passwords and key files are excluded.")
+            .style(Style::default().fg(MUTED.into()))
+            .wrap(Wrap { trim: true }),
+        rows[5],
+    );
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
+}
+
+fn render_sync_conflicts(frame: &mut Frame, prepared: &crate::sync_engine::Prepared) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(86);
+    let height = screen.height.saturating_sub(2).min(16);
+    if width < 32 || height < 8 {
+        return;
+    }
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{} conflicting changes detected.",
+                prepared.plan.conflicts.len()
+            ),
+            Style::default()
+                .fg(Color::Rgb(239, 192, 101))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("No files have been changed. Choose each conflict separately:"),
+        Line::from(""),
+    ];
+    let start = prepared.conflict_selection.saturating_sub(5);
+    for (index, conflict) in prepared
+        .plan
+        .conflicts
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(6)
+    {
+        let prefix = if prepared.conflict_selection == index {
+            "> "
+        } else {
+            "  "
+        };
+        lines.push(Line::from(format!(
+            "{prefix}{}  [local]  [remote]",
+            conflict.path
+        )));
+    }
+    if prepared.plan.conflicts.len() > 6 {
+        lines.push(Line::from(format!(
+            "  ... and {} more",
+            prepared.plan.conflicts.len() - 6
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Up/Down select conflict"));
+    lines.push(Line::from(vec![
+        Span::styled("[L] Keep local value", Style::default().fg(GREEN.into())),
+        Span::raw("    "),
+        Span::styled(
+            "[R] Use remote value",
+            Style::default().fg(Color::Rgb(239, 192, 101)),
+        ),
+        Span::raw("    Esc Cancel"),
+    ]));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             Block::default()
-                .title(" WORKSPACE ")
-                .borders(Borders::RIGHT)
-                .border_style(Style::default().fg(BORDER)),
+                .title(" Resolve sync conflicts ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER.into()))
+                .style(Style::default().bg(PANEL.into())),
         ),
         area,
     );
 }
 
 fn render_hosts(frame: &mut Frame, area: Rect, app: &App) {
-    if area.width < 60 {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let path = app.active_group.as_ref().map_or_else(
+        || "All hosts".to_string(),
+        |group| format!("All hosts  /  {}", group.title()),
+    );
+    let title = if app.search_query.is_empty() {
+        path
+    } else {
+        format!("{path}  /  Filter: {}", app.search_query)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            title,
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
+        )),
+        rows[0],
+    );
+    let area = rows[1];
+    if area.width < 70 {
         render_compact_hosts(frame, area, app);
         return;
     }
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .constraints([
+            Constraint::Length(host_browser_width(area.width)),
+            Constraint::Min(1),
+        ])
         .split(area);
-    render_host_list(frame, panes[0], app);
+    render_host_browser(frame, panes[0], app);
     render_host_details(frame, panes[1], app);
 }
 
+fn render_host_browser(frame: &mut Frame, area: Rect, app: &App) {
+    if app.showing_groups() && !app.visible_groups().is_empty() {
+        let columns = group_columns(area.width);
+        let total_rows = app.visible_groups().len().div_ceil(columns);
+        let visible_rows =
+            total_rows.min(usize::from(area.height.saturating_sub(8) / 4).clamp(1, 2));
+        let height = (1 + visible_rows as u16 * 4).min(area.height.saturating_sub(4));
+        let sections =
+            Layout::vertical([Constraint::Length(height), Constraint::Min(3)]).split(area);
+        render_group_cards(frame, sections[0], app);
+        render_host_list(frame, sections[1], app);
+    } else {
+        render_host_list(frame, area, app);
+    }
+}
+
+fn render_group_cards(frame: &mut Frame, area: Rect, app: &App) {
+    let groups = app.visible_groups();
+    let columns = group_columns(area.width);
+    let total_rows = groups.len().div_ceil(columns);
+    let visible_rows = usize::from(area.height.saturating_sub(1) / 4).max(1);
+    let selected = app
+        .selected_group()
+        .and_then(|group| groups.iter().position(|item| *item == group));
+    let first_row = selected
+        .map_or(0, |index| {
+            (index / columns).saturating_sub(visible_rows - 1)
+        })
+        .min(total_rows.saturating_sub(visible_rows));
+    let heading = if total_rows > visible_rows {
+        format!(
+            " GROUPS  {}    {}/{}",
+            groups.len(),
+            first_row + 1,
+            total_rows
+        )
+    } else {
+        format!(" GROUPS  {}", groups.len())
+    };
+    frame.render_widget(
+        Paragraph::new(heading).style(
+            Style::default()
+                .fg(MUTED.into())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(area.x, area.y, area.width, area.height.min(1)),
+    );
+    for row in 0..visible_rows {
+        let y = area.y.saturating_add(1 + row as u16 * 4);
+        if y.saturating_add(4) > area.bottom() {
+            break;
+        }
+        let card_width = (area.width.saturating_sub(columns as u16 - 1) / columns as u16).min(24);
+        let cells = Layout::horizontal(vec![Constraint::Length(card_width); columns])
+            .flex(Flex::Start)
+            .spacing(1)
+            .split(Rect::new(area.x, y, area.width, 4));
+        for column in 0..columns {
+            let index = (first_row + row) * columns + column;
+            let Some(group) = groups.get(index) else {
+                break;
+            };
+            let active = selected == Some(index);
+            let count = app.group_hosts(group).len();
+            let border = if active { GREEN.into() } else { BORDER.into() };
+            let background = if active {
+                SELECTED_ROW.into()
+            } else {
+                PANEL.into()
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .style(Style::default().bg(background));
+            let inner = block.inner(cells[column]);
+            frame.render_widget(block, cells[column]);
+            let rows =
+                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+            frame.render_widget(
+                Paragraph::new(group.title())
+                    .style(
+                        Style::default()
+                            .fg(TEXT.into())
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .wrap(Wrap { trim: true }),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{count} {}",
+                    if count == 1 { "host" } else { "hosts" }
+                ))
+                .style(Style::default().fg(if active {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                })),
+                rows[1],
+            );
+        }
+    }
+}
+
 fn render_compact_hosts(frame: &mut Frame, area: Rect, app: &App) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(area);
-    render_host_list(frame, rows[0], app);
-    render_host_details(frame, rows[1], app);
+    render_host_browser(frame, area, app);
 }
 
 fn render_host_list(frame: &mut Frame, area: Rect, app: &App) {
     let hosts = app.visible_hosts();
+    let groups = app.visible_groups();
+    let selected = if hosts.is_empty() {
+        None
+    } else if app.showing_groups() {
+        app.selected_browse_item
+            .checked_sub(groups.len())
+            .map(|index| index.min(hosts.len() - 1))
+    } else {
+        Some(app.selected_browse_item.min(hosts.len() - 1))
+    };
     let items = hosts
         .iter()
-        .map(|host| ListItem::new(format!("  {}", host.alias)).style(Style::default().fg(TEXT)))
+        .enumerate()
+        .map(|(index, host)| {
+            ListItem::new(host_list_lines(
+                app,
+                host,
+                usize::from(area.width.saturating_sub(6)),
+            ))
+            .style(if selected == Some(index) {
+                Style::default().bg(SELECTED_ROW.into())
+            } else {
+                Style::default()
+            })
+        })
         .collect::<Vec<_>>();
 
     let title = if app.search_query.is_empty() {
@@ -176,41 +2701,36 @@ fn render_host_list(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!(" HOSTS  {} matching ", hosts.len())
     };
-    let mut state = ListState::default();
-    if !hosts.is_empty() {
-        state.select(Some(app.selected_host.min(hosts.len() - 1)));
-    }
+    let mut state = ListState::default().with_selected(selected);
+    let count = items.len();
     frame.render_stateful_widget(
         List::new(items)
             .block(
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BORDER))
-                    .style(Style::default().bg(PANEL)),
+                    .border_style(Style::default().fg(BORDER.into()))
+                    .style(Style::default().bg(PANEL.into())),
             )
             .highlight_symbol("> ")
-            .highlight_style(
-                Style::default()
-                    .fg(TEXT)
-                    .bg(Color::Rgb(34, 54, 47))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
         area,
         &mut state,
     );
-    if hosts.is_empty() {
+    if count == 0 {
         let message = if app.hosts.error.is_some() {
             "SSH config could not be read."
         } else if !app.search_query.is_empty() {
             "No matching hosts."
+        } else if app.active_group.is_some() {
+            "No hosts in this group."
         } else {
             "No Host aliases found in ~/.ssh/config."
         };
         let inner = Block::default().borders(Borders::ALL).inner(area);
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(MUTED.into()))
                 .wrap(Wrap { trim: true }),
             inner,
         );
@@ -218,6 +2738,29 @@ fn render_host_list(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
+    if app.showing_groups()
+        && let Some(group) = app.selected_group()
+    {
+        let hosts = app.group_hosts(&group);
+        let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                detail_line("Group", group.title()),
+                detail_line("Hosts", &hosts.len().to_string()),
+            ])
+            .block(panel_l(app, "Group")),
+            rows[0],
+        );
+        let items = hosts.iter().map(|host| {
+            ListItem::new(host_list_lines(
+                app,
+                host,
+                usize::from(area.width.saturating_sub(2)),
+            ))
+        });
+        frame.render_widget(List::new(items).block(panel_l(app, "Hosts")), rows[1]);
+        return;
+    }
     if let Some(host) = app.selected_host() {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
@@ -230,65 +2773,207 @@ fn render_host_details(frame: &mut Frame, area: Rect, app: &App) {
 
         let overview = vec![
             detail_line("Alias", &host.alias),
-            detail_line("Target", "Resolved by OpenSSH"),
+            detail_line("Target", host.destination()),
             detail_line("User / port", "Resolved by OpenSSH"),
-            detail_line("Auth", "ssh-agent, key, or password prompt"),
+            detail_line(
+                "Auth",
+                if app.host_password_reference(&host.alias).is_some() {
+                    "Saved password / Keychain"
+                } else {
+                    "ssh-agent, key, or password prompt"
+                },
+            ),
+            detail_line("Tags", &app.tags(host).join(", ")),
         ];
         frame.render_widget(
             Paragraph::new(overview)
-                .block(panel(" HOST "))
+                .block(panel_l(app, "Hosts"))
                 .wrap(Wrap { trim: true }),
             vertical[0],
         );
 
+        let key_sources = app
+            .credential_manager
+            .host_key_sources
+            .get(&host.alias)
+            .filter(|sources| !sources.is_empty())
+            .map(|sources| sources.join(", "));
         let routing = vec![
-            detail_line("Routing", "ProxyJump / ProxyCommand"),
-            detail_line("Identity", "IdentityFile / ssh-agent"),
+            detail_line(
+                "ProxyJump",
+                host.proxy_jump.as_deref().unwrap_or("OpenSSH config"),
+            ),
+            detail_line(
+                "Identity",
+                key_sources
+                    .as_deref()
+                    .or(host.identity_file.as_deref())
+                    .unwrap_or("IdentityFile / ssh-agent"),
+            ),
+            detail_line(
+                "Public key upload",
+                if app
+                    .metadata
+                    .uploaded_keys
+                    .get(&host.alias)
+                    .is_some_and(|keys| !keys.is_empty())
+                {
+                    "Success recorded by LazyTerm"
+                } else {
+                    "No LazyTerm upload record"
+                },
+            ),
+            detail_line(
+                "Saved password",
+                if app.host_password_reference(&host.alias).is_some() {
+                    "Configured"
+                } else {
+                    "Not configured"
+                },
+            ),
             detail_line("Source", "~/.ssh/config"),
         ];
         frame.render_widget(
             Paragraph::new(routing)
-                .block(panel(" CONNECTION "))
+                .block(panel_l(app, "Connection"))
                 .wrap(Wrap { trim: true }),
             vertical[1],
         );
 
-        let recent = app.notice.as_deref().unwrap_or("No session history yet.");
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled(recent, Style::default().fg(MUTED))),
+                Line::from(Span::styled(
+                    "No session history yet.",
+                    Style::default().fg(MUTED.into()),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Enter connects using the system OpenSSH client.",
-                    Style::default().fg(DISABLED),
+                    Style::default().fg(DISABLED.into()),
                 )),
             ])
-            .block(panel(" RECENT SESSIONS "))
+            .block(panel_l(app, "Recent sessions"))
             .wrap(Wrap { trim: true }),
             vertical[2],
         );
     } else {
-        let message = app.hosts.error.as_deref().unwrap_or({
-            if app.search_query.is_empty() && app.hosts.hosts.is_empty() {
-                "Add a Host alias to ~/.ssh/config, then press r to reload."
-            } else {
-                "No hosts match the current search."
-            }
-        });
+        let message = if let Some(error) = app.hosts.error.as_deref() {
+            error
+        } else if app.search_query.is_empty() && app.hosts.hosts.is_empty() {
+            "Add a Host alias to ~/.ssh/config, then press r to reload."
+        } else {
+            "No hosts match the current search."
+        };
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(MUTED))
-                .block(panel(" HOST DETAILS "))
+                .style(Style::default().fg(MUTED.into()))
+                .block(panel_l(app, "Host details"))
                 .wrap(Wrap { trim: true }),
             area,
         );
     }
 }
 
-fn detail_line<'a>(label: &'a str, value: &'a str) -> Line<'a> {
+fn host_alias_line(host: &crate::hosts::Host, indent: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("{indent}{}", host.alias),
+        Style::default().fg(TEXT.into()),
+    ))
+}
+
+fn host_list_lines(
+    app: &App,
+    host: &crate::hosts::Host,
+    content_width: usize,
+) -> Vec<Line<'static>> {
+    let alias = host_alias_line(host, "  ");
+    let badges = host_auth_badges(app, host);
+    let has_badges = !badges.spans.is_empty();
+    let address_width = content_width
+        .saturating_sub(badges.width())
+        .saturating_sub(usize::from(has_badges));
+    let address_text = format!("  {}", host.destination());
+    let address_text = truncate_display(&address_text, address_width);
+    let address = Line::from(Span::styled(
+        address_text,
+        Style::default().fg(MUTED.into()),
+    ));
+    let gap = content_width.saturating_sub(address.width() + badges.width());
+    let mut second_line = address.spans;
+    second_line.push(Span::raw(" ".repeat(gap)));
+    second_line.extend(badges.spans);
+    vec![alias, Line::from(second_line)]
+}
+
+fn truncate_display(value: &str, max_width: usize) -> String {
+    let value_width = value
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum::<usize>();
+    if value_width <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let available = max_width.saturating_sub(1);
+    let mut result = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > available {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push('…');
+    result
+}
+
+fn host_auth_badges(app: &App, host: &crate::hosts::Host) -> Line<'static> {
+    let mut spans = Vec::new();
+    let authenticated_with_key = app.metadata.host_public_key_auth.contains(&host.alias);
+    let key_uploaded = app
+        .metadata
+        .uploaded_keys
+        .get(&host.alias)
+        .is_some_and(|keys| !keys.is_empty());
+    if authenticated_with_key {
+        spans.push(Span::styled(
+            " SSH key ",
+            Style::default()
+                .fg(BG.into())
+                .bg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+    } else if key_uploaded {
+        spans.push(Span::styled(
+            " Key uploaded ",
+            Style::default()
+                .fg(BG.into())
+                .bg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    if app.host_password_reference(&host.alias).is_some() {
+        spans.push(Span::styled(
+            " Password ",
+            Style::default()
+                .fg(BG.into())
+                .bg(Color::Rgb(103, 211, 211))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn detail_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
-        Span::styled(value.to_string(), Style::default().fg(TEXT)),
+        Span::styled(format!("{label:<11}  "), Style::default().fg(MUTED.into())),
+        Span::styled(value.to_string(), Style::default().fg(TEXT.into())),
     ])
 }
 
@@ -296,129 +2981,1343 @@ fn panel(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL))
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()))
 }
 
-fn render_placeholder(
-    frame: &mut Frame,
-    area: Rect,
-    section: &str,
-    title: &str,
-    description: &str,
-) {
-    let block = panel(section);
+fn panel_l(app: &App, title: &str) -> Block<'static> {
+    let title = crate::i18n::text(app.metadata.language, title);
+    Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER.into()))
+        .style(Style::default().bg(PANEL.into()))
+}
+
+pub(crate) fn action_panel<'a>(title: &'a str, footer: &str, border: Color) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .title_bottom(Span::styled(
+            format!(" {footer} "),
+            Style::default().fg(MUTED.into()),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(PANEL.into()))
+}
+
+pub(crate) fn form_panel<'a>(title: &'a str, footer: &str, area: Rect) -> Block<'a> {
+    use unicode_width::UnicodeWidthStr;
+    let mut footer = footer.to_string();
+    if area.width < 64 {
+        footer = footer.replace("Tab / ↑↓ field", "Tab field");
+    }
+    if footer.width() + 4 > usize::from(area.width) {
+        footer = footer.replace("Tab field  ", "");
+    }
+    if footer.width() + 4 > usize::from(area.width)
+        && let Some(start) = footer.find("Enter ")
+    {
+        footer = footer[start..].to_string();
+    }
+    action_panel(title, &footer, BORDER.into())
+}
+
+fn render_snippets(frame: &mut Frame, area: Rect, app: &App) {
+    if app.snippet_execution_view {
+        render_snippet_execution(frame, area, app);
+        return;
+    }
+    let block = panel_l(app, "SNIPPETS");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "Packages",
+            Style::default()
+                .fg(TEXT.into())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   →   ", Style::default().fg(MUTED.into())),
+        Span::styled(
+            if app.snippet_package_open {
+                app.metadata
+                    .snippet_packages
+                    .get(app.selected_package)
+                    .map_or("Package", |package| package.name.as_str())
+            } else {
+                "Select a package"
+            },
+            Style::default()
+                .fg(GREEN.into())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(title, Rect { height: 1, ..inner });
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    let sections = Layout::vertical([Constraint::Min(6), Constraint::Length(7)]).split(body);
+    let columns = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(sections[0]);
 
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(38),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
+    let package_rows = app
+        .metadata
+        .snippet_packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| {
+            let selected = !app.snippet_package_open && index == app.selected_package;
+            ListItem::new(vec![
+                Line::from(Span::styled(
+                    format!("▣  {}", package.name),
+                    Style::default()
+                        .fg(if selected { GREEN.into() } else { TEXT.into() })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "   {} snippet{}",
+                        package.snippets.len(),
+                        if package.snippets.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(MUTED.into()),
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(package_rows).block(panel_l(app, "PACKAGES")),
+        columns[0],
+    );
+
+    let snippet_rows = app
+        .metadata
+        .snippet_packages
+        .get(app.selected_package)
+        .map(|package| {
+            package
+                .snippets
+                .iter()
+                .enumerate()
+                .map(|(index, snippet)| {
+                    let selected = app.snippet_package_open && index == app.selected_snippet;
+                    let marker = if selected { ">" } else { " " };
+                    ListItem::new(vec![
+                        Line::from(Span::styled(
+                            format!("{marker}  {{}}  {} {}", snippet.name, snippet.command),
+                            Style::default()
+                                .fg(if selected { GREEN.into() } else { TEXT.into() })
+                                .add_modifier(if selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        )),
+                        Line::from(Span::styled(
+                            if snippet.description.is_empty() {
+                                "     No description".to_string()
+                            } else {
+                                format!("     {}", snippet.description)
+                            },
+                            Style::default().fg(MUTED.into()),
+                        )),
+                    ])
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    frame.render_widget(
+        List::new(snippet_rows).block(panel_l(app, "Snippets in package")),
+        columns[1],
+    );
+    render_snippet_runs(frame, sections[1], app);
+}
+
+fn render_snippet_execution(frame: &mut Frame, area: Rect, app: &App) {
+    let block = panel_l(app, "Snippet execution");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(run) = app.snippet_runs.get(app.selected_snippet_run) else {
+        frame.render_widget(
+            Paragraph::new("No execution selected.").style(Style::default().fg(MUTED.into())),
+            inner,
+        );
+        return;
+    };
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Snippet: ", Style::default().fg(MUTED.into())),
+            Span::styled(
+                run.snippet_name.clone(),
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Command: ", Style::default().fg(MUTED.into())),
+            Span::styled(run.command.clone(), Style::default().fg(TEXT.into())),
+        ]),
+    ]);
+    frame.render_widget(header, Rect { height: 2, ..inner });
+    let body = Rect {
+        y: inner.y + 3,
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    let columns =
+        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(body);
+    let target_rows = app.snippet_runs.iter().enumerate().map(|(index, item)| {
+        let selected = index == app.selected_snippet_run;
+        let status = match &item.status {
+            crate::app::SnippetRunStatus::Queued => "queued".to_string(),
+            crate::app::SnippetRunStatus::Running => "running".to_string(),
+            crate::app::SnippetRunStatus::Completed(code) => format!("exit {code}"),
+            crate::app::SnippetRunStatus::ConnectionFailed(error) => {
+                format!("connection: {error}")
+            }
+            crate::app::SnippetRunStatus::Cancelled => "cancelled".to_string(),
+        };
+        ListItem::new(vec![
+            Line::from(Span::styled(
+                format!("{} {}", if selected { ">" } else { " " }, item.host_alias),
+                Style::default()
+                    .fg(if selected { GREEN.into() } else { TEXT.into() })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            )),
+            Line::from(Span::styled(
+                format!("  {status}"),
+                Style::default().fg(MUTED.into()),
+            )),
         ])
+    });
+    frame.render_widget(
+        List::new(target_rows).block(panel_l(app, "Target hosts")),
+        columns[0],
+    );
+    let output = if run.output.is_empty() {
+        match &run.status {
+            crate::app::SnippetRunStatus::Running => "Waiting for output...".to_string(),
+            crate::app::SnippetRunStatus::Queued => "Queued...".to_string(),
+            _ => "No output.".to_string(),
+        }
+    } else {
+        run.output.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(output)
+            .scroll((app.snippet_output_scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(panel_l(app, "OUTPUT")),
+        columns[1],
+    );
+}
+
+fn render_snippet_runs(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = app.snippet_runs.iter().enumerate().map(|(index, run)| {
+        let marker = if index == app.selected_snippet_run {
+            ">"
+        } else {
+            " "
+        };
+        let status = match &run.status {
+            crate::app::SnippetRunStatus::Queued => "queued".to_string(),
+            crate::app::SnippetRunStatus::Running => "running".to_string(),
+            crate::app::SnippetRunStatus::Completed(code) => format!("exit {code}"),
+            crate::app::SnippetRunStatus::ConnectionFailed(error) => {
+                format!("connection: {error}")
+            }
+            crate::app::SnippetRunStatus::Cancelled => "cancelled".to_string(),
+        };
+        let output = run.output.lines().next().unwrap_or("");
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("{marker} {:<18} {:<10} ", run.host_alias, status),
+                Style::default().fg(if index == app.selected_snippet_run {
+                    GREEN.into()
+                } else {
+                    TEXT.into()
+                }),
+            ),
+            Span::styled(output, Style::default().fg(MUTED.into())),
+        ]))
+    });
+    frame.render_widget(List::new(rows).block(panel_l(app, "RUNS")), area);
+}
+
+fn render_snippet_dialog(frame: &mut Frame, dialog: &crate::app::SnippetDialog, app: &App) {
+    let area = centered_rect(82, 16, frame.area());
+    frame.render_widget(Clear, area);
+    let block = form_panel(
+        if dialog.editing_id.is_some() {
+            " EDIT SNIPPET "
+        } else {
+            " NEW SNIPPET "
+        },
+        if dialog.selected_field == 3 {
+            "Tab / ↑↓ field  Space toggle  Enter save  Esc cancel"
+        } else {
+            "Tab / ↑↓ field  Enter save  Esc cancel"
+        },
+        area,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let labels = ["Name", "Command", "Description"];
+    let field_height = if inner.height >= 8 { 2 } else { 1 };
+    let rows = Layout::vertical([Constraint::Length(field_height); 4]).split(inner);
+    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+        frame.render_widget(
+            Paragraph::new(form_input_line(
+                label,
+                value,
+                index == dialog.selected_field,
+                false,
+                dialog.editor.position(index, value),
+                rows[index].width,
+            )),
+            rows[index],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(checkbox_line(
+            "Dangerous command",
+            dialog.fields[3].parse::<bool>().unwrap_or(false),
+            dialog.selected_field == 3,
+        )),
+        rows[3],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Package: {}",
+            app.metadata
+                .snippet_packages
+                .iter()
+                .find(|package| package.id == dialog.package_id)
+                .map_or("Unknown", |package| package.name.as_str())
+        ))
+        .style(Style::default().fg(MUTED.into()))
+        .wrap(Wrap { trim: true }),
+        Rect {
+            y: inner.y.saturating_add(field_height * 4),
+            height: inner.height.saturating_sub(field_height * 4),
+            ..inner
+        },
+    );
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
+}
+
+fn render_package_dialog(frame: &mut Frame, dialog: &crate::app::PackageDialog) {
+    let area = centered_rect(72, 11, frame.area());
+    frame.render_widget(Clear, area);
+    let block = form_panel(
+        if dialog.editing_id.is_some() {
+            " EDIT PACKAGE "
+        } else {
+            " NEW PACKAGE "
+        },
+        "Tab / ↑↓ field  Enter save  Esc cancel",
+        area,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let labels = ["Name", "Description"];
+    let rows = Layout::vertical([Constraint::Length(if inner.height >= 4 { 2 } else { 1 }); 2])
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
-        content[1],
+    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+        frame.render_widget(
+            Paragraph::new(form_input_line(
+                label,
+                value,
+                index == dialog.selected_field,
+                false,
+                dialog.editor.position(index, value),
+                rows[index].width,
+            )),
+            rows[index],
+        );
+    }
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
+}
+
+fn render_snippet_confirmation(frame: &mut Frame, pending: &crate::app::PendingSnippetRun) {
+    let area = centered_rect(76, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let block = action_panel(
+        " CONFIRM DANGEROUS COMMAND ",
+        "y/Enter yes  n/Esc no",
+        Color::Rgb(221, 132, 112),
     );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(description)
-            .style(Style::default().fg(MUTED))
-            .wrap(Wrap { trim: true }),
-        content[2],
+        Paragraph::new(vec![
+            Line::from(format!(
+                "Run {} on {} host(s)?",
+                pending.snippet_name,
+                pending.targets.len()
+            )),
+            Line::from(pending.command.clone()),
+        ])
+        .style(Style::default().fg(TEXT.into()))
+        .wrap(Wrap { trim: true }),
+        inner,
     );
+}
+
+fn render_snippet_delete_confirmation(frame: &mut Frame, target: &crate::app::SnippetDeleteTarget) {
+    let area = centered_rect(76, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let (title, message) = match target {
+        crate::app::SnippetDeleteTarget::Package { name, .. } => (
+            " DELETE PACKAGE ",
+            format!("Delete package \"{name}\" and all snippets inside it?"),
+        ),
+        crate::app::SnippetDeleteTarget::Snippet { name, .. } => {
+            (" DELETE SNIPPET ", format!("Delete snippet \"{name}\"?"))
+        }
+    };
+    let block = action_panel(title, "y/Enter yes  n/Esc no", Color::Rgb(221, 132, 112));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new("Planned").style(Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
-        content[3],
+        Paragraph::new(message).style(Style::default().fg(TEXT.into())),
+        inner,
+    );
+}
+
+fn render_snippet_host_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(82, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let title = app.snippet_host_picker_group.as_ref().map_or_else(
+        || " EXECUTE SNIPPET ".to_string(),
+        |group| match group {
+            crate::app::HostGroup::Tag(tag) => format!(" EXECUTE ON GROUP / {tag} "),
+            crate::app::HostGroup::Untagged => " EXECUTE ON GROUP / UNTAGGED ".to_string(),
+        },
+    );
+    let block = panel(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if let Some(snippet) = app
+        .metadata
+        .snippet_packages
+        .get(app.selected_package)
+        .and_then(|package| package.snippets.get(app.selected_snippet))
+    {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    snippet.name.clone(),
+                    Style::default()
+                        .fg(GREEN.into())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("$ {}", snippet.command),
+                    Style::default().fg(MUTED.into()),
+                )),
+            ]),
+            Rect { height: 2, ..inner },
+        );
+    }
+    let list_area = Rect {
+        y: inner.y + 3,
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    let items = if let Some(group) = &app.snippet_host_picker_group {
+        app.hosts
+            .hosts
+            .iter()
+            .filter(|host| match group {
+                crate::app::HostGroup::Tag(tag) => app.tags(host).iter().any(|item| item == tag),
+                crate::app::HostGroup::Untagged => app.tags(host).is_empty(),
+            })
+            .map(|host| crate::app::HostPickerItem::Host(host.alias.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        app.visible_groups()
+            .into_iter()
+            .map(crate::app::HostPickerItem::Group)
+            .chain(
+                app.hosts
+                    .hosts
+                    .iter()
+                    .map(|host| crate::app::HostPickerItem::Host(host.alias.clone())),
+            )
+            .collect::<Vec<_>>()
+    };
+    let rows = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let selected = index == app.snippet_host_picker_selection;
+            let label = match item {
+                crate::app::HostPickerItem::Group(group) => format!("▣  {}", group.title()),
+                crate::app::HostPickerItem::Host(alias) => format!("   {alias}"),
+            };
+            ListItem::new(Span::styled(
+                label,
+                Style::default()
+                    .fg(if selected { GREEN.into() } else { TEXT.into() })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(rows)
+            .block(panel_l(app, "Targets"))
+            .highlight_style(Style::default().fg(GREEN.into())),
+        list_area,
     );
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let hint = if app.searching {
-        "Type to filter   Enter apply   Esc clear"
-    } else if app.section == NavSection::Hosts {
-        if area.width < 95 {
-            "↑↓ move  Enter SSH  a add  e edit  d delete  / find  r reload  q quit"
-        } else {
-            "↑↓ select   Enter connect   a add   e edit   d delete   / search   r refresh   1-4 nav   q quit"
-        }
+    if app.workspace.form.is_some()
+        || app.host_dialog.is_some()
+        || app.host_group_dialog.is_some()
+        || app.tunnel_dialog.is_some()
+        || app.snippet_dialog.is_some()
+        || app.package_dialog.is_some()
+        || app.credential_manager.form.is_some()
+        || app.credential_export_dialog.is_some()
+        || app.credential_import_dialog.is_some()
+        || app.host_password_dialog.is_some()
+        || app.sync_dialog.is_some()
+    {
+        return;
+    }
+    let confirmation_open = app.workspace.delete.is_some()
+        || app.workspace.confirmation.is_some()
+        || app.import_confirmation.is_some()
+        || app.snippet_confirmation.is_some()
+        || app.snippet_delete_confirmation.is_some()
+        || app.runtime_kill_confirmation.is_some()
+        || app.runtime_force_kill_confirmation.is_some()
+        || app
+            .host_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        || app
+            .tunnel_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        || matches!(
+            app.file_dialog.as_ref(),
+            Some(FileDialog::Delete { .. } | FileDialog::TransferConflict { .. })
+        )
+        || app.credential_manager.confirm_upload.is_some()
+        || app.credential_manager.deleting
+        || app.credential_manager.delete_host_password.is_some();
+    let navigation = if area.width < 75 {
+        "1-7 tabs  Tab next  Shift+Tab prev  ` last"
     } else {
-        "1-4 nav   Hosts: ↑↓ select, Enter connect   q quit"
+        "1-7 tabs  Tab / Shift+Tab cycle  Ctrl+Left/Right cycle  ` last  [,] settings"
     };
-    frame.render_widget(Paragraph::new(hint).style(Style::default().fg(MUTED)), area);
+    let hint = if confirmation_open {
+        if app.import_confirmation.is_some() {
+            "y / Enter confirm  n / Esc cancel"
+        } else {
+            ""
+        }
+    } else if app.credential_import_dialog.is_some() {
+        "Type archive password  Enter continue  Esc cancel"
+    } else if app.host_action_dialog.is_some() {
+        "Enter / Esc close"
+    } else if app.workspace.form.is_some() {
+        "Tab / ↑↓ field  ←→ choice  Enter save  Esc cancel"
+    } else if app.workspace.delete.is_some() || app.workspace.confirmation.is_some() {
+        "y / Enter confirm  n / Esc cancel"
+    } else if app.section == NavSection::Projects {
+        if app.workspace.output_open {
+            "↑↓ scroll  Home/End  [ ] command  s start  x stop  r restart  Esc back  q quit"
+        } else if app.workspace.project_open {
+            if app.project_links_header_selected() {
+                "↑↓ select  ←→/Space fold  Enter fold  L add link  v view  Esc back"
+            } else if app.selected_project_link().is_some() {
+                "↑↓ select  Enter browser  u username  p password  L add link  e edit  d delete  Esc back"
+            } else if app.selected_project_command().is_some() {
+                "↑↓ select  Enter output  s start  x stop  r restart  A/X services  e edit  d delete"
+            } else {
+                "↑↓ select  ←→/Space fold  Enter open  a command  L link  G group  e/d edit/delete  A/X services  v view"
+            }
+        } else {
+            "↑↓ select  Enter open  a add  e edit  d delete  A/X services  q quit"
+        }
+    } else if app.snippet_execution_view {
+        "↑↓ scroll output  [ ] select Host  c cancel  C clear  Esc back  q quit"
+    } else if app.snippet_host_picker_open {
+        "↑↓ select group/Host  Enter run one  b run group  Backspace back  Esc cancel"
+    } else if app.snippet_confirmation.is_some() || app.snippet_delete_confirmation.is_some() {
+        "y / Enter confirm    n / Esc cancel"
+    } else if app.snippet_dialog.is_some() || app.package_dialog.is_some() {
+        "Tab / ↑↓ field  Enter save  Esc cancel"
+    } else if app.tunnel_host_picker_open {
+        "↑↓ select group/Host  Enter open/choose  Backspace back  Esc cancel"
+    } else if app.tunnel_dialog.is_some() {
+        if app
+            .tunnel_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        {
+            "y / Enter confirm  n / Esc cancel"
+        } else {
+            "F1 Local  F2 Remote  F3 Dynamic  Tab / ↑↓ field  Enter save  Esc cancel"
+        }
+    } else if app.host_dialog.is_some() {
+        "Tab / Shift+Tab field  Space groups  Enter save  Esc cancel"
+    } else if app.host_group_dialog.is_some() {
+        if app
+            .host_group_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.deleting)
+        {
+            "y / Enter delete group  n / Esc cancel"
+        } else {
+            "Type group name  Enter save  Esc cancel"
+        }
+    } else if app.tags_dialog.is_some() {
+        "Enter save tags  Esc cancel"
+    } else if let Some(dialog) = &app.file_dialog {
+        match dialog {
+            FileDialog::Rename { .. } => "Left/Right move cursor  Enter save  Esc cancel",
+            FileDialog::Delete { .. } => "y / Enter confirm  n / Esc cancel",
+            FileDialog::CreateDir { .. } => "Left/Right move cursor  Enter save  Esc cancel",
+            FileDialog::TransferConflict { .. } => "y / Enter overwrite  n / Esc cancel",
+        }
+    } else if app.searching {
+        "Type to filter   Enter apply   Esc clear"
+    } else if app.file_filtering {
+        "Type to filter current pane   ↑↓ move   ← parent   → open   Enter apply   Esc clear"
+    } else if app.section == NavSection::Hosts {
+        if area.width < 75 && app.showing_groups() {
+            match app.selected_group() {
+                Some(crate::app::HostGroup::Tag(_)) => "a host  g add grp  e edit  d delete  Enter",
+                Some(crate::app::HostGroup::Untagged) => "a host  g add grp  Enter open",
+                None => "a add host  e edit  d delete  Enter SSH",
+            }
+        } else if area.width < 75 {
+            "d delete  e edit  p password  x delete password  Enter SSH"
+        } else if app.showing_groups() {
+            match app.selected_group() {
+                Some(crate::app::HostGroup::Tag(_)) => {
+                    "↑↓ select  a add host  g add group  e edit  d delete  Enter open"
+                }
+                Some(crate::app::HostGroup::Untagged) => {
+                    "↑↓ select  a add host  g add group  Enter open  / find"
+                }
+                None => "↑↓ select  a add host  e edit host  d delete host  g tags  Enter SSH",
+            }
+        } else if area.width < 95 {
+            "↑↓ move  Enter SSH  d delete  e edit  p password  x delete password  v view  g tags  / find"
+        } else {
+            "↑↓ select  Enter SSH  d delete  e edit  k configure SSH key  p password  x delete password  g tags  Esc back  a add  / find  r reload  q quit"
+        }
+    } else if app.section == NavSection::Files {
+        if app.host_picker_open {
+            if area.width < 75 {
+                "↑↓ select  Enter open  Backspace/Esc back"
+            } else {
+                "↑↓ select  Enter group/host  Backspace back  Esc close"
+            }
+        } else if area.width < 75 {
+            match (app.active_file_pane, app.context_host().is_none()) {
+                (FilePane::Local, _) => {
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  / filter  h hidden  ↑↓ select  ← parent  →/Enter open"
+                }
+                (FilePane::Remote, true) => "Tab local  Enter/s select host",
+                (FilePane::Remote, false) => {
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  Tab local  h hidden  ↑↓ select  ← parent  →/Enter open"
+                }
+            }
+        } else {
+            match (app.active_file_pane, app.context_host().is_none()) {
+                (FilePane::Local, _) => {
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  / filter  h hidden  Tab remote  ↑↓ select  ← parent  →/Enter open  u upload  r reload"
+                }
+                (FilePane::Remote, true) => "Tab local  Enter/s select host",
+                (FilePane::Remote, false) => {
+                    "n mkdir  m rename  x delete  c cancel  C cancel all  [ ] task  R retry  K clear  Tab local  h hidden  ↑↓ select  ← parent  →/Enter open  d download  s host  o native sftp"
+                }
+            }
+        }
+    } else if app.section == NavSection::Tunnels {
+        "↑↓ select  l local  R remote  D dynamic  s/Space start/stop  r restart  e edit  d delete"
+    } else if app.section == NavSection::Snippets {
+        if app.snippet_package_open {
+            "↑↓ select  Enter execute  e edit  a add  d delete  b group  Y copy  [ ] runs  c cancel  C clear"
+        } else {
+            "↑↓ select package  Enter open  e edit  a add  d delete"
+        }
+    } else if app.section == NavSection::Runtime {
+        if app.runtime_host_picker_open {
+            "↑↓ select group/Host  Enter choose  Backspace back  Esc cancel"
+        } else if app.runtime_kill_confirmation.is_some()
+            || app.runtime_force_kill_confirmation.is_some()
+        {
+            "y / Enter confirm  n / Esc cancel"
+        } else {
+            "l Local  h/s Hosts  Left/Right category  ↑↓ select  r refresh  k TERM  K KILL  o project  q quit"
+        }
+    } else if app.section == NavSection::Settings {
+        if app.settings_picker.is_some() {
+            "↑↓ select  Enter confirm  Esc cancel"
+        } else {
+            "↑↓ select  Enter / Space change  Esc / Tab back  q quit"
+        }
+    } else if app.section == NavSection::Credentials {
+        "↑↓ select  a password  g generate key  i import  e edit  d remove  p copy  r refresh  q quit"
+    } else {
+        "q quit"
+    };
+    let hint = crate::i18n::text(app.metadata.language, hint);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(if app.searching {
+                "Ctrl+Left/Right tabs  [,] settings"
+            } else {
+                navigation
+            }),
+            Line::from(hint),
+        ])
+        .style(Style::default().fg(MUTED.into())),
+        area,
+    );
+}
+
+fn render_file_dialog(frame: &mut Frame, dialog: &FileDialog) {
+    match dialog {
+        FileDialog::Rename {
+            old_name,
+            value,
+            cursor,
+            ..
+        } => {
+            let area = centered_rect(68, 7, frame.area());
+            frame.render_widget(Clear, area);
+            let block = action_panel(" RENAME FILE ", "Enter save  Esc cancel", BORDER.into());
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(format!("Rename \"{old_name}\""))
+                    .style(Style::default().fg(TEXT.into()))
+                    .wrap(Wrap { trim: false }),
+                Rect {
+                    height: inner.height.min(2),
+                    ..inner
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(file_name_input(value, *cursor, inner.width)),
+                Rect {
+                    y: inner.y.saturating_add(2),
+                    height: inner.height.saturating_sub(2).min(1),
+                    ..inner
+                },
+            );
+        }
+        FileDialog::Delete { name, is_dir, .. } => {
+            let area = centered_rect(68, 7, frame.area());
+            frame.render_widget(Clear, area);
+            let title = if *is_dir {
+                " DELETE DIRECTORY "
+            } else {
+                " DELETE FILE "
+            };
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("Delete \"{name}\"?")),
+                    Line::from(if *is_dir {
+                        "The directory must be empty."
+                    } else {
+                        "This action cannot be undone."
+                    }),
+                ])
+                .style(Style::default().fg(TEXT.into()))
+                .block(action_panel(
+                    title,
+                    "y/Enter yes  n/Esc no",
+                    Color::Rgb(221, 132, 112),
+                ))
+                .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+        FileDialog::CreateDir { value, cursor, .. } => {
+            let area = centered_rect(68, 7, frame.area());
+            frame.render_widget(Clear, area);
+            let block = action_panel(" NEW DIRECTORY ", "Enter save  Esc cancel", BORDER.into());
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(file_name_input(value, *cursor, inner.width)),
+                inner,
+            );
+        }
+        FileDialog::TransferConflict { request } => {
+            let direction = match request.direction {
+                crate::sftp::TransferDirection::Upload => "Upload",
+                crate::sftp::TransferDirection::Download => "Download",
+            };
+            let target = match request.direction {
+                crate::sftp::TransferDirection::Upload => request.remote_path.clone(),
+                crate::sftp::TransferDirection::Download => {
+                    request.local_path.to_string_lossy().into_owned()
+                }
+            };
+            let area = centered_rect(72, 7, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("{direction} will overwrite:")),
+                    Line::from(target),
+                ])
+                .style(Style::default().fg(TEXT.into()))
+                .block(action_panel(
+                    " TRANSFER CONFLICT ",
+                    "y/Enter yes  n/Esc no",
+                    Color::Rgb(221, 132, 112),
+                ))
+                .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+    }
+}
+
+fn file_name_input(value: &str, cursor: usize, width: u16) -> Line<'static> {
+    let mut line = input_line("Name", "", true, false);
+    line.spans.pop();
+    let available = usize::from(width).saturating_sub(8);
+    if available == 0 {
+        return line;
+    }
+    let mut start = cursor;
+    let mut used = value[cursor..]
+        .chars()
+        .next()
+        .map_or(1, |c| c.width().unwrap_or(0).max(1));
+    for (index, character) in value[..cursor].char_indices().rev() {
+        let size = character.width().unwrap_or(0);
+        if used + size > available {
+            break;
+        }
+        used += size;
+        start = index;
+    }
+    line.spans.push(Span::styled(
+        value[start..cursor].to_string(),
+        Style::default().fg(TEXT.into()),
+    ));
+    let mut characters = value[cursor..].chars();
+    let caret = characters.next().unwrap_or(' ');
+    line.spans.push(Span::styled(
+        caret.to_string(),
+        Style::default()
+            .fg(TEXT.into())
+            .add_modifier(Modifier::REVERSED),
+    ));
+    let mut tail = String::new();
+    for character in characters {
+        let size = character.width().unwrap_or(0);
+        if used + size > available {
+            break;
+        }
+        used += size;
+        tail.push(character);
+    }
+    line.spans
+        .push(Span::styled(tail, Style::default().fg(TEXT.into())));
+    line
+}
+
+fn render_settings_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.settings_picker else {
+        return;
+    };
+    let language = app.metadata.language;
+    let (title, choices): (&str, Vec<String>) = if picker.setting == 0 {
+        (
+            "Theme",
+            crate::metadata::Theme::ALL
+                .into_iter()
+                .map(|theme| crate::i18n::text(language, theme.label()).to_string())
+                .collect(),
+        )
+    } else {
+        (
+            "Language",
+            crate::metadata::Language::ALL
+                .into_iter()
+                .map(|language| language.label().to_string())
+                .collect(),
+        )
+    };
+    let height = u16::try_from(choices.len()).unwrap_or(0).saturating_add(4);
+    let area = centered_rect(48, height, frame.area());
+    frame.render_widget(Clear, area);
+    let items = choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            let selected = index == picker.selected;
+            let marker = if selected { "▸ " } else { "  " };
+            let checked = if index == picker.selected {
+                "● "
+            } else {
+                "○ "
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(GREEN.into())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT.into())
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(checked, style),
+                Span::styled(choice, style),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items)
+            .block(action_panel(
+                crate::i18n::text(language, title),
+                "↑↓ select  Enter confirm  Esc cancel",
+                BORDER.into(),
+            ))
+            .highlight_style(Style::default()),
+        area,
+    );
 }
 
 fn render_host_dialog(frame: &mut Frame, dialog: &crate::app::HostDialog) {
-    let area = centered_rect(68, 15, frame.area());
+    let area = centered_rect(72, 20, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(if dialog.deleting {
-        " DELETE HOST "
-    } else if dialog.editing {
-        " EDIT HOST "
+    let actions = if dialog.selected_field == 2
+        || (dialog.selected_field == 6 && dialog.fields[5].is_empty())
+    {
+        "Tab / ↑↓ field  Space select  Enter save  Esc cancel"
     } else {
-        " NEW HOST "
-    });
+        "Tab / ↑↓ field  Enter save  Esc cancel"
+    };
+    let block = if dialog.deleting {
+        action_panel(
+            " DELETE HOST ",
+            "y/Enter yes  n/Esc no",
+            Color::Rgb(221, 132, 112),
+        )
+    } else if dialog.editing {
+        form_panel(" EDIT HOST ", actions, area)
+    } else {
+        form_panel(" NEW HOST ", actions, area)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if dialog.deleting {
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(format!(
-                    "Delete LazyTerm-managed host \"{}\"?",
-                    dialog.fields[0]
-                )),
-                Line::from(""),
-                Line::from("y confirm    n / Esc cancel"),
+                Line::from(format!("Delete SSH host \"{}\"?", dialog.fields[0])),
+                Line::from(
+                    "Its Host entry will be removed from SSH config, including Include files.",
+                ),
+                Line::from("A backup is created before the config is changed."),
             ])
-            .style(Style::default().fg(TEXT))
+            .style(Style::default().fg(TEXT.into()))
             .wrap(Wrap { trim: true }),
             inner,
         );
         return;
     }
-    let labels = ["Alias", "HostName", "User", "Port", "IdentityFile"];
+    let labels = [
+        "Alias",
+        "HostName",
+        "Groups",
+        "User",
+        "Port",
+        "IdentityFile",
+        "ProxyJump",
+    ];
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1); 5])
+        .constraints([Constraint::Length(if inner.height >= 14 { 2 } else { 1 }); 7])
         .split(inner);
-    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
-        let cursor = if index == dialog.selected_field {
-            "_"
+    for (index, label) in labels.iter().enumerate() {
+        let value = if index == 2 {
+            format!("{}  [Space to select]", dialog.tags.join(", "))
         } else {
-            ""
+            dialog.fields[match index {
+                0 => 0,
+                1 => 1,
+                3 => 2,
+                4 => 3,
+                5 => 4,
+                6 => 5,
+                _ => unreachable!(),
+            }]
+            .clone()
         };
-        let line = Line::from(vec![
-            Span::styled(format!("{label:<13}"), Style::default().fg(MUTED)),
-            Span::styled(format!("{value}{cursor}"), Style::default().fg(TEXT)),
-        ]);
+        let mut line = form_input_line(
+            label,
+            &value,
+            index == dialog.selected_field
+                && !dialog.tag_picker_open
+                && !dialog.proxy_jump_picker_open,
+            false,
+            dialog.editor.position(index, &value),
+            rows[index].width,
+        );
+        if index == 6 && value.is_empty() {
+            line.spans.push(Span::styled(
+                if inner.width < 48 {
+                    " IP/alias | Space select"
+                } else {
+                    " IP/alias (unlisted OK) | Space to select"
+                },
+                Style::default().fg(MUTED.into()),
+            ));
+        }
         frame.render_widget(Paragraph::new(line), rows[index]);
     }
-    let help_area = Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(6),
-        width: inner.width,
-        height: inner.height.saturating_sub(6),
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
+}
+
+fn render_proxy_jump_picker(frame: &mut Frame, app: &App, dialog: &crate::app::HostDialog) {
+    let aliases = app.proxy_jump_choices();
+    let area = centered_rect(64, 16, frame.area());
+    frame.render_widget(Clear, area);
+    let block = action_panel(
+        " SELECT JUMP HOST ",
+        "↑↓ select  Enter use host  Esc back",
+        BORDER.into(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if aliases.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No other Hosts. Press Esc to enter a jump host manually.")
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+    } else {
+        let selected = dialog.proxy_jump_picker_selected.min(aliases.len() - 1);
+        let items = aliases.iter().enumerate().map(|(index, alias)| {
+            ListItem::new(format!(
+                "{} {alias}",
+                if index == selected { ">" } else { " " }
+            ))
+        });
+        let mut state = ListState::default().with_selected(Some(selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().bg(PANEL.into())),
+            inner,
+            &mut state,
+        );
+    }
+}
+
+fn render_host_tag_picker(frame: &mut Frame, app: &App, dialog: &crate::app::HostDialog) {
+    let available = app
+        .metadata
+        .tags
+        .values()
+        .flatten()
+        .cloned()
+        .chain(app.metadata.host_groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let filter = dialog.tag_filter.to_lowercase();
+    let matches = available
+        .iter()
+        .filter(|tag| tag.to_lowercase().contains(&filter))
+        .collect::<Vec<_>>();
+    let exact_match = available
+        .iter()
+        .any(|tag| tag.eq_ignore_ascii_case(dialog.tag_filter.trim()));
+    let create_tag =
+        (!dialog.tag_filter.trim().is_empty() && !exact_match).then(|| dialog.tag_filter.trim());
+    let option_count = matches.len() + usize::from(create_tag.is_some());
+    let selected = dialog
+        .tag_picker_selected
+        .min(option_count.saturating_sub(1));
+    let mut items = matches
+        .iter()
+        .enumerate()
+        .map(|(index, tag)| {
+            let checked = dialog.tags.iter().any(|selected| selected == *tag);
+            ListItem::new(format!(
+                "{} [{}] {}",
+                if selected == index { ">" } else { " " },
+                if checked { "x" } else { " " },
+                tag
+            ))
+        })
+        .collect::<Vec<_>>();
+    if let Some(tag) = create_tag {
+        items.push(ListItem::new(format!(
+            "{} [+] Create and add \"{tag}\"",
+            if selected == matches.len() { ">" } else { " " }
+        )));
+    }
+
+    let area = centered_rect(64, 16, frame.area());
+    frame.render_widget(Clear, area);
+    let block = action_panel(
+        " SELECT GROUPS ",
+        "Type filter  Space toggle  Enter create/apply  Esc done",
+        BORDER.into(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(input_line("Filter", &dialog.tag_filter, true, false)),
+        rows[0],
+    );
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No groups yet. Type a name to create one."),
+            rows[1],
+        );
+    } else {
+        let mut state = ListState::default().with_selected((option_count > 0).then_some(selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().bg(PANEL.into())),
+            rows[1],
+            &mut state,
+        );
+    }
+}
+
+fn render_host_group_dialog(frame: &mut Frame, dialog: &crate::app::HostGroupDialog) {
+    let area = centered_rect(68, 9, frame.area());
+    frame.render_widget(Clear, area);
+    if dialog.deleting {
+        let name = dialog.original_name.as_deref().unwrap_or("group");
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("Delete group \"{name}\"?")),
+                Line::from("Hosts will be kept; only this group assignment is removed."),
+            ])
+            .style(Style::default().fg(TEXT.into()))
+            .block(action_panel(
+                " DELETE GROUP ",
+                "y/Enter delete  n/Esc cancel",
+                Color::Rgb(221, 132, 112),
+            ))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+    } else {
+        let title = if dialog.original_name.is_some() {
+            " EDIT GROUP "
+        } else {
+            " NEW GROUP "
+        };
+        let block = form_panel(title, "Enter save  Esc cancel", area);
+        let inner = block.inner(area);
+        frame.render_widget(
+            Paragraph::new(form_input_line(
+                "Name",
+                &dialog.name,
+                true,
+                false,
+                dialog.editor.position(0, &dialog.name),
+                inner.width,
+            ))
+            .style(Style::default().fg(TEXT.into()))
+            .block(block),
+            area,
+        );
+        render_form_error(frame, inner, dialog.editor.error.as_deref());
+    }
+}
+
+fn render_tunnel_dialog(frame: &mut Frame, dialog: &crate::app::TunnelDialog) {
+    let area = centered_rect(82, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let title = if dialog.deleting {
+        " DELETE PORT FORWARDING "
+    } else if dialog.editing_id.is_some() {
+        match dialog.kind {
+            crate::metadata::TunnelKind::Local => " EDIT LOCAL FORWARDING ",
+            crate::metadata::TunnelKind::Remote => " EDIT REMOTE FORWARDING ",
+            crate::metadata::TunnelKind::Dynamic => " EDIT DYNAMIC FORWARDING ",
+        }
+    } else {
+        match dialog.kind {
+            crate::metadata::TunnelKind::Local => " NEW LOCAL FORWARDING ",
+            crate::metadata::TunnelKind::Remote => " NEW REMOTE FORWARDING ",
+            crate::metadata::TunnelKind::Dynamic => " NEW DYNAMIC FORWARDING ",
+        }
+    };
+    let block = if dialog.deleting {
+        action_panel(title, "y/Enter yes  n/Esc no", Color::Rgb(221, 132, 112))
+    } else {
+        form_panel(
+            title,
+            if dialog.selected_field == 8 {
+                "Tab / ↑↓ field  ←→/Space choice  Enter save  Esc cancel"
+            } else if dialog.selected_field == 1 {
+                "Tab / ↑↓ field  Space select  Enter save  Esc cancel"
+            } else {
+                "Tab / ↑↓ field  Enter save  Esc cancel"
+            },
+            area,
+        )
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if dialog.deleting {
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(format!(
+                "Delete forwarding \"{}\"?",
+                dialog.fields[0]
+            ))])
+            .style(Style::default().fg(TEXT.into()))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let labels = [
+        "Label",
+        "SSH host / IP",
+        if dialog.kind == crate::metadata::TunnelKind::Remote {
+            "Remote bind"
+        } else {
+            "Local bind"
+        },
+        if dialog.kind == crate::metadata::TunnelKind::Remote {
+            "Remote port"
+        } else {
+            "Local port"
+        },
+        if dialog.kind == crate::metadata::TunnelKind::Remote {
+            "Local destination"
+        } else {
+            "Destination"
+        },
+        "Destination port",
+        "Connect timeout (s)",
+        "KeepAlive interval (s)",
+    ];
+    let mode = match dialog.kind {
+        crate::metadata::TunnelKind::Local => "Local",
+        crate::metadata::TunnelKind::Remote => "Remote",
+        crate::metadata::TunnelKind::Dynamic => "Dynamic",
     };
     frame.render_widget(
-        Paragraph::new("Tab / ↑↓ next field    Enter next / save    Esc cancel")
-            .style(Style::default().fg(MUTED)),
-        help_area,
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                if dialog.selected_field == 8 {
+                    "> Mode  "
+                } else {
+                    "  Mode  "
+                },
+                Style::default().fg(if dialog.selected_field == 8 {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
+            ),
+            Span::styled(
+                "[F1 Local]  ",
+                Style::default().fg(if mode == "Local" {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
+            ),
+            Span::styled(
+                "[F2 Remote]  ",
+                Style::default().fg(if mode == "Remote" {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
+            ),
+            Span::styled(
+                "[F3 Dynamic]",
+                Style::default().fg(if mode == "Dynamic" {
+                    GREEN.into()
+                } else {
+                    MUTED.into()
+                }),
+            ),
+        ])),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
     );
+    let rows = Layout::vertical([Constraint::Length(if inner.height >= 18 { 2 } else { 1 }); 8])
+        .split(Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(2),
+            width: inner.width,
+            height: inner.height.saturating_sub(2),
+        });
+    for (index, (label, value)) in labels.iter().zip(dialog.fields.iter()).enumerate() {
+        let mut line = form_input_line(
+            label,
+            value,
+            index == dialog.selected_field,
+            false,
+            dialog.editor.position(index, value),
+            rows[index].width,
+        );
+        if index == 1 && value.is_empty() {
+            line.spans.push(Span::styled(
+                " IP/alias | Space select",
+                Style::default().fg(MUTED.into()),
+            ));
+        }
+        frame.render_widget(Paragraph::new(line), rows[index]);
+    }
+    render_form_error(frame, inner, dialog.editor.error.as_deref());
+}
+
+fn render_tunnel_host_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(64, 20, frame.area());
+    frame.render_widget(Clear, area);
+    render_host_picker(frame, area, app);
 }
 
 fn render_search(frame: &mut Frame, app: &App) {
     let area = centered_rect(60, 5, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(format!("/{}_", app.search_query)).block(
+        Paragraph::new(input_line("Filter", &app.search_query, true, false)).block(
             Block::default()
                 .title(" SEARCH HOSTS ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(GREEN))
-                .style(Style::default().bg(PANEL)),
+                .border_style(Style::default().fg(GREEN.into()))
+                .style(Style::default().bg(PANEL.into())),
         ),
         area,
     );
@@ -426,34 +4325,328 @@ fn render_search(frame: &mut Frame, app: &App) {
 
 fn render_connection_dialog(frame: &mut Frame, dialog: &ConnectionDialog) {
     let area = centered_rect(72, 9, frame.area());
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    let content = Paragraph::new(dialog.message.as_str()).wrap(Wrap { trim: false });
+    let content_lines = content.line_count(inner_width);
+    let needs_scroll = content_lines > usize::from(inner_height);
+    let max_scroll = content_lines.saturating_sub(usize::from(inner_height));
+    let scroll = if needs_scroll {
+        usize::from(dialog.scroll)
+            .min(max_scroll)
+            .min(u16::MAX as usize) as u16
+    } else {
+        0
+    };
     let border = if dialog.pending {
-        GREEN
+        GREEN.into()
     } else {
         Color::Rgb(221, 132, 112)
     };
     let footer = if dialog.pending {
-        "Please wait..."
+        if dialog.cancelable {
+            "Connecting...  Esc cancel"
+        } else {
+            "Please wait..."
+        }
+    } else if needs_scroll {
+        if area.width < 60 {
+            "↑↓ scroll  Enter/Esc close"
+        } else {
+            "↑↓ scroll  PgUp/PgDn page  Enter/Esc close"
+        }
     } else {
-        "Press any key to close"
+        "Enter close"
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                dialog.message.as_str(),
-                Style::default().fg(TEXT),
+        content
+            .style(Style::default().fg(TEXT.into()))
+            .scroll((scroll, 0))
+            .block(
+                Block::default()
+                    .title(format!(" {} ", dialog.title))
+                    .title_bottom(Span::styled(
+                        format!(" {footer} "),
+                        Style::default().fg(MUTED.into()),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border))
+                    .style(Style::default().bg(PANEL.into())),
+            ),
+        area,
+    );
+}
+
+fn render_host_password_dialog(frame: &mut Frame, dialog: &crate::app::HostPasswordDialog) {
+    let area = centered_rect(72, 12, frame.area());
+    let purpose = match &dialog.purpose {
+        HostPasswordPurpose::Authentication => "SSH authentication",
+        HostPasswordPurpose::UploadKey { .. } => "Install SSH public key",
+    };
+    let lines = vec![
+        Line::from(format!("Host: {}", dialog.alias)),
+        Line::from(""),
+        if matches!(dialog.purpose, HostPasswordPurpose::Authentication) {
+            Line::from(format!(
+                "  SSH user: {} (from Host/config)",
+                dialog.username
+            ))
+        } else {
+            form_input_line(
+                "Username",
+                &dialog.username,
+                dialog.selected_field == 0,
+                false,
+                dialog.editor.position(0, &dialog.username),
+                area.width.saturating_sub(2),
+            )
+        },
+        form_input_line(
+            "Password",
+            dialog.password.as_str(),
+            dialog.selected_field == 1,
+            true,
+            dialog.editor.position(1, dialog.password.as_str()),
+            area.width.saturating_sub(2),
+        ),
+        if dialog.save_allowed {
+            checkbox_line(
+                "Save password in system Keychain",
+                dialog.save_in_keychain,
+                dialog.selected_field == 2,
+            )
+        } else {
+            Line::from("  Add this host to Hosts to save its password.")
+        },
+    ];
+    let title = format!(" {purpose} ");
+    let block = form_panel(
+        &title,
+        if dialog.selected_field == 2 && dialog.save_allowed {
+            "Tab / ↑↓ field  Space toggle  Enter connect  Esc cancel"
+        } else {
+            "Tab / ↑↓ field  Enter connect  Esc cancel"
+        },
+        area,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().fg(TEXT.into()))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    render_form_error(frame, inner, dialog.error.as_deref());
+}
+
+pub(crate) fn input_line(label: &str, value: &str, focused: bool, masked: bool) -> Line<'static> {
+    form_input_line(label, value, focused, masked, value.len(), u16::MAX)
+}
+
+pub(crate) fn form_input_line(
+    label: &str,
+    value: &str,
+    focused: bool,
+    masked: bool,
+    cursor: usize,
+    width: u16,
+) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    let shown = if masked {
+        "*".repeat(value.chars().count())
+    } else {
+        value.to_string()
+    };
+    let position = if masked {
+        value[..cursor].chars().count()
+    } else {
+        cursor
+    };
+    let mut shown = shown;
+    if focused {
+        shown.insert(position, '_');
+    }
+    let label = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{label}: ")
+    };
+    let available = usize::from(width).saturating_sub(label.width() + 2).max(1);
+    let mut start = 0;
+    if focused {
+        while shown[start..position].width() >= available {
+            start += shown[start..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    Line::from(vec![
+        Span::styled(
+            if focused { "> " } else { "  " },
+            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
+        ),
+        Span::styled(
+            label,
+            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
+        ),
+        Span::styled(shown[start..].to_string(), Style::default().fg(TEXT.into())),
+    ])
+}
+
+pub(crate) fn render_form_error(frame: &mut Frame, inner: Rect, error: Option<&str>) {
+    if let Some(error) = error {
+        let height = inner.height.min(2);
+        frame.render_widget(
+            Paragraph::new(crate::diagnostics::redact_sensitive_text(error))
+                .style(Style::default().fg(Color::Rgb(221, 132, 112)))
+                .wrap(Wrap { trim: false }),
+            Rect {
+                y: inner.bottom().saturating_sub(height),
+                height,
+                ..inner
+            },
+        );
+    }
+}
+
+pub(crate) fn checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if focused { "> " } else { "  " },
+            Style::default().fg(if focused { GREEN.into() } else { MUTED.into() }),
+        ),
+        Span::styled(
+            format!("[{}] {label}", if checked { "x" } else { " " }),
+            Style::default().fg(if focused { GREEN.into() } else { TEXT.into() }),
+        ),
+    ])
+}
+
+fn render_credential_export_dialog(frame: &mut Frame, dialog: &crate::app::CredentialExportDialog) {
+    let area = centered_rect(76, 12, frame.area());
+    frame.render_widget(Clear, area);
+    let block = form_panel(
+        " EXPORT ENCRYPTED CREDENTIALS ",
+        "Tab / ↑↓ field  Enter export  Esc cancel",
+        area,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(2),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new("Set a password to protect the exported .age file.")
+            .style(Style::default().fg(TEXT.into())),
+        rows[0],
+    );
+    for (index, label) in ["Export password", "Confirm password"].iter().enumerate() {
+        let focused = dialog.selected_field == index;
+        let value = &dialog.fields[index];
+        frame.render_widget(
+            Paragraph::new(form_input_line(
+                label,
+                value,
+                focused,
+                true,
+                dialog.editor.position(index, value),
+                rows[index + 1].width,
             )),
-            Line::from(""),
-            Line::from(Span::styled(footer, Style::default().fg(MUTED))),
-        ])
-        .block(
-            Block::default()
-                .title(format!(" {} ", dialog.title))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border))
-                .style(Style::default().bg(PANEL)),
-        )
-        .wrap(Wrap { trim: true }),
+            rows[index + 1],
+        );
+    }
+    render_form_error(frame, inner, dialog.error.as_deref());
+}
+
+fn render_credential_import_dialog(frame: &mut Frame, dialog: &crate::app::CredentialImportDialog) {
+    let area = centered_rect(72, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let input = Rect {
+        x: area.x + 1,
+        y: area.y + 3,
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new("Enter the password used to encrypt this credential archive.")
+            .style(Style::default().fg(TEXT.into()))
+            .block(
+                Block::default()
+                    .title(" IMPORT ENCRYPTED CREDENTIALS ")
+                    .title_bottom(Span::styled(
+                        " Enter import   Esc cancel ",
+                        Style::default().fg(MUTED.into()),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GREEN.into()))
+                    .style(Style::default().bg(PANEL.into())),
+            ),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(form_input_line(
+            "Password",
+            &dialog.password,
+            true,
+            true,
+            dialog.editor.position(0, &dialog.password),
+            input.width,
+        )),
+        input,
+    );
+    if let Some(error) = dialog.error.as_deref() {
+        let error_area = Rect {
+            x: area.x + 2,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(crate::diagnostics::redact_sensitive_text(error))
+                .style(Style::default().fg(Color::Rgb(221, 132, 112))),
+            error_area,
+        );
+    }
+}
+
+fn render_import_confirmation(frame: &mut Frame, app: &App, kind: crate::app::ImportKind) {
+    let (title, message) = match kind {
+        crate::app::ImportKind::Configuration => (
+            "IMPORT CONFIGURATION",
+            format!(
+                "Merge {} SSH hosts and LazyTerm data. Incoming same-name entries take priority; local-only entries remain. Current files will be backed up first. Keychain passwords are imported separately.",
+                app.pending_configuration_import
+                    .as_ref()
+                    .map_or(0, |pending| pending.import.host_count)
+            ),
+        ),
+        crate::app::ImportKind::Credentials => (
+            "IMPORT CREDENTIALS",
+            "Matching Keychain entries will be replaced. Existing values are backed up encrypted using this archive's password.".to_string(),
+        ),
+    };
+    let area = centered_rect(82, 10, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(TEXT.into()))
+            .block(
+                Block::default()
+                    .title(format!(" {title} "))
+                    .title_bottom(Span::styled(
+                        " y/Enter confirm   n/Esc cancel ",
+                        Style::default().fg(MUTED.into()),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(221, 177, 91)))
+                    .style(Style::default().bg(PANEL.into())),
+            ),
         area,
     );
 }
@@ -474,22 +4667,1317 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::{app::App, hosts::HostCatalog};
+    use crate::{
+        app::{App, TransferStatus, TransferTask},
+        hosts::{Host, HostCatalog},
+    };
+
+    #[test]
+    fn files_only_show_the_focused_panes_filter_cursor() {
+        let mut app = App::with_catalog(
+            HostCatalog {
+                hosts: vec![Host {
+                    alias: "web".into(),
+                    hostname: Some("web.example.com".into()),
+                    user: None,
+                    port: None,
+                    identity_file: None,
+                    proxy_jump: None,
+                    managed: false,
+                }],
+                error: None,
+            },
+            Ok(Default::default()),
+        );
+        app.section = NavSection::Files;
+        app.host_context = Some("web".into());
+        app.files = FilesState::Loaded(crate::sftp::SftpListing {
+            host_alias: "web".into(),
+            path: String::new(),
+            entries: Vec::new(),
+        });
+        for pane in [FilePane::Local, FilePane::Remote] {
+            app.active_file_pane = pane;
+            app.file_filtering = true;
+            app.local_file_filter.clear();
+            app.remote_file_filter.clear();
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert_eq!(text.matches("> Filter: _").count(), 1);
+            assert_eq!(text.matches("Filter:").count(), 1);
+        }
+        app.local_file_filter = "local-query".into();
+        app.remote_file_filter = "remote-query".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("  Filter: local-query"));
+        assert!(text.contains("> Filter: remote-query_"));
+    }
+
+    #[test]
+    fn file_name_dialogs_keep_actions_on_bottom_and_show_the_edit_position() {
+        for (width, height) in [(90, 24), (44, 14)] {
+            for dialog in [
+                FileDialog::Rename {
+                    pane: FilePane::Local,
+                    old_name: "before.txt".into(),
+                    value: "after.txt".into(),
+                    cursor: 2,
+                },
+                FileDialog::CreateDir {
+                    pane: FilePane::Remote,
+                    value: "after.txt".into(),
+                    cursor: 2,
+                },
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| render_file_dialog(frame, &dialog))
+                    .unwrap();
+                let area = centered_rect(68, 7, Rect::new(0, 0, width, height));
+                let buffer = terminal.backend().buffer();
+                let bottom: String = (area.x..area.right())
+                    .map(|x| buffer[(x, area.bottom() - 1)].symbol())
+                    .collect();
+                assert!(bottom.contains("Enter save  Esc cancel"));
+                let caret = buffer
+                    .content
+                    .iter()
+                    .find(|cell| cell.modifier.contains(Modifier::REVERSED))
+                    .unwrap();
+                assert_eq!(caret.symbol(), "t");
+            }
+        }
+        let value = format!("{}中文.txt", "a".repeat(200));
+        let line = file_name_input(&value, value.len(), 30);
+        assert!(line.width() <= 30);
+        assert!(line.to_string().contains("中文.txt"));
+    }
+
+    #[test]
+    fn host_action_notice_renders_as_centered_dialog() {
+        let mut metadata = crate::metadata::Metadata::default();
+        metadata.tags.insert(
+            "other".into(),
+            vec!["dogfooding".into(), "production".into()],
+        );
+        let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
+        app.host_action_dialog = Some(crate::app::HostActionDialog {
+            title: "NO SAVED PASSWORD".into(),
+            message: "No saved password is configured for this Host.".into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("NO SAVED PASSWORD"));
+        assert!(text.contains("No saved password"));
+        assert!(text.contains("Enter/Esc close"));
+    }
+
+    #[test]
+    fn notices_render_as_a_transient_upper_right_toast_without_reserving_layout() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.notice = Some("Saved host demo.".into());
+        app.update_toast();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = format!("{}", terminal.backend());
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(lines[3].contains("Saved host demo."));
+        assert!(!lines[3].contains("┌"));
+        assert_eq!(
+            text.matches("Saved host demo.").count(),
+            1,
+            "notices should render once in the toast"
+        );
+        assert!(lines[22].contains("1-7 tabs"));
+        assert!(!lines[22].contains("Saved host demo."));
+    }
+
+    #[test]
+    fn ssh_config_errors_remain_in_the_hosts_page_not_the_toast() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.hosts.error = Some("Could not parse SSH config.".into());
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = format!("{}", terminal.backend());
+        assert_eq!(text.matches("Could not parse SSH config.").count(), 1);
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn expired_toasts_are_not_rendered() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.toast = Some(crate::app::ToastNotice {
+            message: "Saved host demo.".into(),
+            expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(!format!("{}", terminal.backend()).contains("Saved host demo."));
+    }
+
+    #[test]
+    fn long_connection_errors_preserve_lines_and_can_be_scrolled() {
+        use crossterm::event::KeyCode;
+
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.connection_dialog = Some(ConnectionDialog {
+            title: "Connection failed".into(),
+            message: [
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+                "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+                "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!",
+                "Someone could be eavesdropping on you right now.",
+                "It is also possible that a host key has just been changed.",
+                "The fingerprint for the ED25519 key sent by the remote host is",
+                "SHA256:fixture-fingerprint",
+                "Please contact your system administrator.",
+                "Update the key in known_hosts to remove this warning.",
+            ]
+            .join("\n"),
+            pending: false,
+            cancelable: false,
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let first_page = format!("{}", terminal.backend());
+        assert!(first_page.contains("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"));
+        assert!(!first_page.contains("fixture-fingerprint"));
+        assert!(first_page.contains("PgUp/PgDn"));
+
+        app.handle_key(KeyCode::PageDown);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(format!("{}", terminal.backend()).contains("SHA256:fixture-fingerprint"));
+    }
+
+    #[test]
+    fn short_connection_errors_do_not_show_scroll_controls() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.connection_dialog = Some(ConnectionDialog {
+            title: "Connection failed".into(),
+            message: "Connection refused.".into(),
+            pending: false,
+            cancelable: false,
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("Enter close"));
+        assert!(!text.contains("scroll"));
+        assert!(!text.contains("PgUp"));
+    }
+
+    #[test]
+    fn host_delete_confirmation_places_actions_on_dialog_bottom_border() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.host_dialog = Some(crate::app::HostDialog {
+            editor: Default::default(),
+            fields: [
+                "prod".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+            tags: Vec::new(),
+            tag_picker_open: false,
+            tag_filter: String::new(),
+            tag_picker_selected: 0,
+            proxy_jump_picker_open: false,
+            proxy_jump_picker_selected: 0,
+            original_alias: None,
+            selected_field: 0,
+            editing: false,
+            deleting: true,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.lines().any(|line| line.contains("y/Enter yes")));
+        assert!(text.lines().any(|line| line.contains("n/Esc no")));
+        assert!(!text.contains("y / Enter confirm"));
+    }
+
+    #[test]
+    fn long_form_values_keep_unicode_and_masked_cursors_visible() {
+        let value = format!("{}中文{}", "start".repeat(20), "tail".repeat(20));
+        for masked in [false, true] {
+            for key in [
+                crossterm::event::KeyCode::Home,
+                crossterm::event::KeyCode::End,
+            ] {
+                let mut editor = crate::form::Editor::default();
+                let mut text = value.clone();
+                editor.edit(0, &mut text, key);
+                let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new(form_input_line(
+                                "Value",
+                                &text,
+                                true,
+                                masked,
+                                editor.position(0, &text),
+                                40,
+                            )),
+                            frame.area(),
+                        );
+                    })
+                    .unwrap();
+                let output = format!("{}", terminal.backend());
+                assert!(output.contains('_'), "{output}");
+                assert!(output.contains("> Value: "), "{output}");
+                if masked {
+                    assert!(output.contains('*'), "{output}");
+                    assert!(!output.contains("start"), "{output}");
+                    assert!(!output.contains("中文"), "{output}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_form_footers_keep_save_and_cancel_visible() {
+        for width in [42, 60, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        form_panel(
+                            " NEW ",
+                            "Tab / ↑↓ field  Space toggle  Enter save  Esc cancel",
+                            frame.area(),
+                        ),
+                        frame.area(),
+                    );
+                })
+                .unwrap();
+            let output = format!("{}", terminal.backend());
+            assert!(output.contains("Enter save"), "{output}");
+            assert!(output.contains("Esc cancel"), "{output}");
+        }
+    }
+
+    #[test]
+    fn tunnel_snippet_and_package_forms_keep_actions_on_the_bottom_border() {
+        let app = App::with_catalog(HostCatalog::default(), Ok(Default::default()));
+        for (width, height) in [(100, 30), (80, 24), (60, 20)] {
+            for editing in [false, true] {
+                for form in 0..3 {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| match form {
+                            0 => render_tunnel_dialog(
+                                frame,
+                                &crate::app::TunnelDialog {
+                                    editor: Default::default(),
+                                    fields: [
+                                        "Database".into(),
+                                        "web".into(),
+                                        "127.0.0.1".into(),
+                                        "3306".into(),
+                                        "localhost".into(),
+                                        "3306".into(),
+                                        "10".into(),
+                                        "30".into(),
+                                    ],
+                                    kind: crate::metadata::TunnelKind::Local,
+                                    editing_id: editing.then(uuid::Uuid::new_v4),
+                                    selected_field: 1,
+                                    deleting: false,
+                                },
+                            ),
+                            1 => render_snippet_dialog(
+                                frame,
+                                &crate::app::SnippetDialog {
+                                    editor: Default::default(),
+                                    fields: [
+                                        "Health".into(),
+                                        "uptime".into(),
+                                        "Check".into(),
+                                        "true".into(),
+                                    ],
+                                    package_id: uuid::Uuid::nil(),
+                                    editing_id: editing.then(uuid::Uuid::new_v4),
+                                    selected_field: 3,
+                                },
+                                &app,
+                            ),
+                            _ => render_package_dialog(
+                                frame,
+                                &crate::app::PackageDialog {
+                                    editor: Default::default(),
+                                    fields: ["Operations".into(), "Checks".into()],
+                                    editing_id: editing.then(uuid::Uuid::new_v4),
+                                    selected_field: 0,
+                                },
+                            ),
+                        })
+                        .unwrap();
+                    let area = centered_rect(
+                        if form == 2 { 72 } else { 82 },
+                        [22, 16, 11][form],
+                        Rect::new(0, 0, width, height),
+                    );
+                    let buffer = terminal.backend().buffer();
+                    let bottom = (area.x..area.right())
+                        .map(|x| buffer[(x, area.bottom() - 1)].symbol())
+                        .collect::<String>();
+                    assert!(bottom.contains("Enter save"), "{bottom}");
+                    assert!(bottom.contains("Esc cancel"), "{bottom}");
+                    let text = format!("{}", terminal.backend());
+                    assert_eq!(text.matches("Enter save").count(), 1, "{text}");
+                    if form == 0 {
+                        assert!(bottom.contains("Space select"), "{bottom}");
+                        assert!(text.contains("> SSH host / IP: web_"), "{text}");
+                        assert!(text.contains("KeepAlive interval (s): 30"), "{text}");
+                    } else if form == 1 {
+                        assert!(bottom.contains("Space toggle"), "{bottom}");
+                        assert!(text.contains("Dangerous command"), "{text}");
+                        assert!(text.contains("Package: Unknown"), "{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_forms_render_group_field_and_consistent_bottom_actions() {
+        let mut metadata = crate::metadata::Metadata::default();
+        metadata.tags.insert(
+            "other".into(),
+            vec!["dogfooding".into(), "production".into()],
+        );
+        let mut app = App::with_catalog(HostCatalog::default(), Ok(metadata));
+        app.host_dialog = Some(crate::app::HostDialog {
+            editor: Default::default(),
+            fields: [
+                "prod".into(),
+                "example.com".into(),
+                "deploy".into(),
+                "22".into(),
+                String::new(),
+                "bastion".into(),
+            ],
+            tags: vec!["production".into(), "dogfooding".into()],
+            tag_picker_open: false,
+            tag_filter: String::new(),
+            tag_picker_selected: 0,
+            proxy_jump_picker_open: false,
+            proxy_jump_picker_selected: 0,
+            original_alias: Some("prod".into()),
+            selected_field: 2,
+            editing: true,
+            deleting: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("EDIT HOST"));
+        assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
+        assert!(text.contains("Space select  Enter save"));
+        assert!(text.contains("ProxyJump: bastion"));
+
+        app.host_dialog.as_mut().unwrap().editing = false;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("NEW HOST"));
+        assert!(text.contains("Groups: production, dogfooding  [Space to select]_"));
+        assert!(text.contains("Space select  Enter save"));
+
+        app.host_dialog.as_mut().unwrap().tag_picker_open = true;
+        app.host_dialog.as_mut().unwrap().tag_filter = "dog".into();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("SELECT GROUPS"));
+        assert!(text.contains("[x] dogfooding"), "{text}");
+        assert!(text.contains("Create and add \"dog\""));
+
+        app.host_dialog.as_mut().unwrap().tag_picker_open = false;
+        app.host_dialog.as_mut().unwrap().selected_field = 6;
+        for (width, height) in [(100, 30), (80, 24), (54, 18), (42, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("> ProxyJump: bastion"),
+                "{width}x{height}: {text}"
+            );
+            let jump_line = text
+                .lines()
+                .find(|line| line.contains("ProxyJump:"))
+                .unwrap();
+            assert!(!jump_line.contains("Space"), "{jump_line}");
+            assert!(!text.contains("Space select  Enter save"), "{text}");
+
+            app.host_dialog.as_mut().unwrap().fields[5].clear();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            let jump_line = text
+                .lines()
+                .find(|line| line.contains("ProxyJump:"))
+                .unwrap();
+            assert!(jump_line.contains("IP/alias"), "{jump_line}");
+            assert!(jump_line.contains("Space"), "{jump_line}");
+            if width >= 80 {
+                assert!(jump_line.contains("unlisted OK"), "{jump_line}");
+            }
+            app.host_dialog.as_mut().unwrap().fields[5] = "bastion".into();
+
+            app.host_dialog.as_mut().unwrap().proxy_jump_picker_open = true;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("SELECT JUMP HOST"), "{text}");
+            assert!(text.contains("No other Hosts."), "{text}");
+            app.host_dialog.as_mut().unwrap().proxy_jump_picker_open = false;
+        }
+    }
+
+    #[test]
+    fn hosts_footer_shows_delete_shortcut_across_layouts() {
+        use crate::hosts::Host;
+        use crate::metadata::parse_tags;
+
+        for (width, height) in [(120, 30), (80, 24), (54, 18), (42, 18)] {
+            let mut app = App::with_catalog(
+                HostCatalog {
+                    hosts: vec![Host {
+                        alias: "managed".into(),
+                        hostname: None,
+                        user: None,
+                        port: None,
+                        identity_file: None,
+                        proxy_jump: None,
+                        managed: true,
+                    }],
+                    error: None,
+                },
+                Ok(crate::metadata::Metadata::default()),
+            );
+            app.section = crate::app::NavSection::Hosts;
+            app.metadata
+                .tags
+                .insert("managed".into(), parse_tags("work"));
+            app.selected_browse_item = app.visible_groups().len();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("d delete"), "{width}x{height}: {text}");
+        }
+    }
+
+    #[test]
+    fn host_key_password_dialog_is_above_selector_and_masks_the_password() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.open_host_ssh_key_selector("web".into());
+        app.prompt_host_password(
+            "web".into(),
+            "root".into(),
+            Some("Password authentication required.".into()),
+            true,
+            HostPasswordPurpose::Authentication,
+        );
+        app.host_password_dialog
+            .as_mut()
+            .unwrap()
+            .password
+            .push_str("fixture-secret");
+        for (width, height) in [(80, 24), (60, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Password: **************"), "{text}");
+            assert!(text.contains("SSH user: root (from Host/config)"));
+            assert!(text.contains("Save password in system Keychain"));
+            assert!(text.contains("Enter connect"));
+            assert!(!text.contains("fixture-secret"));
+        }
+    }
+
+    #[test]
+    fn file_sizes_use_readable_units() {
+        assert_eq!(format_bytes(12), "12 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(12 * 1024), "12 KB");
+        assert_eq!(format_bytes(1536 * 1024), "1.5 MB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2 GB");
+    }
+
+    #[test]
+    fn remote_times_use_readable_utc_values() {
+        assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_unix_timestamp(1_704_067_200), "2024-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn credential_export_fields_render_masked_input_and_cursor() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.credential_export_dialog = Some(crate::app::CredentialExportDialog {
+            editor: Default::default(),
+            fields: ["secret".into(), "confirmed".into()],
+            selected_field: 0,
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("******_"), "{text}");
+        assert!(text.contains("*********"), "{text}");
+    }
+
+    #[test]
+    fn import_password_is_masked_and_configuration_requires_confirmation() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.credential_import_dialog = Some(crate::app::CredentialImportDialog {
+            editor: Default::default(),
+            password: "archive-secret".into(),
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("**************"), "{text}");
+        assert!(!text.contains("archive-secret"), "{text}");
+
+        app.credential_import_dialog = None;
+        app.import_confirmation = Some(crate::app::ImportKind::Credentials);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("IMPORT CREDENTIALS"), "{text}");
+        assert!(text.contains("y / Enter confirm"), "{text}");
+        assert!(
+            text.contains("encrypted using this archive's password"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn populated_projects_forms_and_output_render_and_scroll_at_supported_sizes() {
+        use crate::projects::tests::{Fixture, until};
+        use crossterm::event::KeyCode;
+        let mut fixture = Fixture::new("render");
+        fixture.project.name = "Demo".into();
+        let mut command = fixture.command(
+            "i=0; while [ \"$i\" -lt 200 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i + 1)); done",
+        );
+        command.name = "Server".into();
+        fixture.project.commands.push(command.clone());
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.metadata_error = true;
+        app.metadata.projects.push(fixture.project.clone());
+        app.project_service = fixture.service();
+        app.project_service
+            .start(&fixture.project, &command)
+            .unwrap();
+        until(&mut app.project_service, |s| {
+            !s.active((fixture.project.id, command.id))
+        });
+        for (width, height) in [(120, 40), (80, 24), (54, 18), (42, 18), (32, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            app.section = NavSection::Projects;
+            app.viewport_width = width;
+            app.viewport_height = height;
+            app.workspace.project_open = false;
+            app.workspace.output_open = false;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("Demo"));
+            app.handle_projects_key(KeyCode::Enter);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("Server"));
+            assert!(format!("{}", terminal.backend()).contains("exit 0"));
+            app.handle_projects_key(KeyCode::Enter);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(
+                format!("{}", terminal.backend()).contains("line-199"),
+                "{width}x{height} must follow live tail"
+            );
+            app.handle_projects_key(KeyCode::Home);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("line-000"));
+            assert!(!format!("{}", terminal.backend()).contains("line-199"));
+            app.handle_projects_key(KeyCode::End);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("line-199"));
+            app.handle_projects_key(KeyCode::Char('e'));
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("EDIT COMMAND"));
+            assert!(format!("{}", terminal.backend()).contains("Name"));
+            assert!(format!("{}", terminal.backend()).contains("Working directory"));
+            app.handle_projects_key(KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn project_action_hints_match_selected_workspace_item() {
+        use crate::projects::tests::Fixture;
+        let mut fixture = Fixture::new("project-action-hints");
+        let mut command = fixture.command("true");
+        command.group = Some("Services".into());
+        fixture.project.groups = vec!["Services".into()];
+        fixture.project.commands.push(command);
+        fixture.project.links.push(crate::projects::ProjectLink {
+            id: uuid::Uuid::from_u128(1),
+            name: "Home".into(),
+            url: "http://localhost/".into(),
+            ..Default::default()
+        });
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Projects;
+        app.workspace.project_open = true;
+        app.metadata.projects.push(fixture.project.clone());
+        app.workspace.selected_item = 2;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("A/X services"), "{text}");
+        assert!(!text.contains("s start"), "{text}");
+        assert!(!text.contains("r restart"), "{text}");
+
+        app.workspace.selected_item = 3;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("s start  x stop  r restart"), "{text}");
+
+        app.workspace.selected_item = 1;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("Enter browser"), "{text}");
+        assert!(!text.contains("s start"), "{text}");
+    }
+
+    #[test]
+    fn runtime_project_source_shows_project_and_command_and_group_stop_confirmation() {
+        use crate::runtime::{RuntimeEntry, RuntimeOrigin, RuntimeProcessKind};
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Runtime;
+        app.runtime_entries.push(RuntimeEntry {
+            protocol: "TCP".into(),
+            address: "127.0.0.1".into(),
+            port: 3000,
+            pid: Some(42),
+            process: "node".into(),
+            user: "501".into(),
+            command: "node server.js".into(),
+            working_directory: Some("/tmp/demo".into()),
+            owned_by_current_user: true,
+            kind: RuntimeProcessKind::Application,
+            origin: RuntimeOrigin::Project,
+            origin_reason: "Managed command: Demo / Dev server".into(),
+            project: Some(crate::projects::ProjectOwner {
+                key: (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)),
+                run_id: 3,
+                process_group: 42,
+                project_name: "Demo".into(),
+                command_name: "Dev server".into(),
+            }),
+            external_project: None,
+            tunnel: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("PROJECT"));
+        assert!(text.contains("Demo / Dev server"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "P" && cell.fg == GREEN.into())
+        );
+        app.runtime_kill_confirmation = app.selected_runtime_entry().cloned();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(format!("{}", terminal.backend()).contains("all its child processes"));
+    }
+
+    #[test]
+    fn runtime_categories_render_selection_and_filtered_process_details() {
+        use crate::runtime::{RuntimeEntry, RuntimeFilter, RuntimeProcessKind};
+        for (width, height) in [(120, 30), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut app = App::with_catalog(
+                HostCatalog::default(),
+                Ok(crate::metadata::Metadata::default()),
+            );
+            app.section = NavSection::Runtime;
+            app.runtime_entries.push(RuntimeEntry {
+                protocol: "TCP".into(),
+                address: "127.0.0.1".into(),
+                port: 3000,
+                pid: Some(123),
+                process: "node".into(),
+                user: "501".into(),
+                command: "node server.js".into(),
+                working_directory: Some("/tmp/project".into()),
+                owned_by_current_user: true,
+                kind: RuntimeProcessKind::Application,
+                origin: crate::runtime::RuntimeOrigin::CommandLine,
+                origin_reason: "Shell ancestor".into(),
+                project: None,
+                external_project: None,
+                tunnel: None,
+            });
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Mine 1"));
+            assert!(text.contains("Apps 1"));
+            assert!(text.contains("System 0"));
+            assert!(text.contains(">> 3000"));
+            assert!(text.contains("CLI"));
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "n"
+                        && cell.fg
+                            == runtime_origin_color(crate::runtime::RuntimeOrigin::CommandLine))
+            );
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "3" && cell.bg == Color::Rgb(47, 78, 61))
+            );
+            app.runtime_filter = RuntimeFilter::System;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(!format!("{}", terminal.backend()).contains("node"));
+            app.runtime_filter = RuntimeFilter::Mine;
+            app.runtime_target = crate::runtime::RuntimeTarget::Host("prod-web".into());
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Local"));
+            assert!(text.contains("Hosts ▾"));
+            assert!(text.contains("prod-web"));
+            let layout = runtime_layout(terminal.get_frame().area());
+            assert_eq!(
+                terminal.backend().buffer()[(layout.hosts.x + 1, layout.hosts.y)].fg,
+                GREEN.into()
+            );
+            assert_eq!(
+                terminal.backend().buffer()[(layout.local.x + 1, layout.local.y)].fg,
+                MUTED.into()
+            );
+            app.runtime_kill_confirmation = app.selected_runtime_entry().cloned();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("Machine: Host / prod-web"));
+        }
+    }
+
+    #[test]
+    fn settings_pickers_show_all_choices_at_compact_sizes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (width, height) in [(100, 30), (80, 24), (32, 12)] {
+            for (setting, labels) in [
+                (0, vec!["Forest", "Ocean", "Amber", "Rose"]),
+                (1, vec!["English", "中文", "日本語"]),
+            ] {
+                let mut app = App::with_catalog(
+                    HostCatalog::default(),
+                    Ok(crate::metadata::Metadata::default()),
+                );
+                app.section = NavSection::Settings;
+                app.selected_setting = setting;
+                app.handle_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert!(app.settings_picker.is_some());
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| render_settings_picker(frame, &app))
+                    .unwrap();
+                let text = format!("{}", terminal.backend());
+                for label in labels {
+                    assert!(text.contains(label), "{width}x{height}: missing {label}");
+                }
+                assert_eq!(text.matches("●").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_render_options_in_non_selectable_sections() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Settings;
+        app.selected_setting = 12;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("Appearance"));
+        assert!(text.contains("Workspace tabs"));
+        assert!(text.contains("Configuration"));
+        assert!(text.contains("Import credentials"));
+        assert!(text.contains("Configuration sync"));
+        assert_eq!(text.matches("▸").count(), 1);
+    }
+
+    #[test]
+    fn sync_settings_modal_shows_remote_branch_and_sync_action() {
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Settings;
+        app.sync_settings.remote = "git@example.test:team/config.git".into();
+        app.sync_settings.branch = "main".into();
+        app.sync_dialog = Some(crate::app::SyncSettingsDialog {
+            editor: Default::default(),
+            remote: app.sync_settings.remote.clone(),
+            branch: app.sync_settings.branch.clone(),
+            selected: 4,
+            testing: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("git@example.test:team/config.git"));
+        assert!(text.contains("main"));
+        assert!(text.contains("Sync now"));
+        assert!(text.contains("private remote"));
+    }
 
     #[test]
     fn all_sections_render_at_desktop_and_compact_sizes() {
-        for (width, height) in [(120, 40), (80, 24), (54, 18)] {
+        for (width, height) in [(120, 40), (80, 24), (54, 18), (42, 18), (32, 12)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).expect("create test terminal");
-            let mut app = App::new();
-            app.hosts = HostCatalog::default();
+            let mut app = App::with_catalog(
+                HostCatalog::default(),
+                Ok(crate::metadata::Metadata::default()),
+            );
 
             for section in NavSection::ALL {
                 app.section = section;
                 terminal
                     .draw(|frame| render(frame, &app))
                     .expect("render section");
+                if section == NavSection::Runtime {
+                    let text = format!("{}", terminal.backend());
+                    for label in ["Local", "Hosts ▾", "Mine 0", "Apps 0", "System 0", "All 0"] {
+                        assert!(text.contains(label), "{width}x{height}: missing {label}");
+                    }
+                }
             }
+        }
+    }
+
+    #[test]
+    fn files_render_persistent_local_pane_remote_empty_state_and_host_picker() {
+        use crate::{
+            hosts::Host,
+            metadata::{Metadata, parse_tags},
+        };
+
+        for (width, height) in [(120, 40), (80, 24), (54, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut app = App::with_catalog(
+                HostCatalog {
+                    hosts: vec![Host {
+                        alias: "web-prod".into(),
+                        hostname: Some("web.example.com".into()),
+                        user: None,
+                        port: None,
+                        identity_file: None,
+                        proxy_jump: None,
+                        managed: false,
+                    }],
+                    error: None,
+                },
+                Ok(Metadata::default()),
+            );
+            app.section = NavSection::Files;
+            app.metadata
+                .tags
+                .insert("web-prod".into(), parse_tags("production"));
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("LOCAL"));
+            assert!(text.contains("REMOTE"));
+            assert!(text.contains("Connect to host"));
+            assert!(text.contains("Select host"));
+
+            app.host_picker_open = true;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("Groups"));
+            assert!(text.contains("Hosts"));
+            assert!(text.contains("production"));
+            assert!(text.contains("web-prod"));
+        }
+    }
+
+    #[test]
+    fn files_render_transfer_task_list() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Files;
+        app.transfer_tasks.push(TransferTask {
+            id: 1,
+            host_alias: "web".into(),
+            direction: crate::sftp::TransferDirection::Upload,
+            name: "notes.txt".into(),
+            local_path: std::path::PathBuf::from("/tmp/notes.txt"),
+            remote_path: "notes.txt".into(),
+            is_dir: false,
+            transferred: 10,
+            total: 10,
+            status: TransferStatus::Completed,
+        });
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("TRANSFERS"));
+        assert!(text.contains("notes.txt"));
+        assert!(text.contains("done"));
+    }
+
+    #[test]
+    fn tunnels_render_list_and_detail_panel() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::with_catalog(
+            HostCatalog {
+                hosts: vec![Host {
+                    alias: "web".into(),
+                    hostname: Some("web.example.com".into()),
+                    user: None,
+                    port: None,
+                    identity_file: None,
+                    proxy_jump: None,
+                    managed: false,
+                }],
+                error: None,
+            },
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.section = NavSection::Tunnels;
+        app.metadata
+            .tunnels
+            .push(crate::metadata::TunnelDefinition {
+                id: uuid::Uuid::from_u128(1),
+                label: "web-db".into(),
+                host_alias: "web".into(),
+                custom_host: false,
+                kind: crate::metadata::TunnelKind::Local,
+                bind_address: "127.0.0.1".into(),
+                local_port: 15432,
+                remote_host: Some("db.internal".into()),
+                remote_port: Some(5432),
+                lifecycle: crate::metadata::TunnelLifecycle::App,
+                auto_reconnect: false,
+                connect_timeout_secs: 10,
+                keepalive_interval_secs: 30,
+            });
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("PORT FORWARDING"));
+        assert!(text.contains("web-db"));
+        assert!(text.contains("db.internal:5432"));
+        assert!(text.contains("EDIT PORT FORWARDING"));
+    }
+
+    #[test]
+    fn tabs_share_one_top_row_and_content_has_no_sidebar() {
+        for (width, height) in [(120, 40), (80, 24), (54, 18), (42, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut app = App::with_catalog(
+                HostCatalog::default(),
+                Ok(crate::metadata::Metadata::default()),
+            );
+            for (index, section) in NavSection::ALL.into_iter().enumerate() {
+                app.section = section;
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let row = &buffer.content[usize::from(width)..usize::from(width) * 2];
+                let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
+                for (number, tab) in NavSection::ALL.iter().enumerate() {
+                    let label = if width < 70 {
+                        format!("{} {}", number + 1, &tab.title()[..1])
+                    } else if width < 100 {
+                        tab.title().to_string()
+                    } else {
+                        format!("{} {}", number + 1, tab.title())
+                    };
+                    assert!(text.contains(&label));
+                }
+                let selected_label = if width < 70 {
+                    format!("{} {}", index + 1, &section.title()[..1])
+                } else if width < 100 {
+                    section.title().to_string()
+                } else {
+                    format!("{} {}", index + 1, section.title())
+                };
+                let selected = text.find(&selected_label).unwrap();
+                assert_eq!(row[selected].fg, GREEN.into());
+                assert_eq!(row[selected].bg, Color::Rgb(34, 54, 47));
+                assert!(!format!("{}", terminal.backend()).contains("WORKSPACE"));
+                if section == NavSection::Hosts {
+                    assert!(format!("{}", terminal.backend()).contains("All hosts"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_auth_badges_only_mark_keys_uploaded_by_lazyterm() {
+        let host = crate::hosts::Host {
+            alias: "external".into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_file: None,
+            proxy_jump: None,
+            managed: false,
+        };
+        let mut app = App::with_catalog(
+            HostCatalog::default(),
+            Ok(crate::metadata::Metadata::default()),
+        );
+        app.credential_manager
+            .host_key_sources
+            .insert(host.alias.clone(), vec!["~/.ssh/id_ed25519".into()]);
+        let badges = host_auth_badges(&app, &host);
+        assert!(!badges.to_string().contains("Key uploaded"));
+        assert!(!badges.to_string().contains("SSH key"));
+        assert!(app.metadata.uploaded_keys.is_empty());
+        app.metadata.host_public_key_auth.insert(host.alias.clone());
+        let badges = host_auth_badges(&app, &host);
+        assert!(badges.to_string().contains("SSH key"));
+        assert!(!badges.to_string().contains("Key uploaded"));
+        app.metadata.host_public_key_auth.remove(&host.alias);
+        app.metadata
+            .uploaded_keys
+            .insert(host.alias.clone(), vec!["SHA256:fixture".into()]);
+        let badges = host_auth_badges(&app, &host);
+        let key = badges
+            .spans
+            .iter()
+            .find(|span| span.content == " Key uploaded ")
+            .unwrap();
+        assert_eq!(key.style.bg, Some(GREEN.into()));
+        assert_eq!(key.style.fg, Some(BG.into()));
+        assert!(!badges.to_string().contains("Password"));
+        let lines = host_list_lines(&app, &host, 40);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].width(), 40);
+        assert!(lines[1].to_string().starts_with("  external"));
+        assert!(lines[1].to_string().contains("Key uploaded"));
+        let narrow = host_list_lines(&app, &host, 22);
+        assert_eq!(narrow.len(), 2);
+        assert_eq!(narrow[1].width(), 22);
+        assert!(narrow[1].to_string().contains("…"));
+        assert!(narrow[1].to_string().contains("Key uploaded"));
+        app.credential_manager
+            .host_key_sources
+            .insert(host.alias.clone(), vec!["ssh-agent".into()]);
+        app.metadata.host_public_key_auth.insert(host.alias.clone());
+        let badges = host_auth_badges(&app, &host).to_string();
+        assert!(badges.contains("SSH key"));
+        assert!(!badges.contains("Key uploaded"));
+    }
+
+    #[test]
+    fn group_list_host_list_and_tag_editor_render_at_multiple_sizes() {
+        use crate::{
+            hosts::Host,
+            metadata::{Metadata, parse_tags},
+        };
+        for (width, height) in [(120, 40), (80, 24), (54, 18)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let catalog = HostCatalog {
+                hosts: vec![Host {
+                    alias: "web".into(),
+                    hostname: Some("web.example.com".into()),
+                    user: None,
+                    port: None,
+                    identity_file: None,
+                    proxy_jump: None,
+                    managed: false,
+                }],
+                error: None,
+            };
+            let mut metadata = Metadata::default();
+            metadata.tags.insert("web".into(), parse_tags("prod,work"));
+            metadata.credentials.push(crate::credentials::Credential {
+                id: uuid::Uuid::from_u128(9),
+                name: "web password".into(),
+                kind: crate::credentials::CredentialKind::Password,
+                username: "deploy".into(),
+                password_ref: Some("web-password".into()),
+                private_key_path: None,
+                public_key: String::new(),
+                fingerprint: String::new(),
+            });
+            metadata
+                .host_passwords
+                .insert("web".into(), uuid::Uuid::from_u128(9));
+            metadata
+                .uploaded_keys
+                .insert("web".into(), vec!["SHA256:fixture".into()]);
+            let mut app = App::with_catalog(catalog, Ok(metadata));
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("HOSTS"));
+            assert!(text.contains("GROUPS"));
+            assert!(text.contains("prod"));
+            app.enter_group();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("web"));
+            assert!(text.contains("HOSTS"));
+            assert!(text.contains("Key uploaded"));
+            assert!(text.contains("Password"), "{text}");
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| { cell.symbol() == "P" && cell.bg == Color::Rgb(103, 211, 211) })
+            );
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| { cell.symbol() == "K" && cell.bg == GREEN.into() })
+            );
+            assert!(!text.contains("UP upload recorded"));
+            app.active_group = None;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            if width >= 80 {
+                assert!(format!("{}", terminal.backend()).contains("web"));
+            }
+            app.tags_dialog = Some(("web".into(), "prod,work".into()));
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("TAGS / web"));
+        }
+    }
+
+    #[test]
+    fn group_cards_reflow_and_scroll_to_the_selected_group() {
+        use crate::{hosts::Host, metadata::Metadata};
+        for (width, height) in [
+            (300, 40),
+            (200, 40),
+            (160, 40),
+            (120, 40),
+            (80, 24),
+            (54, 18),
+            (32, 18),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut metadata = Metadata::default();
+            metadata.tags.insert(
+                "web".into(),
+                (0..12).map(|index| format!("group-{index:02}")).collect(),
+            );
+            let catalog = HostCatalog {
+                hosts: vec![Host {
+                    alias: "web".into(),
+                    hostname: None,
+                    user: None,
+                    port: None,
+                    identity_file: None,
+                    proxy_jump: None,
+                    managed: false,
+                }],
+                error: None,
+            };
+            let mut app = App::with_catalog(catalog, Ok(metadata));
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 5)].symbol(), "┌");
+            assert_eq!(buffer[(0, 5)].fg, GREEN.into());
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("group-00"));
+            assert!(text.contains("1 host"));
+            if width >= 70 {
+                let sidebar = host_browser_width(width);
+                assert_eq!(buffer[(sidebar, 4)].symbol(), "┌");
+                assert_eq!(buffer[(sidebar, 5)].symbol(), "│");
+                assert_eq!(buffer[(0, 8)].symbol(), "└");
+            }
+            let first_card_end = (0..host_browser_width(width))
+                .find(|x| buffer[(*x, 5)].symbol() == "┐")
+                .unwrap();
+            assert!(first_card_end < 24);
+            if group_columns(host_browser_width(width)) >= 2 {
+                let row = (0..width)
+                    .map(|x| buffer[(x, 6)].symbol())
+                    .collect::<String>();
+                assert!(row.contains("group-00") && row.contains("group-01"));
+            }
+            app.selected_browse_item = 11;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(format!("{}", terminal.backend()).contains("group-11"));
+            app.selected_browse_item = 12;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert_eq!(app.selected_host().unwrap().alias, "web");
+            assert!(format!("{}", terminal.backend()).contains("web"));
+            assert_eq!(terminal.backend().buffer()[(0, 5)].fg, BORDER.into());
+            app.selected_browse_item = 0;
+            app.enter_group();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(!text.contains("GROUPS"));
+            assert!(text.contains("group-00"));
         }
     }
 }
