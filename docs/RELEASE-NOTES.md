@@ -6,6 +6,7 @@ public testing build, not a stable release.
 
 ## Changes Since Beta 3
 
+- Update the URL parser to 2.5.9 to address RUSTSEC-2026-0592.
 - Reduce idle redraws from ten per second to one; input and visible work retain
   responsive updates.
 - Stop ignored mouse movement from triggering full redraws or accelerating
