@@ -117,7 +117,7 @@ jobs:
   draft:
     needs: verify-universal
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -131,6 +131,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists; preserving its publication state and assets."
+            exit 0
+          fi
           flags=()
           if [[ "$TAG" == *-* ]]; then
             flags+=(--prerelease)

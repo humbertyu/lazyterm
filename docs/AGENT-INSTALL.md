@@ -2,10 +2,10 @@
 
 Share this page with your Agent:
 
-`https://github.com/humbertyu/lazyterm/blob/v0.9-stable-core/docs/AGENT-INSTALL.md`
+`https://github.com/humbertyu/lazyterm/blob/main/docs/AGENT-INSTALL.md`
 
 This guide installs the LazyTerm CLI/TUI and its Agent Skill on macOS 15 or
-later. The current beta is `0.9.0-beta.3`.
+later. The current beta is `0.9.0-beta.4`.
 
 ## Recommended: Homebrew
 
@@ -41,9 +41,9 @@ brew install humbertyu/brew/lazyterm
 Installing the program does not automatically install or enable the Skill in
 an Agent client. Download the Skill ZIP from the pinned release:
 
-<https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.3>
+<https://github.com/humbertyu/lazyterm/releases/tag/v0.9.0-beta.4>
 
-The release asset is `lazyterm-v0.9.0-beta.3-skill.zip`; `SHA256SUMS` in the
+The release asset is `lazyterm-v0.9.0-beta.4-skill.zip`; `SHA256SUMS` in the
 same release contains its checksum. Compare the downloaded ZIP's SHA-256 value
 with that file before importing it. This detects a damaged or mismatched
 download; because both files come from the same GitHub release, it is not an
@@ -77,8 +77,8 @@ release archive is a macOS Universal Binary for Intel and Apple Silicon.
 ## Give This to an Agent
 
 ```text
-Install LazyTerm 0.9.0-beta.3 on this Mac using the instructions at
-https://github.com/humbertyu/lazyterm/blob/v0.9-stable-core/docs/AGENT-INSTALL.md.
+Install LazyTerm 0.9.0-beta.4 on this Mac using the instructions at
+https://github.com/humbertyu/lazyterm/blob/main/docs/AGENT-INSTALL.md.
 Prefer the fully qualified Homebrew formula. Before approving any trust prompt,
 explain exactly what code is being trusted and inspect the formula; do not
 trust the whole tap or disable trust checks. Install the matching Skill ZIP
