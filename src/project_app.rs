@@ -495,8 +495,11 @@ impl App {
         }
         if !self.workspace.monitor.checking
             && (self.workspace.pending.is_some()
-                || ((!self.metadata.projects.is_empty()
-                    || !self.workspace.monitor.runs.is_empty())
+                || ((self.section == NavSection::Projects
+                    || (self.section == NavSection::Runtime
+                        && self.runtime_target == crate::runtime::RuntimeTarget::Local))
+                    && (!self.metadata.projects.is_empty()
+                        || !self.workspace.monitor.runs.is_empty())
                     && self.workspace.monitor.due(&self.metadata.projects)))
         {
             self.refresh_projects();

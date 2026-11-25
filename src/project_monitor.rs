@@ -176,14 +176,7 @@ pub(crate) fn inspect(
         return Ok(BTreeMap::new());
     }
     let processes = process_snapshot()?;
-    let listeners = runtime::inspect_listeners(&RuntimeTarget::Local)?;
     let mut directories = HashMap::new();
-    let mut ports = HashMap::<u32, Vec<u16>>::new();
-    for entry in listeners {
-        if let Some(pid) = entry.pid {
-            ports.entry(pid).or_default().push(entry.port);
-        }
-    }
     let mut ancestors = ancestors_of(std::process::id(), &processes);
     ancestors.insert(std::process::id());
     let uid = unsafe { libc::geteuid() };
@@ -212,15 +205,37 @@ pub(crate) fn inspect(
             );
         }
     }
-    Ok(associate(
+    let mut runs = associate(
         definitions,
         owners,
         &processes,
         &directories,
-        &ports,
+        &HashMap::new(),
         uid,
         &ancestors,
-    ))
+    );
+    // Port enumeration is expensive and only contributes details for actual matches.
+    if runs.is_empty() {
+        return Ok(runs);
+    }
+    let mut ports = HashMap::<u32, Vec<u16>>::new();
+    for entry in runtime::inspect_listeners(&RuntimeTarget::Local)? {
+        if let Some(pid) = entry.pid {
+            ports.entry(pid).or_default().push(entry.port);
+        }
+    }
+    for run in runs.values_mut().flatten() {
+        run.ports = run
+            .processes
+            .iter()
+            .filter_map(|process| ports.get(&process.pid))
+            .flatten()
+            .copied()
+            .collect();
+        run.ports.sort_unstable();
+        run.ports.dedup();
+    }
+    Ok(runs)
 }
 
 fn associate(

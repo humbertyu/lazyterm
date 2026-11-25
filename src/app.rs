@@ -779,6 +779,46 @@ pub enum InputAction {
 }
 
 impl App {
+    pub fn redraw_interval(&self) -> Duration {
+        let live = self
+            .connection_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.pending)
+            || match self.section {
+                NavSection::Files => {
+                    matches!(self.files, FilesState::Loading { .. })
+                        || self.transfer_tasks.iter().any(|task| {
+                            matches!(
+                                task.status,
+                                TransferStatus::Queued | TransferStatus::Running
+                            )
+                        })
+                }
+                NavSection::Projects => {
+                    self.workspace.monitor.checking
+                        || self
+                            .project_service
+                            .tasks
+                            .values()
+                            .any(|task| task.active())
+                }
+                NavSection::Snippets => !self.snippet_processes.is_empty(),
+                NavSection::Tunnels => self
+                    .tunnel_statuses
+                    .values()
+                    .any(|status| *status == TunnelStatus::Starting),
+                NavSection::Runtime => self.runtime_loading,
+                NavSection::Settings => self.sync_worker.is_some(),
+                NavSection::Credentials => self.credentials_busy(),
+                NavSection::Hosts => false,
+            };
+        if live {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
+
     pub fn update_toast(&mut self) {
         let credential_message = if self.credential_manager.open {
             self.credential_manager.message.as_deref()
@@ -9007,6 +9047,35 @@ mod tests {
 
         assert_eq!(app.local_files.path, root.join("one"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_pages_do_not_scan_projects_and_visible_work_retains_fast_frames() {
+        let fixture = crate::projects::tests::Fixture::new("idle-project-monitor");
+        let mut app = app_fixture();
+        app.metadata.projects = vec![fixture.project.clone()];
+        for section in [NavSection::Hosts, NavSection::Files, NavSection::Settings] {
+            app.section = section;
+            app.poll_projects();
+            assert!(!app.workspace.monitor.checking);
+            assert_eq!(app.redraw_interval(), Duration::from_secs(1));
+        }
+        app.section = NavSection::Runtime;
+        app.runtime_target = RuntimeTarget::Host("fixture".into());
+        app.poll_projects();
+        assert!(!app.workspace.monitor.checking);
+        app.section = NavSection::Projects;
+        app.poll_projects();
+        assert!(app.workspace.monitor.checking);
+        assert_eq!(app.redraw_interval(), Duration::from_millis(100));
+        app.section = NavSection::Hosts;
+        assert_eq!(app.redraw_interval(), Duration::from_secs(1));
+        app.section = NavSection::Files;
+        app.files = FilesState::Loading {
+            host_alias: "fixture".into(),
+            path: ".".into(),
+        };
+        assert_eq!(app.redraw_interval(), Duration::from_millis(100));
     }
 
     #[test]

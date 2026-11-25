@@ -19,6 +19,7 @@ mod project_credentials;
 mod project_monitor;
 mod project_runner;
 mod projects;
+mod refresh;
 mod runtime;
 mod sftp;
 mod sync;
@@ -30,7 +31,7 @@ mod ui;
 use std::{
     io,
     process::{Command, ExitStatus, Stdio},
-    time::Duration,
+    time::Instant,
 };
 
 use color_eyre::eyre::Result;
@@ -120,35 +121,49 @@ fn main() -> Result<()> {
 }
 
 fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
+    let mut refresh = refresh::RefreshSchedule::new(Instant::now());
     while !app.should_quit {
-        app.poll_configuration();
-        app.poll_sftp();
-        app.poll_transfers();
-        app.poll_mutations();
-        app.poll_tunnels();
-        app.poll_snippet_runs();
-        app.poll_projects();
-        app.poll_runtime();
-        app.poll_credentials();
-        app.poll_authentication();
-        app.poll_sync_test();
-        poll_native_connection(terminal, &mut app)?;
-        app.update_toast();
-        let size = terminal.size()?;
-        app.viewport_width = size.width;
-        app.viewport_height = size.height;
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        if refresh.poll_due(Instant::now()) {
+            app.poll_configuration();
+            app.poll_sftp();
+            app.poll_transfers();
+            app.poll_mutations();
+            app.poll_tunnels();
+            app.poll_snippet_runs();
+            app.poll_projects();
+            app.poll_runtime();
+            app.poll_credentials();
+            app.poll_authentication();
+            app.poll_sync_test();
+            poll_native_connection(terminal, &mut app)?;
+            app.update_toast();
+        }
+        if refresh.draw_due(Instant::now(), app.redraw_interval()) {
+            let size = terminal.size()?;
+            app.viewport_width = size.width;
+            app.viewport_height = size.height;
+            terminal.draw(|frame| ui::render(frame, &app))?;
+        }
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(refresh.wait(Instant::now(), app.redraw_interval()))? {
             let action = match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_event(key),
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    refresh.invalidate();
+                    app.handle_event(key)
+                }
                 Event::Paste(text) => {
+                    refresh.invalidate();
                     app.handle_paste(&text);
                     InputAction::None
                 }
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    refresh.invalidate();
                     let size = terminal.size()?;
                     app.handle_mouse(mouse.column, mouse.row, size.width, size.height)
+                }
+                Event::Resize(_, _) | Event::FocusGained => {
+                    refresh.invalidate();
+                    InputAction::None
                 }
                 _ => InputAction::None,
             };
